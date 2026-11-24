@@ -1,0 +1,85 @@
+name: Verify HKsLGT on Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: League Beta version
+        required: true
+        default: '1.0.0-beta.13'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      LEAGUE_VERSION: ${{ inputs.version }}
+      LEAGUE_PIN: 14557723706ccc0e0a9d62c470141d4cb7190fcd
+      RUSTUP_TOOLCHAIN: 1.100.0
+      CARGO_INCREMENTAL: '0'
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      YARN_IGNORE_PATH: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.22.3'
+
+      - name: Prepare the pinned League renderer and toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:LEAGUE_VERSION -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.(0|[1-9][0-9]*)$') { throw 'Expected x.y.z-beta.n.' }
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --target x86_64-pc-windows-msvc
+          $source = Join-Path $env:RUNNER_TEMP 'akari-source'
+          git init --quiet $source
+          git -c core.longpaths=true -C $source fetch --quiet --depth 1 https://github.com/LeagueAkari/LeagueAkari.git $env:LEAGUE_PIN
+          git -c core.longpaths=true -C $source checkout --quiet --detach FETCH_HEAD
+          if ((git -C $source rev-parse HEAD).Trim() -cne $env:LEAGUE_PIN) { throw 'Unexpected renderer source revision.' }
+          Push-Location $source
+          try { node .yarn/releases/yarn-4.9.1.cjs install --immutable } finally { Pop-Location }
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'hkslgt-target')" >> $env:GITHUB_ENV
+
+      - name: Test renderer behavior and native installer templates
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $source = Join-Path $env:RUNNER_TEMP 'akari-source'
+          node --test packaging/windows/league-standalone/native-renderer/build.test.mjs packaging/windows/league-standalone/native-renderer/tauri-ipc.test.mjs packaging/windows/league-standalone/league-update.test.mjs packaging/windows/league-standalone/companion-window-demand.test.mjs packaging/windows/league-standalone/league-profile.test.mjs
+          node packaging/windows/league-standalone/test-native-shell-links.cjs $source
+          ./packaging/windows/league-standalone/test-stage-logger.ps1 -PinnedSource $source
+
+      - name: Run locked Rust tests and build the Windows x64 installer
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-windows.ps1 -Version $env:LEAGUE_VERSION -SourceDir (Join-Path $env:RUNNER_TEMP 'akari-source') -OutputDir (Join-Path $env:RUNNER_TEMP 'hkslgt-out')
+
+      - name: Verify the released League overlay and candidate checksum
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'hkslgt-out'
+          $proof = Get-Content -Raw -LiteralPath (Join-Path $out 'provenance.json') | ConvertFrom-Json
+          $name = "MaxGameStudioLeague_$($env:LEAGUE_VERSION)_x64-setup.exe"
+          if ($proof.sourceCommit -cne $env:GITHUB_SHA -or $proof.version -cne $env:LEAGUE_VERSION -or $proof.installer -cne $name -or $proof.executableSha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid candidate provenance.' }
+          $installer = Join-Path $out $name
+          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256
+          $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -cne $proof.installerSha256 -or (Get-Content -Raw -LiteralPath "$installer.sha256").Trim() -cne "$sha *$name") { throw 'Installer checksum mismatch.' }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: HKsLGT-${{ inputs.version }}-windows-x64
+          path: |
+            ${{ runner.temp }}/hkslgt-out/MaxGameStudioLeague_${{ inputs.version }}_x64-setup.exe
+            ${{ runner.temp }}/hkslgt-out/MaxGameStudioLeague_${{ inputs.version }}_x64-setup.exe.sha256
+            ${{ runner.temp }}/hkslgt-out/provenance.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
