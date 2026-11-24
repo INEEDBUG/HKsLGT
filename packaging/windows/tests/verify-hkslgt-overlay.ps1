@@ -37,7 +37,7 @@ import json, sqlite3, sys
 with sqlite3.connect(sys.argv[1]) as db:
     assert db.execute("SELECT id, gameId FROM EncounteredGames").fetchall() == [(27, 132)]
     assert json.loads(db.execute("SELECT value FROM Settings WHERE key='app-common-main/locale'").fetchone()[0]) == "zh-CN"
-    version = json.loads(db.execute("SELECT value FROM Metadata WHERE key='version'").fetchone()[0])
+    version = int(db.execute("SELECT value FROM Metadata WHERE key='version'").fetchone()[0])
     assert version in (10, 15)
 '@
   python -c $check $database
