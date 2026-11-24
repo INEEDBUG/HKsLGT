@@ -46,6 +46,16 @@ jobs:
           Push-Location $source
           try { node .yarn/releases/yarn-4.9.1.cjs install --immutable } finally { Pop-Location }
           "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'hkslgt-target')" >> $env:GITHUB_ENV
+          $fixtureTemp = Join-Path $env:RUNNER_TEMP 'hkslgt-test-temp'
+          $null = New-Item -ItemType Directory -Path $fixtureTemp
+          # Rust's profile validation rejects junctions. The runner user temp can be redirected.
+          $directory = Get-Item -LiteralPath $fixtureTemp -Force
+          while ($directory) {
+            if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'The GitHub runner fixture path contains a redirect.' }
+            $directory = $directory.Parent
+          }
+          "TEMP=$fixtureTemp" >> $env:GITHUB_ENV
+          "TMP=$fixtureTemp" >> $env:GITHUB_ENV
 
       - name: Test renderer behavior and native installer templates
         shell: pwsh
