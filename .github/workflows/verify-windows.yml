@@ -69,7 +69,14 @@ jobs:
       - name: Run locked Rust tests and build the Windows x64 installer
         shell: pwsh
         run: |
-          ./packaging/windows/build-windows.ps1 -Version $env:LEAGUE_VERSION -SourceDir (Join-Path $env:RUNNER_TEMP 'akari-source') -OutputDir (Join-Path $env:RUNNER_TEMP 'hkslgt-out')
+          $buildOptions = @{}
+          if (Test-Path -LiteralPath './packaging/windows/beta-baseline.json') {
+            $baseline = Get-Content -LiteralPath './packaging/windows/beta-baseline.json' -Raw | ConvertFrom-Json
+            $catalog = Join-Path $env:RUNNER_TEMP 'hkslgt-predecessor-catalog.json'
+            ./packaging/windows/prepare-beta-baseline.ps1 -Version $baseline.version -InstallerSha256 $baseline.installerSha256 -CatalogPath $catalog
+            $buildOptions.PredecessorCatalog = $catalog
+          }
+          ./packaging/windows/build-windows.ps1 -Version $env:LEAGUE_VERSION -SourceDir (Join-Path $env:RUNNER_TEMP 'akari-source') -OutputDir (Join-Path $env:RUNNER_TEMP 'hkslgt-out') @buildOptions
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -90,6 +97,11 @@ jobs:
           $name = "MaxGameStudioLeague_$($env:LEAGUE_VERSION)_x64-setup.exe"
           if ($proof.sourceCommit -cne $env:GITHUB_SHA -or $proof.version -cne $env:LEAGUE_VERSION -or $proof.installer -cne $name -or $proof.executableSha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid candidate provenance.' }
           $installer = Join-Path $out $name
-          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256
+          $baselineOptions = @{}
+          if (Test-Path -LiteralPath './packaging/windows/beta-baseline.json') {
+            $baseline = Get-Content -LiteralPath './packaging/windows/beta-baseline.json' -Raw | ConvertFrom-Json
+            $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineVersion=$baseline.version; BaselineSha256=$baseline.installerSha256 }
+          }
+          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 @baselineOptions
           $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($sha -cne $proof.installerSha256 -or (Get-Content -Raw -LiteralPath "$installer.sha256").Trim() -cne "$sha *$name") { throw 'Installer checksum mismatch.' }

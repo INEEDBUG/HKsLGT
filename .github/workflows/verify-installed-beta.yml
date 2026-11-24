@@ -57,4 +57,10 @@ jobs:
               $proof.version -cne $env:LEAGUE_VERSION -or $proof.installer -cne $name -or $proof.installerSha256 -cne $sha) {
             throw 'Candidate provenance or SHA-256 did not match the selected build.'
           }
-          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256
+          $baselineOptions = @{}
+          if (Test-Path -LiteralPath './packaging/windows/beta-baseline.json') {
+            $baseline = Get-Content -LiteralPath './packaging/windows/beta-baseline.json' -Raw | ConvertFrom-Json
+            ./packaging/windows/prepare-beta-baseline.ps1 -Version $baseline.version -InstallerSha256 $baseline.installerSha256 -CatalogPath (Join-Path $env:RUNNER_TEMP 'hkslgt-predecessor-catalog.json')
+            $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineVersion=$baseline.version; BaselineSha256=$baseline.installerSha256 }
+          }
+          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 @baselineOptions

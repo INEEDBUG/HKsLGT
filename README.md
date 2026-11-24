@@ -28,11 +28,11 @@
 ## 安装与升级
 
 1. 从 [GitHub Releases](https://github.com/INEEDBUG/HKsLGT/releases) 下载最新 Beta 的 `MaxGameStudioLeague_*_x64-setup.exe`。可用 `.sha256` 文件核对下载。
-2. 关闭旧工具箱，打开安装包。可选择「仅为我安装」或「为所有用户安装」。所有用户安装会请求管理员权限。
+2. 关闭旧工具箱，打开安装包。「仅为我安装」可自行选择程序目录。「为所有用户安装」会请求管理员权限，程序放在 Program Files。两种范围都可以设置独立的数据目录。
 3. 从旧版升级时，保留安装器识别出的程序和数据目录，直接覆盖即可。自定义目录时，请给程序和数据分别选位置。全新安装的程序目录应为空。
 4. 从总览或平时的入口启动英雄联盟并登录，再打开工具箱需要使用的页面。
 
-旧版 MaxGameStudio League 的 Beta 用户可从原更新入口获取迁移版。安装迁移版后，工具箱通过 HKsLGT 仓库检查后续 Beta。
+旧版 MaxGameStudio League 的 Beta 用户可在总览点击「检查工具箱更新」，获取迁移版。安装迁移版后，工具箱通过 HKsLGT 检查后续 Beta。[覆盖升级验收](https://github.com/INEEDBUG/HKsLGT/actions/runs/45467667291)
 
 ### 智能应用控制
 
@@ -43,6 +43,14 @@
 1. 进入 **Windows 安全中心 → 应用和浏览器控制 → 智能应用控制设置**。
 2. 选择 **关闭**，再打开安装包。此设置作用于整台电脑。
 3. 测试结束后，可在同一页面重新开启。旧版 Windows 关闭后可能需要重置或重装才能恢复，遇到这类提示时请先保留开启状态并更新 Windows。[微软常见问题](https://support.microsoft.com/zh-cn/windows/security/threat-malware-protection/smart-app-control-frequently-asked-questions)
+
+如果看到「Windows 已保护你的电脑」，这是 SmartScreen 的提示。智能应用控制关闭后，SmartScreen 仍可能检查从网络下载的文件。[微软 SmartScreen 说明](https://learn.microsoft.com/zh-cn/windows/apps/package-and-deploy/smartscreen-reputation)
+
+在安装包所在文件夹打开 PowerShell，运行下方命令可查看 SHA-256。结果应与同名 `.sha256` 文件的第一列一致。
+
+```powershell
+Get-FileHash -Algorithm SHA256 -Path '.\MaxGameStudioLeague_*_x64-setup.exe'
+```
 
 ## 反馈与开发
 
