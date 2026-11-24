@@ -84,11 +84,17 @@ if ((Get-FileHash -LiteralPath $executable).Hash -ine $ExecutableSha256 -or
   throw 'The new binary did not match, or the old Electron payload was left behind.'
 }
 
-$process = Start-Process -FilePath $executable -WorkingDirectory $program -PassThru
+$stderr = Join-Path $scratch 'startup-stderr.txt'
+$process = Start-Process -FilePath $executable -WorkingDirectory $program -PassThru -RedirectStandardError $stderr
 try {
   $until = [DateTime]::UtcNow.AddSeconds(30)
   do {
-    if ($process.HasExited) { throw "Installed League exited with $($process.ExitCode)." }
+    if ($process.HasExited) {
+      Get-Content -LiteralPath $stderr -Tail 10 -ErrorAction SilentlyContinue | ForEach-Object {
+        $_ -replace '[A-Za-z]:\\[^"\r\n]+', '<runner-path>'
+      }
+      throw "Installed League exited with $($process.ExitCode)."
+    }
     $process.Refresh()
     $rendered = (Test-Path -LiteralPath (Join-Path $profile 'WebView2/EBWebView') -PathType Container) -and
       $process.MainWindowHandle -ne [IntPtr]::Zero

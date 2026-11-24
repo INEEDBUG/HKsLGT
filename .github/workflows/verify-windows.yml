@@ -71,6 +71,17 @@ jobs:
         run: |
           ./packaging/windows/build-windows.ps1 -Version $env:LEAGUE_VERSION -SourceDir (Join-Path $env:RUNNER_TEMP 'akari-source') -OutputDir (Join-Path $env:RUNNER_TEMP 'hkslgt-out')
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: HKsLGT-${{ inputs.version }}-windows-x64
+          path: |
+            ${{ runner.temp }}/hkslgt-out/MaxGameStudioLeague_${{ inputs.version }}_x64-setup.exe
+            ${{ runner.temp }}/hkslgt-out/MaxGameStudioLeague_${{ inputs.version }}_x64-setup.exe.sha256
+            ${{ runner.temp }}/hkslgt-out/provenance.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
       - name: Verify the released League overlay and candidate checksum
         shell: pwsh
         run: |
@@ -82,14 +93,3 @@ jobs:
           ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256
           $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($sha -cne $proof.installerSha256 -or (Get-Content -Raw -LiteralPath "$installer.sha256").Trim() -cne "$sha *$name") { throw 'Installer checksum mismatch.' }
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: HKsLGT-${{ inputs.version }}-windows-x64
-          path: |
-            ${{ runner.temp }}/hkslgt-out/MaxGameStudioLeague_${{ inputs.version }}_x64-setup.exe
-            ${{ runner.temp }}/hkslgt-out/MaxGameStudioLeague_${{ inputs.version }}_x64-setup.exe.sha256
-            ${{ runner.temp }}/hkslgt-out/provenance.json
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
