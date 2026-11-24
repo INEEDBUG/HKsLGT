@@ -752,6 +752,26 @@ try {
   $aboutPanePath = Join-Path $source "src\renderer\src-main-window\components\settings-modal\AboutPane.vue"
   Replace-TextExactlyOnce $aboutPanePath "https://api.github.com/repos/LeagueAkari/LeagueAkari" "https://api.github.com/repos/INEEDBUG/HKsLGT"
   $platformPath = Join-Path $source "src\main\shards\self-update\platform.ts"
+  $builderConfig = Join-Path $source "electron-builder.yml"
+  if (Test-Path -LiteralPath $builderConfig) {
+    $builderText = Get-Content -LiteralPath $builderConfig -Raw -Encoding utf8
+    $builderFields = @{
+      'productName' = 'MaxGameStudio League'
+      'executableName' = 'MaxGameStudioLeague'
+      'appId' = 'com.maxgamestudio.league'
+    }
+    foreach ($entry in $builderFields.GetEnumerator()) {
+      $pattern = "(?m)^(\s*)$([regex]::Escape($entry.Key)):\s*.*$"
+      $hits = ([regex]::Matches($builderText, $pattern)).Count
+      if ($hits -ne 1) {
+        throw "Expected exactly one $($entry.Key) field in pinned electron-builder.yml (found $hits)."
+      }
+      $builderText = [regex]::Replace($builderText, $pattern, "`$1$($entry.Key): $($entry.Value)")
+    }
+    [IO.File]::WriteAllText($builderConfig, $builderText, [Text.UTF8Encoding]::new($false))
+  } else {
+    throw "Pinned source is missing electron-builder.yml; refusing to build an unbranded runtime."
+  }
   Apply-MaxGameStudioTheme $source
   Apply-EmbeddedUiPruning $source
   & (Join-Path $PSScriptRoot 'stage-league-prewarm.ps1') -SourceRoot $source

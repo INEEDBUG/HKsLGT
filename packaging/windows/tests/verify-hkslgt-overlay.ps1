@@ -2,7 +2,10 @@
 param(
   [Parameter(Mandatory)][string]$Installer,
   [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+-beta\.\d+$')][string]$Version,
-  [Parameter(Mandatory)][ValidatePattern('^[a-fA-F0-9]{64}$')][string]$ExecutableSha256
+  [Parameter(Mandatory)][ValidatePattern('^[a-fA-F0-9]{64}$')][string]$ExecutableSha256,
+  [ValidateSet('MaxGameStudio','HKsLGT')][string]$BaselineRepository = 'MaxGameStudio',
+  [ValidatePattern('^\d+\.\d+\.\d+-beta\.\d+$')][string]$BaselineVersion = '1.0.0-beta.5',
+  [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$BaselineSha256 = 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,19 +55,18 @@ if (@($installKey, $uninstallKey, $control, $scratch | Where-Object { Test-Path 
   throw 'Expected a clean disposable fixture.'
 }
 $null = New-Item -ItemType Directory -Path $scratch, $profile, $control
-$baselineVersion = '1.0.0-beta.5'
 $oldName = "MaxGameStudioLeague_$($baselineVersion)_x64-setup.exe"
 $baseline = Join-Path $scratch $oldName
-$baselineUri = "https://github.com/INEEDBUG/MaxGameStudio/releases/download/league-v$baselineVersion/$oldName"
+$baselineUri = "https://github.com/INEEDBUG/$BaselineRepository/releases/download/league-v$BaselineVersion/$oldName"
 Invoke-WebRequest -Uri $baselineUri -OutFile $baseline -TimeoutSec 100
-if ((Get-FileHash -LiteralPath $baseline).Hash -ine 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4') {
-  throw 'The released League beta.5 installer did not match its pinned SHA-256.'
+if ((Get-FileHash -LiteralPath $baseline).Hash -ine $BaselineSha256) {
+  throw 'The released League baseline installer did not match its pinned SHA-256.'
 }
 
 $installArgs = "/S /currentuser /D=$program"
 Run-Installer $baseline $installArgs
 Assert-Install $baselineVersion
-if (!(Test-Path -LiteralPath (Join-Path $program 'resources/app.asar') -PathType Leaf)) {
+if ($BaselineRepository -eq 'MaxGameStudio' -and !(Test-Path -LiteralPath (Join-Path $program 'resources/app.asar') -PathType Leaf)) {
   throw 'The old Electron installation was incomplete.'
 }
 
