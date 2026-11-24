@@ -32,7 +32,15 @@ function Assert-Profile {
   if ($savedLocation -ine $profile -or (Get-FileHash -LiteralPath $settings).Hash -ne $settingsHash) {
     throw 'The existing data directory or settings changed.'
   }
-  python -c "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); assert db.execute('select value from hkslgt_overlay_fixture').fetchall()==[('preserve-me',)]; db.close()" $database
+  $check = @'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    assert db.execute("SELECT id, gameId FROM EncounteredGames").fetchall() == [(27, 132)]
+    assert json.loads(db.execute("SELECT value FROM Settings WHERE key='app-common-main/locale'").fetchone()[0]) == "zh-CN"
+    version = json.loads(db.execute("SELECT value FROM Metadata WHERE key='version'").fetchone()[0])
+    assert version in (10, 15)
+'@
+  python -c $check $database
 }
 
 $installer = (Get-Item -LiteralPath $Installer).FullName
@@ -73,7 +81,20 @@ if ($BaselineRepository -eq 'MaxGameStudio' -and !(Test-Path -LiteralPath (Join-
 [IO.File]::WriteAllText($locator, $profile, [Text.Encoding]::Unicode)
 '{"locale":"zh-CN"}' | Set-Content -LiteralPath $settings -Encoding utf8
 $settingsHash = (Get-FileHash -LiteralPath $settings).Hash
-python -c "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute('create table hkslgt_overlay_fixture(value text)'); db.execute('insert into hkslgt_overlay_fixture values (?)',('preserve-me',)); db.commit(); db.close()" $database
+# Match the legacy v10 database fixture in rust/league-core/tests/profile_database.rs.
+$seed = @'
+import json, sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    db.executescript("""
+      CREATE TABLE Metadata (key VARCHAR NOT NULL PRIMARY KEY, value JSON NOT NULL);
+      CREATE TABLE Settings (key VARCHAR NOT NULL PRIMARY KEY, value JSON NOT NULL);
+      CREATE TABLE EncounteredGames (id INTEGER PRIMARY KEY, gameId INTEGER NOT NULL);
+      INSERT INTO Metadata VALUES ('version', json('10'));
+      INSERT INTO EncounteredGames VALUES (27, 132);
+    """)
+    db.execute("INSERT INTO Settings VALUES (?, ?)", ("app-common-main/locale", json.dumps("zh-CN")))
+'@
+python -c $seed $database
 Assert-Profile
 
 Run-Installer $installer $installArgs
