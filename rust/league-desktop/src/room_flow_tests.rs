@@ -184,6 +184,47 @@ fn enabling_auto_accept_during_a_ready_check_applies_to_the_next_check() {
 }
 
 #[test]
+fn a_second_ready_round_in_the_same_party_gets_its_own_timer_and_one_answer() {
+    let sample = snapshot(
+        AuxPhase::ReadyCheck,
+        2400,
+        "tester",
+        &party(),
+        Some(&json!({"readyCheck":{"state":"InProgress","playerResponse":"None"}})),
+    );
+    let mut flow = RoomFlow::default();
+    flow.options.accept = true;
+    flow.options.accept_delay = Duration::from_secs(2);
+    let start = Instant::now();
+    let first = sample.clone().with_ready_round(0, None);
+    let second = sample.with_ready_round(1, None);
+    assert!(flow.observe(Some(&first), start, 0).is_none());
+    assert!(flow
+        .observe(Some(&first), start + Duration::from_secs(2), 2000)
+        .is_some());
+    flow.mark_sent(RoomAction::AcceptReadyCheck);
+    assert!(flow
+        .observe(Some(&first), start + Duration::from_secs(3), 3000)
+        .is_none());
+    assert!(flow
+        .observe(Some(&second), start + Duration::from_secs(3), 3000)
+        .is_none());
+    assert!(!flow.current(&first, RoomAction::AcceptReadyCheck, true));
+    assert_eq!(flow.fields()["willAcceptAt"], 5000);
+    assert!(flow
+        .observe(Some(&second), start + Duration::from_secs(4), 4000)
+        .is_none());
+    assert_eq!(
+        flow.observe(Some(&second), start + Duration::from_secs(5), 5000),
+        Some(RoomAction::AcceptReadyCheck)
+    );
+    flow.mark_sent(RoomAction::AcceptReadyCheck);
+    assert!(flow
+        .observe(Some(&second), start + Duration::from_secs(6), 6000)
+        .is_none());
+}
+
+#[test]
 fn either_manual_response_can_be_reversed_after_the_client_confirms_it() {
     let now = Instant::now();
     let mut room = RoomFlow::default();
@@ -211,6 +252,30 @@ fn either_manual_response_can_be_reversed_after_the_client_confirms_it() {
     assert!(declined.allows(RoomAction::AcceptReadyCheck));
     assert!(room.current(&declined, RoomAction::AcceptReadyCheck, false));
     assert!(!room.current(&declined, RoomAction::AcceptReadyCheck, true));
+}
+
+#[test]
+fn polling_detects_a_new_game_id_without_rearming_on_duplicate_reads() {
+    let pending = snapshot(
+        AuxPhase::ReadyCheck,
+        450,
+        "tester",
+        &party(),
+        Some(&json!({"readyCheck":{"state":"InProgress","playerResponse":"None"}})),
+    );
+    let first = pending.clone().with_ready_round(0, Some(78));
+    let next = pending.with_ready_round(0, Some(79));
+    let now = Instant::now();
+    let mut flow = RoomFlow::default();
+    flow.options.accept = true;
+    let accept = RoomAction::AcceptReadyCheck;
+    assert_eq!(flow.observe(Some(&first), now, 0), Some(accept));
+    flow.mark_sent(accept);
+    assert!(flow.observe(Some(&first), now, 0).is_none());
+    assert_eq!(flow.observe(Some(&next), now, 0), Some(accept));
+    assert!(!flow.current(&first, accept, true));
+    assert!(!next.round_is_current(0, true));
+    assert!(flow.current(&next, accept, true));
 }
 
 #[test]

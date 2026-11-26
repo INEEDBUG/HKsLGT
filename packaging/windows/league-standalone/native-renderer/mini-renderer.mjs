@@ -9,7 +9,11 @@ const scopedClient = [
 
 const miniPatches = {
   'views/Indicator.vue': [
-    ['  <KeepAlive>', '  <div class="aux-activity h-full" :data-phase="view?.phase"><KeepAlive>'],
+    ['  <KeepAlive>', `  <div class="aux-activity h-full" :data-phase="view?.phase">
+      <div v-if="!view && verifyingDraft" class="aux-draft-confirming flex h-full items-center justify-center text-sm text-gray-500" role="status">
+        {{ chinese ? '正在确认当前游戏阶段和队列…' : 'Checking the game phase and queue…' }}
+      </div>
+      <KeepAlive v-else>`],
     ['  </KeepAlive>', '  </KeepAlive></div>']
   ],
   'views/ChampSelect.vue': [
@@ -54,8 +58,12 @@ const { selectionBlocked, chinese } = useNativeAuxActivity()`]
   'components/BenchChampionsMini.vue': [
     ['v-if="combinedChampions && gameMode"', 'v-if="gameMode && (combinedChampions || lcs.champSelect.currentChampion)"'],
     ['<NDivider vertical />', '<NDivider v-if="combinedChampions" vertical />'],
+    ['        <!-- 新版大乱斗', `        <span v-if="view?.remainingSeconds != null" class="aux-draft-timer text-xs tabular-nums text-gray-500">
+          {{ view.remainingSeconds }}{{ chinese ? ' 秒' : 's' }}
+        </span>
+        <!-- 新版大乱斗`],
     [scopedClient[0], `import { useNativeAuxClient, useNativeAuxActivity, useNativeAramBalance } from '${MINI_ACTIVITY_MODULE}'`],
-    ['const lcs = useLeagueClientStore()', 'const lcs = useNativeAuxClient()\nconst { view, pending, selectionBlocked, run } = useNativeAuxActivity()\nuseNativeAramBalance()'],
+    ['const lcs = useLeagueClientStore()', 'const lcs = useNativeAuxClient()\nconst { view, pending, selectionBlocked, chinese, run } = useNativeAuxActivity()\nuseNativeAramBalance()'],
     ["import { LeagueClientRenderer } from '@renderer-shared/shards/league-client'\n", ''],
     ['const lc = useInstance(LeagueClientRenderer)\n', ''],
     ['class="size-9 cursor-default rounded-full', 'class="current-champion size-9 cursor-default rounded-full'],
@@ -150,7 +158,7 @@ import ChampSelect from './ChampSelect.vue'
 import Lounge from './Lounge.vue'
 import Placeholder from './Placeholder.vue'
 
-const { view } = provideNativeAuxActivity()
+const { view, verifyingDraft, chinese } = provideNativeAuxActivity()
 const currentPage = computed(() => {
   if (!view.value) return 'placeholder'
   return view.value.phase === 'ChampSelect' ? 'champ-select' : 'lounge'

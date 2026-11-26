@@ -27,6 +27,10 @@ mod mini_optional_actions_smoke;
 mod history_responsiveness_smoke;
 #[path = "partial_kiwi_selection_smoke.rs"]
 mod partial_kiwi_selection_smoke;
+#[path = "champion_picker_smoke.rs"]
+mod champion_picker_smoke;
+#[path = "post_game_smoke.rs"]
+mod post_game_smoke;
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(200);
@@ -59,7 +63,11 @@ fn champ_select_opens_real_windows() {
     let profile = DesktopProfile {
         directory,
         database: Mutex::new(db),
-        system_locale: "en",
+        system_locale: if champion_picker_smoke::requested() || post_game_smoke::requested() {
+            "zh-CN"
+        } else {
+            "en"
+        },
     };
     let mut runtime =
         ClientRuntime::new(false, Default::default()).expect("disconnected fixture runtime");
@@ -114,6 +122,14 @@ fn champ_select_opens_real_windows() {
 }
 
 async fn exercise(app: &AppHandle) {
+    if post_game_smoke::requested() {
+        post_game_smoke::check(app).await;
+        return;
+    }
+    if champion_picker_smoke::requested() {
+        champion_picker_smoke::check(app).await;
+        return;
+    }
     if std::env::var_os("HKSLGT_PARTIAL_KIWI_ONLY").is_some() {
         partial_kiwi_selection_smoke::check(app).await;
         return;

@@ -9,10 +9,13 @@ use crate::client_discovery::LocalClient;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+#[derive(Default)]
 pub(super) struct DraftFixture {
     pub gameflow: Option<Value>,
     pub selection: Option<Value>,
     pub current_champion: Option<u32>,
+    pub phase_missing: bool,
+    pub profile_loading: bool,
 }
 
 fn flow(phase: &str, queue: u64, mode: &str) -> Value {
@@ -54,22 +57,70 @@ pub(super) async fn check(app: &AppHandle) {
     )
     .await;
 
+    let writes = server.scene.lock().unwrap().writes.len();
+    let yasuo = json!({
+        "queueId":2400,"gameId":7812,"localPlayerCellId":0,
+        "isCustomGame":false,"isSpectating":false,
+        "myTeam":[{"cellId":1,"puuid":"fixture-ally","championId":55},
+                  {"cellId":0,"puuid":PLAYER,"championId":157}],
+        "benchEnabled":true,"benchChampions":[{"championId":22}],
+        "timer":{"phase":"FINALIZATION","isInfinite":false,"adjustedTimeLeftInPhase":15710}
+    });
+    for (phase, flow_phase, phase_missing, profile_loading, current_champion) in [
+        ("ReadyCheck", "ChampSelect", false, false, 157),
+        ("ChampSelect", "ChampSelect", true, false, 157),
+        ("ReadyCheck", "ReadyCheck", true, false, 157),
+        ("ChampSelect", "ChampSelect", false, true, 0),
+    ] {
+        {
+            let mut scene = server.scene.lock().unwrap();
+            scene.phase = phase;
+            scene.partial_kiwi = Some(DraftFixture {
+                gameflow:Some(flow(flow_phase,2400,"KIWI")), selection:Some(yasuo.clone()),
+                current_champion:Some(current_champion), phase_missing, profile_loading,
+            });
+        }
+        runtime.sample_fixture(app, &client).await;
+        let (_, state) = runtime.fields(crate::lcu::aux_activity::NAMESPACE, "state")
+            .expect("read the current synthetic draft").expect("Mini state present");
+        assert_eq!(state["view"]["phase"],"ChampSelect", "phase={phase}, missing={phase_missing}, loading={profile_loading}");
+        assert_eq!(state["view"]["selectionActionable"],false);
+        check_renderer(&aux, r#"
+            document.querySelector('.aux-activity[data-phase="ChampSelect"] .current-champion[data-champion-id="157"] img')?.naturalWidth > 1 &&
+            document.querySelector('.bench [data-champion-id="22"][aria-disabled="true"] img')?.naturalWidth > 1 &&
+            /^16\s*(秒|s)$/.test(document.querySelector('.aux-draft-timer')?.textContent.trim()) &&
+            document.querySelector('[data-action="leave-game"]')?.disabled === true"#,
+            "live Yasuo, bench and 16 seconds during a partial KIWI draft", || {}).await;
+        assert_eq!(aux.hwnd().unwrap(), window);
+    }
+    {
+        let mut unknown = yasuo;
+        unknown.as_object_mut().unwrap().remove("queueId");
+        server.scene.lock().unwrap().partial_kiwi = Some(DraftFixture {
+            selection:Some(unknown), current_champion:Some(157), profile_loading:true, ..Default::default()
+        });
+    }
+    runtime.sample_fixture(app, &client).await;
+    check_renderer(&aux,
+        "document.querySelector('.aux-draft-confirming[role=status]') && !document.querySelector('.current-champion, .bench, [data-action=\"leave-game\"]')",
+        "an unclassified current draft shows verification and clears all prior KIWI data", || {}).await;
+
     let mut selection = json!({
         "queueId":2400, "gameId":7812, "isSpectating":false, "isCustomGame":false,
         "benchChampions":[{"championId":22}],
         "myTeam":[{"cellId":1,"championId":55}],
         "timer":{"phase":"FINALIZATION","adjustedTimeLeftInPhase":20110}
     });
-    let writes = {
+    {
         let mut scene = server.scene.lock().unwrap();
         scene.phase = "ChampSelect";
         scene.partial_kiwi = Some(DraftFixture {
             gameflow: Some(flow("ReadyCheck", 450, "ARAM")),
             selection: Some(selection.clone()),
             current_champion: Some(103),
+            ..Default::default()
         });
-        scene.writes.len()
-    };
+    }
     runtime.sample_fixture(app, &client).await;
     let (revision, state) = runtime
         .fields(crate::lcu::aux_activity::NAMESPACE, "state")
@@ -122,6 +173,7 @@ pub(super) async fn check(app: &AppHandle) {
         gameflow: Some(flow("ChampSelect", 2400, "KIWI")),
         selection: None,
         current_champion: Some(103),
+        ..Default::default()
     });
     runtime.sample_fixture(app, &client).await;
     check_renderer(
@@ -153,15 +205,25 @@ pub(super) async fn check(app: &AppHandle) {
     ).await;
     assert_eq!(aux.hwnd().unwrap(), window);
 
+    let mut gap = selection.clone();
+    gap["queueId"] = Value::Null;
+    gap["myTeam"][0]["championId"] = json!(157);
+    gap["benchChampions"] = json!([{"championId":44}]);
+    server.scene.lock().unwrap().partial_kiwi = Some(DraftFixture {
+        gameflow:None, selection:Some(gap), current_champion:Some(157), ..Default::default()
+    });
+    runtime.sample_fixture(app, &client).await;
+    check_renderer(&aux, r#"
+        document.querySelector('.current-champion[data-champion-id="157"] img')?.naturalWidth > 1 &&
+        document.querySelector('.bench [data-champion-id="44"][aria-disabled="true"] img')?.naturalWidth > 1 &&
+        !document.querySelector('.current-champion[data-champion-id="103"], .bench [data-champion-id="22"]')"#,
+        "same game and player recover only the mode; fresh picks replace the old roster", || {}).await;
+
     selection["gameId"] = json!(7813);
-    server
-        .scene
-        .lock()
-        .unwrap()
-        .partial_kiwi
-        .as_mut()
-        .unwrap()
-        .selection = Some(selection.clone());
+    server.scene.lock().unwrap().partial_kiwi = Some(DraftFixture {
+        gameflow:Some(flow("ChampSelect",2400,"KIWI")), selection:Some(selection.clone()),
+        current_champion:Some(103), ..Default::default()
+    });
     runtime.sample_fixture(app, &client).await;
     check_renderer(
         &aux,
@@ -193,6 +255,7 @@ pub(super) async fn check(app: &AppHandle) {
         gameflow: Some(flow("ChampSelect", 2400, "KIWI")),
         selection: Some(selection),
         current_champion: Some(103),
+        ..Default::default()
     });
     runtime.sample_fixture(app, &client).await;
     check_renderer(

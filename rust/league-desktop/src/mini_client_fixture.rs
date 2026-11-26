@@ -29,6 +29,9 @@ pub(super) struct Scene {
     pub reject_next: bool,
     pub writes: Vec<(String, String)>,
     pub partial_kiwi: Option<super::partial_kiwi_selection_smoke::DraftFixture>,
+    pub position_reads: usize,
+    pub reject_position_once: bool,
+    pub post_game: Option<super::post_game_smoke::PostGameFixture>,
 }
 
 pub(super) struct MiniClient {
@@ -68,6 +71,9 @@ impl MiniClient {
             reject_next: false,
             writes: vec![],
             partial_kiwi: None,
+            position_reads: 0,
+            reject_position_once: false,
+            post_game: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let history = Arc::new(super::history_responsiveness_smoke::HistoryFixture::default());
@@ -191,15 +197,28 @@ fn serve(
             .strip_prefix("/lol-game-data/assets/v1/champion-icons/")
             .and_then(|name| name.strip_suffix(".png"))
             .and_then(|id| id.parse::<u32>().ok());
-        let bytes = portrait.and_then(|id| {
+        let legacy_black = super::champion_picker_smoke::requested()
+            && matches!(portrait, Some(60022 | 60103 | 60117));
+        let bytes = if legacy_black {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAADklEQVR4nGPghQEGOAsACTgA6+Drjf4AAAAASUVORK5CYII="
+            ).expect("synthetic legacy portrait")
+        } else { portrait.and_then(|id| {
             let dir = std::env::var_os("HKSLGT_SMOKE_PORTRAIT_DIR")?;
             std::fs::read(std::path::PathBuf::from(dir).join(format!("{id}.png"))).ok()
         }).unwrap_or_else(|| {
             use base64::Engine as _;
             // Hand-generated three-color PNG for offline CI. Local acceptance can supply actual portraits.
             base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAFUlEQVR4nGO4pMEvt8BNK+8EA5wFAEKIBtsqErd8AAAAAElFTkSuQmCC").unwrap()
-        });
+        }) };
         (200, "image/png", bytes)
+    } else if method == "GET" && super::champion_picker_smoke::requested()
+        && path == "/lol-perks/v1/recommended-champion-positions"
+        && std::mem::take(&mut scene.reject_position_once)
+    {
+        scene.position_reads += 1;
+        (503, "application/json", vec![])
     } else if method == "GET" {
         match scene.get(path) {
             Some(json) => (200, "application/json", serde_json::to_vec(&json).unwrap()),
@@ -216,9 +235,33 @@ fn serve(
 }
 
 impl Scene {
-    fn get(&self, path: &str) -> Option<Value> {
+    fn get(&mut self, path: &str) -> Option<Value> {
+        if let Some(game) = self.post_game.as_ref() {
+            match path {
+                "/lol-chat/v1/me" => return Some(json!({"puuid":PLAYER,"platformId":"HN1"})),
+                "/lol-gameflow/v1/session" => return Some(game.flow(self.phase)),
+                "/lol-honor-v2/v1/ballot/" => return game.ballot(self.phase),
+                "/lol-lobby/v2/party/eog-status" => return Some(game.party()),
+                "/lol-pre-end-of-game/v1/currentSequenceEvent" => return game.sequence(),
+                _ => {}
+            }
+        }
+        if super::champion_picker_smoke::requested() {
+            match path {
+                "/lol-chat/v1/me" => return Some(json!({"puuid":PLAYER,"platformId":"HN1"})),
+                "/lol-game-data/assets/v1/champion-summary.json" =>
+                    return Some(super::champion_picker_smoke::champion_summary()),
+                "/lol-perks/v1/recommended-champion-positions" => {
+                    self.position_reads += 1;
+                    return Some(super::champion_picker_smoke::recommended_positions());
+                }
+                _ => {}
+            }
+        }
         if let Some(draft) = self.partial_kiwi.as_ref() {
             match path {
+                "/lol-gameflow/v1/gameflow-phase" if draft.phase_missing => return None,
+                "/lol-summoner/v1/current-summoner" if draft.profile_loading => return Some(json!({"ready":false})),
                 "/lol-gameflow/v1/session" => return draft.gameflow.clone(),
                 "/lol-champ-select/v1/session" => return draft.selection.clone(),
                 "/lol-champ-select/v1/current-champion" => {
@@ -287,6 +330,12 @@ impl Scene {
 
     fn mutate(&mut self, method: &str, path: &str, body: &[u8]) -> u16 {
         self.writes.push((method.into(), path.into()));
+        if let Some(game) = self.post_game.as_mut() {
+            if let Some((status, phase)) = game.apply(self.phase, method, path, body) {
+                self.phase = phase;
+                return status;
+            }
+        }
         if std::mem::take(&mut self.reject_next) {
             return 409;
         }

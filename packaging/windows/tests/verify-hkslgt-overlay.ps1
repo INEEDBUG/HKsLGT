@@ -6,7 +6,8 @@ param(
   [ValidateSet('MaxGameStudio','HKsLGT')][string]$BaselineRepository = 'MaxGameStudio',
   [ValidatePattern('^\d+\.\d+\.\d+-beta\.\d+$')][string]$BaselineVersion = '1.0.0-beta.5',
   [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$BaselineSha256 = 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4',
-  [string]$SameVersionBaseline,
+  [string]$BaselineInstaller,
+  [Alias('SameVersionBaseline')][string]$PriorCandidateInstaller,
   [ValidateSet('currentuser','allusers')][string]$InstallScope = 'currentuser',
   [switch]$UserToMachine
 )
@@ -72,16 +73,21 @@ if (@($installKey, $uninstallKey, $control, $scratch, $program | Where-Object { 
 }
 $null = New-Item -ItemType Directory -Path $scratch, $profile, $control
 $oldName = "MaxGameStudioLeague_$($baselineVersion)_x64-setup.exe"
-$baseline = Join-Path $scratch $oldName
-$baselineUri = "https://github.com/INEEDBUG/$BaselineRepository/releases/download/league-v$BaselineVersion/$oldName"
-Invoke-WebRequest -Uri $baselineUri -OutFile $baseline -TimeoutSec 100
+if ($BaselineInstaller) {
+  $baseline = (Get-Item -LiteralPath $BaselineInstaller).FullName
+  if ((Split-Path -Leaf $baseline) -cne $oldName) { throw 'Earlier candidate filename did not match its embedded version.' }
+} else {
+  $baseline = Join-Path $scratch $oldName
+  $baselineUri = "https://github.com/INEEDBUG/$BaselineRepository/releases/download/league-v$BaselineVersion/$oldName"
+  Invoke-WebRequest -Uri $baselineUri -OutFile $baseline -TimeoutSec 100
+}
 if ((Get-FileHash -LiteralPath $baseline).Hash -ine $BaselineSha256) {
   throw 'The released League baseline installer did not match its pinned SHA-256.'
 }
 
 $installArgs = "/S /$InstallScope /D=$program"
 if ($UserToMachine) {
-  if ($InstallScope -ne 'allusers' -or $SameVersionBaseline) { throw 'Use a fresh per-user predecessor for cross-scope verification.' }
+  if ($InstallScope -ne 'allusers' -or $PriorCandidateInstaller) { throw 'Use a fresh per-user predecessor for cross-scope verification.' }
   $oldProgram = Join-Path $scratch 'PerUserProgram'
   if (Test-Path -LiteralPath "HKCU:\Software\$identity") { throw 'Expected a clean per-user registration.' }
   Run-Installer $baseline "/S /currentuser /D=$oldProgram"
@@ -143,6 +149,15 @@ function Test-CandidateOverlay([string]$FromVersion) {
     Assert-Profile
     $programBytes = (Get-ChildItem -LiteralPath $program -File -Recurse | Measure-Object -Property Length -Sum).Sum
     Write-Host "HKSLGT_STARTUP_SAMPLE: installedBytes=$programBytes mainProcessWorkingSetBytes=$($process.WorkingSet64)"
+    $processes = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe' OR ProcessId=$($process.Id)" -Property ProcessId,ParentProcessId,PrivatePageCount)
+    $owned = @($processes | Where-Object ProcessId -EQ $process.Id)
+    $children = $owned
+    while ($children.Count) {
+      $children = @($processes | Where-Object { $_.ParentProcessId -in $children.ProcessId -and $_.ProcessId -notin $owned.ProcessId })
+      $owned += $children
+    }
+    $privateBytes = ($owned | Measure-Object PrivatePageCount -Sum).Sum
+    Write-Host "HKSLGT_STARTUP_TREE: processes=$($owned.Count) privateBytes=$privateBytes"
     if ($UserToMachine) {
       $oldEntry = Test-Path -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity"
       $oldExe = Test-Path -LiteralPath (Join-Path $oldProgram 'MaxGameStudioLeagueToolbox.exe')
@@ -173,12 +188,17 @@ function Test-CandidateOverlay([string]$FromVersion) {
 }
 
 Test-CandidateOverlay $baselineVersion
-if ($SameVersionBaseline) {
-  Run-Installer (Get-Item -LiteralPath $SameVersionBaseline).FullName $installArgs
-  Assert-Install $Version
+if ($PriorCandidateInstaller) {
+  $prior = Get-Item -LiteralPath $PriorCandidateInstaller
+  $priorVersion = $prior.VersionInfo.ProductVersion
+  if ($priorVersion -cnotmatch '^\d+\.\d+\.\d+-beta\.\d+$' -or $prior.Name -cne "MaxGameStudioLeague_$($priorVersion)_x64-setup.exe") {
+    throw 'Earlier candidate name and embedded League Beta version must match.'
+  }
+  Run-Installer $prior.FullName $installArgs
+  Assert-Install $priorVersion
   Assert-Profile
   if ((Get-FileHash -LiteralPath $executable).Hash -ieq $ExecutableSha256) {
-    throw 'The earlier same-version installer must contain a different executable.'
+    throw 'The earlier installer must contain a different executable.'
   }
-  Test-CandidateOverlay "$Version (previous candidate)"
+  Test-CandidateOverlay "$priorVersion (previous candidate)"
 }

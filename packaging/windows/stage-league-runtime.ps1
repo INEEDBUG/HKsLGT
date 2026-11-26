@@ -557,6 +557,12 @@ try {
   $shellChinesePath = Join-Path $source "src\shared\i18n\zh-CN\renderer\shell.yaml"
   $settingsEnglishPath = Join-Path $source "src\shared\i18n\en\renderer\settings.yaml"
   $settingsChinesePath = Join-Path $source "src\shared\i18n\zh-CN\renderer\settings.yaml"
+  $pickerHeader = '  orderedChampionList:'
+  $retryPositionsZh = & $makeUnicodeText @(0x91CD, 0x8BD5, 0x5206, 0x8DEF, 0x6570, 0x636E)
+  foreach ($entry in @{ 'zh-CN' = $retryPositionsZh; 'en' = 'Retry lane data' }.GetEnumerator()) {
+    $labels = Join-Path $source "src\shared\i18n\$($entry.Key)\renderer\automation.yaml"
+    Replace-TextExactlyOnce $labels $pickerHeader ($pickerHeader + [Environment]::NewLine + '    retryPositions: ' + $entry.Value)
+  }
   foreach ($i18nPath in @($shellEnglishPath, $shellChinesePath, $settingsEnglishPath, $settingsChinesePath)) {
     if (-not (Test-Path -LiteralPath $i18nPath -PathType Leaf)) {
       throw "Embedded close copy i18n target is missing: $i18nPath"

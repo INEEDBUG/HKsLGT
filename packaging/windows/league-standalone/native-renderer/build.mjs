@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resgDisplayProgram } from '../../league-resg/resg-display.ts'
 import { artworkModule, logoComponents, useMitIconImports } from './artwork.mjs'
+import { registerChampionPicker } from './champion-picker.mjs'
 import { MINI_ACTIVITY_MODULE, patchNativeMini } from './mini-renderer.mjs'
 
 const IPC_MODULE = 'virtual:mgs-league-native-ipc'
@@ -228,6 +229,7 @@ function nativeRendererPlugin(sourceRoot) {
     Object.entries(IPC_TRANSFORMS).map(([file, patches]) => [`${ipcDirectory}/${file}`, patches])
   )
   const autoGameflow = `${stagedSourcePrefix}src/renderer/src-main-window/views/automation/AutoGameflow.vue`
+  registerChampionPicker(transforms, `${stagedSourcePrefix}src/renderer/src-main-window`)
   transforms.set(autoGameflow, [
     ["import aramTeamSideMessageImage from '@renderer-shared/assets/automation/aram-team-side-message.webp'\n", ''],
     [

@@ -48,6 +48,7 @@ interface AuxView {
   subsetChampionIds?: number[]
   benchEnabled?: boolean
   timerPhase?: string
+  remainingSeconds?: number | null
   localActions?: LocalAction[]
   selectionActionable?: boolean
   localPlayerCellId?: number
@@ -65,8 +66,9 @@ export function provideNativeAuxActivity() {
   const sync = useInstance(PiniaMobxUtilsRenderer)
   const app = useAppCommonStore()
   const message = useMessage()
-  const state = shallowReactive<{ view: AuxView | null }>({ view: null })
+  const state = shallowReactive<{ view: AuxView | null, verifyingDraft: boolean }>({ view: null, verifyingDraft: false })
   const view = computed(() => state.view)
+  const verifyingDraft = computed(() => state.verifyingDraft)
   const chinese = computed(() => app.settings.locale.startsWith('zh'))
   const pending = ref(false)
   const selectionBlocked = computed(() => view.value?.phase === 'ChampSelect' && view.value.selectionActionable !== true)
@@ -108,7 +110,7 @@ export function provideNativeAuxActivity() {
     })
   }
 
-  const activity = { view, pending, selectionBlocked, chinese, run, withFeedback }
+  const activity = { view, verifyingDraft, pending, selectionBlocked, chinese, run, withFeedback }
   provide(nativeAuxActivity, activity)
   return activity
 }

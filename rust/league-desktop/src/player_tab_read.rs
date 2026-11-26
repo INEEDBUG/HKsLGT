@@ -1,12 +1,13 @@
 //! The match history screen only needs these authenticated LCU reads.
 
 use super::{
-    player_search::{may_request_history, shard_from_platform, PlayerSearchShard, Puuid},
     LcuError, LcuTarget, LcuTransport,
+    player_search::{PlayerSearchShard, Puuid, may_request_history, shard_from_platform},
 };
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 const PROFILE: &str = "/lol-summoner/v2/summoners/puuid/";
 const CURRENT_PROFILE: &str = "/lol-summoner/v1/current-summoner";
@@ -14,9 +15,11 @@ const HISTORY: &str = "/lol-match-history/v1/products/lol/";
 const DETAIL: &str = "/lol-match-history/v1/games/";
 const TIMELINE: &str = "/lol-match-history/v1/game-timelines/";
 const RANKED: &str = "/lol-ranked/v1/ranked-stats/";
+const RECOMMENDED_POSITIONS: &str = "/lol-perks/v1/recommended-champion-positions";
 const MAX_PAGE_SIZE: u32 = 200;
 const MAX_GAME_ID: u64 = (1 << 53) - 1;
 const MAX_RANKED_BYTES: usize = 64 * 1024;
+const MAX_RECOMMENDED_POSITIONS_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -32,6 +35,12 @@ struct RankedStatsShape {
     queues: Vec<Value>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecommendedPositionsRow {
+    recommended_positions: Vec<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PlayerTabRead(Read);
 
@@ -40,12 +49,16 @@ enum Read {
     Profile(Puuid),
     Matches(Puuid, Page),
     RankedStats(Puuid),
+    RecommendedPositions,
     Detail(u64),
     Timeline(u64),
 }
 
 impl PlayerTabRead {
     pub(crate) fn parse(path: &str, params: &Value) -> Option<Self> {
+        if path == RECOMMENDED_POSITIONS {
+            return params.is_null().then_some(Self(Read::RecommendedPositions));
+        }
         if let Some(id) = path.strip_prefix(PROFILE).filter(|_| params.is_null()) {
             return Some(Self(Read::Profile(Puuid::parse(id)?)));
         }
@@ -141,6 +154,25 @@ fn validate_ranked_stats(reply: Option<Value>) -> Result<Value, LcuError> {
     Ok(reply)
 }
 
+fn validate_recommended_positions(reply: Option<Value>) -> Result<Value, LcuError> {
+    let reply = reply.ok_or(LcuError::UnexpectedStatus(404))?;
+    let entries: BTreeMap<String, RecommendedPositionsRow> =
+        serde_json::from_value(reply).map_err(|_| LcuError::InvalidPayload)?;
+    let mut projected = BTreeMap::new();
+    for (id, row) in entries {
+        let numeric_id = id.parse::<i64>().map_err(|_| LcuError::InvalidPayload)?;
+        if numeric_id.to_string() != id {
+            return Err(LcuError::InvalidPayload);
+        }
+        // The client may include non-champion placeholder entries.
+        if numeric_id <= 0 {
+            continue;
+        }
+        projected.insert(id, row);
+    }
+    serde_json::to_value(projected).map_err(|_| LcuError::InvalidPayload)
+}
+
 impl LcuTransport {
     async fn read_tab_profile(
         &self,
@@ -206,6 +238,14 @@ impl LcuTransport {
                 let reply =
                     Self::read_json(self.local_json_get(target, &path), MAX_RANKED_BYTES).await?;
                 validate_ranked_stats(reply)
+            }
+            Read::RecommendedPositions => {
+                let reply = Self::read_json(
+                    self.local_json_get(target, RECOMMENDED_POSITIONS),
+                    MAX_RECOMMENDED_POSITIONS_BYTES,
+                )
+                .await?;
+                validate_recommended_positions(reply)
             }
             Read::Detail(id) | Read::Timeline(id) => {
                 let timeline = matches!(request.0, Read::Timeline(_));
@@ -275,11 +315,63 @@ mod tests {
         assert!(
             PlayerTabRead::parse("/lol-ranked/v1/current-ranked-stats", &Value::Null).is_none()
         );
-        assert!(PlayerTabRead::parse(
-            &format!("/lol-ranked/v1/ranked-stats/../current-ranked-stats"),
-            &Value::Null
-        )
-        .is_none());
+        assert!(
+            PlayerTabRead::parse(
+                &format!("/lol-ranked/v1/ranked-stats/../current-ranked-stats"),
+                &Value::Null
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn allowlists_only_the_exact_recommended_positions_get() {
+        let path = "/lol-perks/v1/recommended-champion-positions";
+        assert!(PlayerTabRead::parse(path, &Value::Null).is_some());
+        for invalid in [
+            "/lol-perks/v1/recommended-champion-positions/",
+            "/lol-perks/v1/recommended-champion-positions?x=1",
+            "/lol-perks/v1/recommended-champion-positions/1",
+            "https://example.com/lol-perks/v1/recommended-champion-positions",
+        ] {
+            assert!(PlayerTabRead::parse(invalid, &Value::Null).is_none());
+        }
+        assert!(PlayerTabRead::parse(path, &json!({"puuid": PLAYER})).is_none());
+    }
+
+    #[test]
+    fn projects_bounded_recommended_positions_records_without_filtering_ids() {
+        let reply = json!({
+            "67": {"recommendedPositions": ["MIDDLE", "BOTTOM"]},
+            "266": {"recommendedPositions": ["TOP"]},
+            "210000": {"recommendedPositions": ["FUTURE_POSITION", ""]},
+            "99999": {"recommendedPositions": []},
+            "0": {"recommendedPositions": ["UNASSIGNED"]},
+            "-1": {"recommendedPositions": ["DUMMY"]}
+        });
+        let expected = json!({
+            "67": {"recommendedPositions": ["MIDDLE", "BOTTOM"]},
+            "266": {"recommendedPositions": ["TOP"]},
+            "210000": {"recommendedPositions": ["FUTURE_POSITION", ""]},
+            "99999": {"recommendedPositions": []}
+        });
+        assert_eq!(validate_recommended_positions(Some(reply)), Ok(expected));
+        assert_eq!(
+            validate_recommended_positions(None),
+            Err(LcuError::UnexpectedStatus(404))
+        );
+
+        for invalid in [
+            json!([]),
+            json!({"01": {"recommendedPositions": ["TOP"]}}),
+            json!({"67": {"recommendedPositions": "MIDDLE"}}),
+            json!({"not-a-champion-id": {"recommendedPositions": ["TOP"]}}),
+        ] {
+            assert_eq!(
+                validate_recommended_positions(Some(invalid)),
+                Err(LcuError::InvalidPayload)
+            );
+        }
     }
 
     fn ranked_entry(queue_type: &str) -> Value {

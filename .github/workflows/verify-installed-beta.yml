@@ -20,6 +20,12 @@ on:
         description: Upgrade a per-user baseline to a machine-wide installation
         type: boolean
         default: false
+      predecessor_run:
+        description: Optional earlier installer build for this upgrade test
+        type: string
+      predecessor_sha256:
+        description: Required pinned installer SHA-256 when using an earlier build
+        type: string
 
 permissions:
   actions: read
@@ -34,6 +40,8 @@ jobs:
       LEAGUE_VERSION: ${{ inputs.version }}
       INSTALL_SCOPE: ${{ inputs.install_scope }}
       USER_TO_MACHINE: ${{ inputs.user_to_machine }}
+      PREDECESSOR_RUN: ${{ inputs.predecessor_run }}
+      PREDECESSOR_SHA256: ${{ inputs.predecessor_sha256 }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -72,7 +80,15 @@ jobs:
             throw 'Candidate provenance or SHA-256 did not match the selected build.'
           }
           $baselineOptions = @{}
-          if (Test-Path -LiteralPath './packaging/windows/beta-baseline.json') {
+          if ($env:PREDECESSOR_RUN -or $env:PREDECESSOR_SHA256) {
+            if ($env:PREDECESSOR_RUN -cnotmatch '^[1-9][0-9]*$' -or $env:PREDECESSOR_SHA256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Supply an earlier run and its exact installer SHA-256 together.' }
+            $dir = Join-Path $env:RUNNER_TEMP 'hkslgt-earlier-build'
+            gh run download $env:PREDECESSOR_RUN --repo $env:GITHUB_REPOSITORY --pattern 'HKsLGT-*-windows-x64' --dir $dir
+            if ($LASTEXITCODE) { throw 'Could not download the earlier installer.' }
+            $prior = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter '*_x64-setup.exe')
+            if ($prior.Count -ne 1 -or (Get-FileHash -LiteralPath $prior[0].FullName).Hash -ine $env:PREDECESSOR_SHA256) { throw 'The earlier installer digest did not match.' }
+            $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineInstaller=$prior[0].FullName; BaselineVersion=$prior[0].VersionInfo.ProductVersion; BaselineSha256=$env:PREDECESSOR_SHA256 }
+          } elseif (Test-Path -LiteralPath './packaging/windows/beta-baseline.json') {
             $baseline = Get-Content -LiteralPath './packaging/windows/beta-baseline.json' -Raw | ConvertFrom-Json
             ./packaging/windows/prepare-beta-baseline.ps1 -Version $baseline.version -InstallerSha256 $baseline.installerSha256 -CatalogPath (Join-Path $env:RUNNER_TEMP 'hkslgt-predecessor-catalog.json')
             $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineVersion=$baseline.version; BaselineSha256=$baseline.installerSha256 }

@@ -47,6 +47,8 @@ struct Scene {
     phase: String,
     queue_id: u64,
     response: String,
+    direct_ready_response: String,
+    direct_ready_available: bool,
     slow_search_ms: u64,
     request_trace: Vec<String>,
     posts: Vec<Instant>,
@@ -54,6 +56,7 @@ struct Scene {
 
 #[derive(Clone)]
 struct WsEvent {
+    event_type: &'static str,
     uri: &'static str,
     data: Value,
 }
@@ -84,6 +87,8 @@ impl ReadyFixture {
             phase: "Lobby".into(),
             queue_id,
             response: "None".into(),
+            direct_ready_response: "None".into(),
+            direct_ready_available: true,
             ..Scene::default()
         }));
         let event_senders = Arc::new(Mutex::new(Vec::new()));
@@ -145,6 +150,26 @@ impl ReadyFixture {
         let mut scene = self.scene.lock().unwrap();
         scene.phase = "ReadyCheck".into();
         scene.response = "None".into();
+        scene.direct_ready_response = "None".into();
+    }
+
+    fn requeue_ready_check_without_phase_change(&self) {
+        let mut scene = self.scene.lock().unwrap();
+        scene.phase = "ReadyCheck".into();
+        // The search projection may lag a new ready check. The dedicated endpoint is current.
+        scene.response = "Accepted".into();
+        scene.direct_ready_response = "None".into();
+    }
+
+    fn restart_pending_ready_check_without_phase_change(&self) {
+        let mut scene = self.scene.lock().unwrap();
+        scene.phase = "ReadyCheck".into();
+        scene.response = "None".into();
+        scene.direct_ready_response = "None".into();
+    }
+
+    fn hide_direct_ready_check(&self) {
+        self.scene.lock().unwrap().direct_ready_available = false;
     }
 
     fn set_classic(&self) {
@@ -156,16 +181,45 @@ impl ReadyFixture {
 
     fn emit_phase(&self, phase: &'static str) {
         self.emit(WsEvent {
+            event_type: "Update",
             uri: "/lol-gameflow/v1/gameflow-phase",
             data: json!(phase),
         });
     }
 
     fn emit_ready(&self, response: &'static str) {
+        self.emit_ready_event("Update", response);
+    }
+
+    fn emit_ready_event(&self, event_type: &'static str, response: &'static str) {
         self.emit(WsEvent {
+            event_type,
             uri: "/lol-matchmaking/v1/ready-check",
             data: json!({"state":"InProgress","playerResponse":response}),
         });
+    }
+
+    fn emit_ready_delete_create(&self) {
+        self.emit(WsEvent {
+            event_type: "Delete",
+            uri: "/lol-matchmaking/v1/ready-check",
+            data: Value::Null,
+        });
+        self.emit(WsEvent {
+            event_type: "Create",
+            uri: "/lol-matchmaking/v1/ready-check",
+            // Riot's pinned ReadyCheck has no ID field.
+            data: json!({"state":"InProgress","playerResponse":"None"}),
+        });
+    }
+
+    fn phase(&self) -> String {
+        self.scene.lock().unwrap().phase.clone()
+    }
+
+    fn readiness(&self) -> (String, String) {
+        let scene = self.scene.lock().unwrap();
+        (scene.response.clone(), scene.direct_ready_response.clone())
     }
 
     fn emit(&self, event: WsEvent) {
@@ -189,6 +243,16 @@ impl ReadyFixture {
 
     fn request_trace(&self) -> Vec<String> {
         self.scene.lock().unwrap().request_trace.clone()
+    }
+
+    fn request_count(&self, fragment: &str) -> usize {
+        self.scene
+            .lock()
+            .unwrap()
+            .request_trace
+            .iter()
+            .filter(|request| request.contains(fragment))
+            .count()
     }
 
     async fn wait_subscribed(&self, timeout: Duration) -> bool {
@@ -317,7 +381,7 @@ fn serve_websocket(
         loop {
             match event_rx.try_recv() {
                 Ok(WsCommand::Event(event)) if subscribed => {
-                    let payload = json!([8,"OnJsonApiEvent",{"uri":event.uri,"eventType":"Update","data":event.data}]);
+                    let payload = json!([8,"OnJsonApiEvent",{"uri":event.uri,"eventType":event.event_type,"data":event.data}]);
                     if socket
                         .send(Message::Text(payload.to_string().into()))
                         .is_err()
@@ -417,6 +481,7 @@ fn serve_http<S: Read + Write>(
         let mut scene = scene.lock().unwrap();
         scene.posts.push(now);
         scene.response = "Accepted".into();
+        scene.direct_ready_response = "Accepted".into();
         (200, json!({}), Some(now))
     } else if method == "GET" {
         let scene = scene.lock().unwrap();
@@ -443,8 +508,8 @@ fn serve_http<S: Read + Write>(
             "/lol-matchmaking/v1/search" => {
                 json!({"queueId":scene.queue_id,"readyCheck":{"state":"InProgress","playerResponse":scene.response}})
             }
-            "/lol-matchmaking/v1/ready-check" => {
-                json!({"state":"InProgress","playerResponse":scene.response})
+            "/lol-matchmaking/v1/ready-check" if scene.direct_ready_available => {
+                json!({"state":"InProgress","playerResponse":scene.direct_ready_response})
             }
             _ => Value::Null,
         };
@@ -549,6 +614,22 @@ async fn wait_for_lobby(app: &tauri::App, fixture: &ReadyFixture) -> bool {
         );
         false
     }
+}
+
+async fn wait_for_request_count(
+    fixture: &ReadyFixture,
+    fragment: &str,
+    minimum: usize,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if fixture.request_count(fragment) >= minimum {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fixture.request_count(fragment) >= minimum
 }
 
 #[test]
@@ -677,6 +758,168 @@ fn ready_check_event_does_not_accept_non_aram_queue() {
             fixture.post_count(),
             0,
             "non-ARAM state must not invoke the accept route"
+        );
+        monitor.abort();
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable Windows desktop runner; reproduces consecutive id-less ready checks"]
+fn second_ready_check_after_accept_is_accepted_again_without_intermediate_champ_select() {
+    let mut fixture = ReadyFixture::start(450);
+    let (app, _client) = app_with_runtime(&fixture);
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::block_on(async {
+        consume_startup_refresh(&app).await;
+        let monitor = tauri::async_runtime::spawn(monitor(app_handle));
+        assert!(wait_for_lobby(&app, &fixture).await);
+        assert!(fixture.wait_subscribed(Duration::from_secs(3)).await);
+
+        fixture.ready_check();
+        fixture.emit_phase("ReadyCheck");
+        fixture.emit_ready("None");
+        fixture.emit_ready("None");
+        fixture
+            .receive_post(Duration::from_millis(900))
+            .await
+            .expect("the first pending ready check should be accepted");
+        assert_eq!(fixture.post_count(), 1);
+
+        // Model the first response update, then a fresh id-less Delete/Create pair in the
+        // same queue/party/phase. Search remains stale Accepted while the direct read is Pending.
+        fixture.emit_ready("Accepted");
+        fixture.requeue_ready_check_without_phase_change();
+        assert_eq!(fixture.readiness(), ("Accepted".into(), "None".into()));
+        fixture.emit_ready_delete_create();
+        fixture.emit_ready("None");
+        fixture.emit_ready("None");
+
+        let started = Instant::now();
+        let second_post = fixture
+            .receive_post(Duration::from_millis(900))
+            .await
+            .expect(
+                "a new Pending direct ready-check must be accepted despite stale search Accepted",
+            );
+        assert!(
+            second_post.duration_since(started) < Duration::from_millis(900),
+            "second ready-check acceptance missed the event wake bound"
+        );
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            fixture.post_count(),
+            2,
+            "duplicate events must not accept twice"
+        );
+        assert_eq!(
+            fixture.phase(),
+            "ReadyCheck",
+            "the scenario must have no intervening ChampSelect"
+        );
+        monitor.abort();
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable Windows desktop runner; verifies a new pending round restarts its delay"]
+fn new_pending_ready_check_restarts_accept_delay_after_delete_create() {
+    let mut fixture = ReadyFixture::start(450);
+    let (app, _client) = app_with_runtime(&fixture);
+    app.state::<ClientRuntime>()
+        .replace_room_options(
+            &app.handle(),
+            RoomOptions {
+                accept: true,
+                accept_delay: Duration::from_millis(1200),
+                ..RoomOptions::default()
+            },
+        )
+        .unwrap();
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::block_on(async {
+        consume_startup_refresh(&app).await;
+        let monitor = tauri::async_runtime::spawn(monitor(app_handle));
+        assert!(wait_for_lobby(&app, &fixture).await);
+        assert!(fixture.wait_subscribed(Duration::from_secs(3)).await);
+
+        let ready_reads_before = fixture.request_count("GET /lol-matchmaking/v1/ready-check");
+        fixture.ready_check();
+        fixture.emit_phase("ReadyCheck");
+        fixture.emit_ready_event("Create", "None");
+        assert!(
+            wait_for_request_count(
+                &fixture,
+                "GET /lol-matchmaking/v1/ready-check",
+                ready_reads_before + 1,
+                Duration::from_secs(1),
+            )
+            .await
+        );
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        fixture.restart_pending_ready_check_without_phase_change();
+        let requeued_at = Instant::now();
+        fixture.emit_ready_delete_create();
+        fixture.emit_ready("None");
+        fixture.emit_ready("None");
+        assert!(
+            fixture
+                .receive_post(Duration::from_millis(900))
+                .await
+                .is_none(),
+            "the previous round's accept timer must not fire early for the new ready check"
+        );
+        let post = fixture
+            .receive_post(Duration::from_millis(700))
+            .await
+            .expect("the new pending round should accept after its full delay");
+        assert!(
+            post.duration_since(requeued_at) >= Duration::from_millis(900),
+            "new ready-check was accepted before its delay elapsed: {:?}",
+            post.duration_since(requeued_at)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            fixture.post_count(),
+            1,
+            "the new round must produce one accept POST"
+        );
+        monitor.abort();
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable Windows desktop runner; rejects stale search readiness"]
+fn missing_direct_ready_check_never_accepts_stale_search_pending() {
+    let mut fixture = ReadyFixture::start(450);
+    let (app, _client) = app_with_runtime(&fixture);
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::block_on(async {
+        consume_startup_refresh(&app).await;
+        let monitor = tauri::async_runtime::spawn(monitor(app_handle));
+        assert!(wait_for_lobby(&app, &fixture).await);
+        assert!(fixture.wait_subscribed(Duration::from_secs(3)).await);
+
+        fixture.ready_check();
+        fixture.hide_direct_ready_check();
+        let ready_reads_before = fixture.request_count("GET /lol-matchmaking/v1/ready-check");
+        fixture.emit_phase("ReadyCheck");
+        fixture.emit_ready_event("Create", "None");
+        assert!(
+            wait_for_request_count(
+                &fixture,
+                "GET /lol-matchmaking/v1/ready-check",
+                ready_reads_before + 1,
+                Duration::from_secs(1),
+            )
+            .await
+        );
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            fixture.post_count(),
+            0,
+            "a missing direct ready-check must not fall back to stale /search Pending"
         );
         monitor.abort();
     });

@@ -32,6 +32,8 @@ use tauri::{AppHandle, Manager};
 
 #[path = "lcu_events.rs"]
 mod lcu_events;
+#[path = "post_game.rs"]
+mod post_game;
 
 const CLIENT_DISCOVERY: &str = "league-client-ux-main";
 const SGP: &str = "sgp-main";
@@ -78,16 +80,36 @@ impl CompanionDemand {
     }
 
     fn reads_aux_selection(self, phase: &str, game: Option<&GameflowSession>) -> bool {
-        self.aux
-            && phase == "ChampSelect"
-            && game.and_then(GameflowSession::aux_game_mode)
-                .is_none_or(|mode| matches!(mode, "ARAM" | "KIWI"))
+        if !self.aux {
+            return false;
+        }
+        let relevant = match phase {
+            "ChampSelect" => game.filter(|game| game.phase == "ChampSelect"),
+            "" | "Matchmaking" | "ReadyCheck" => match game {
+                Some(game) if game.phase == "ChampSelect"
+                    || (matches!(phase, "" | "ReadyCheck") && game.phase == "ReadyCheck"
+                        && game.game_data.as_ref().and_then(|data| data.game_id).is_some_and(|id| id > 0)) => Some(game),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        relevant.is_none_or(|game| {
+            let queue = game.queue();
+            match queue.and_then(|q| q.game_mode.as_deref()).filter(|mode| !mode.is_empty()) {
+                Some(mode) => matches!(mode, "ARAM" | "KIWI"),
+                None => match queue.and_then(|q| q.id) {
+                    Some(450 | 2400) => true,
+                    Some(id) if id > 0 => false,
+                    _ => game.aux_game_mode().is_none_or(|mode| matches!(mode, "ARAM" | "KIWI")),
+                },
+            }
+        })
     }
 
     fn reads_selection(self, phase: &str, game: Option<&GameflowSession>, automate: bool) -> bool {
-        phase == "ChampSelect"
-            && (self.reads_aux_selection(phase, game)
-                || game.is_some_and(|game| {
+        self.reads_aux_selection(phase, game)
+            || (phase == "ChampSelect"
+                && game.filter(|game| game.phase == phase).is_some_and(|game| {
                     ((automate || self.opgg) && game.is_aram())
                         || (self.resg && game.is_hextech_aram())
                 }))
@@ -172,6 +194,7 @@ struct FreshAuxSelection {
 
 struct ReadyEventWatch {
     instance: ClientInstance,
+    rounds: Arc<Mutex<lcu_events::ReadyEventDeduper>>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -186,6 +209,8 @@ struct RoomReads {
     lobby: Option<Value>,
     search: Option<Value>,
     search_read: bool,
+    ready_round: u64,
+    ready_verified: bool,
 }
 
 impl RoomReads {
@@ -195,18 +220,20 @@ impl RoomReads {
         player: Option<&str>,
         activity: &AuxActivity,
     ) -> Option<RoomSample> {
-        let phase = activity.view()?.phase;
+        let view = activity.view()?;
+        let phase = view.phase;
         if phase == AuxPhase::ChampSelect {
             return None;
         }
-        Some(RoomSample::new(
+        let sample = RoomSample::new(
             client,
             phase,
             player.filter(|p| !p.is_empty())?,
             self.lobby.as_ref(),
             self.search.as_ref(),
             self.search_read,
-        ))
+        );
+        Some(sample.with_ready_round(self.ready_round, view.game_id))
     }
 }
 
@@ -226,6 +253,14 @@ async fn optional_lcu<T>(
         .await
         .ok()
         .and_then(Result::ok)
+}
+
+fn aux_sample_read<T>(result: Result<Option<T>, LcuError>, recovering_draft: bool) -> Result<Option<T>, LcuError> {
+    match result {
+        Err(LcuError::Timeout | LcuError::Transport | LcuError::InvalidPayload
+            | LcuError::ResponseTooLarge | LcuError::UnexpectedStatus(500..=599)) if recovering_draft => Ok(None),
+        other => other,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -315,6 +350,8 @@ impl Snapshot {
             (CLIENT, "summoner") => Some(json!({"me": active.map(|client| &client.summoner)})),
             (aux_activity::NAMESPACE, "state") => Some(json!({
                 "view": active.and_then(|client| client.aux_activity.view()),
+                "verifyingDraft": active.is_some_and(|client| matches!(client.phase.as_str(), "ChampSelect" | "ReadyCheck" | "Matchmaking")
+                    && matches!(client.aux_activity, AuxActivity::Unconfirmed)),
             })),
             (opgg_window::NAMESPACE, "state") => Some(json!({
                 "draft": active.and_then(|client| client.companions.opgg).map(OpggTarget::view),
@@ -356,6 +393,7 @@ struct RuntimeState {
     aram_paused: bool,
     aram: AramSchedule,
     room_flow: RoomFlow,
+    post_game: post_game::PostGame,
     published_room: Value,
     published_draft: Value,
     data_client: Option<ClientInstance>,
@@ -465,6 +503,7 @@ impl RuntimeState {
         client: Option<Arc<LocalClient>>,
     ) -> Option<crate::lcu::RoomAction> {
         let due = snapshot.observe_room(&mut self.room_flow);
+        self.post_game.observe(&snapshot, Instant::now());
         if self.aram_paused && self.snapshot.left_draft(&snapshot) {
             self.aram_paused = false;
             self.aram.reset();
@@ -505,10 +544,10 @@ impl RuntimeState {
                 self.revision,
             );
         }
-        if let Some(client) = active {
+        if let Some(client) = self.art_client.as_ref() {
             self.data_task = Some(tauri::async_runtime::spawn(load_game_data(
                 app.clone(),
-                client,
+                Arc::clone(client),
                 self.data_ticket,
             )));
         }
@@ -521,6 +560,7 @@ pub(crate) struct ClientRuntime {
     wake: Arc<tokio::sync::Notify>,
     art_reads: tokio::sync::Semaphore,
     room_writes: tokio::sync::Mutex<()>,
+    post_game_writes: tokio::sync::Mutex<()>,
     selection_writes: tokio::sync::Mutex<()>,
     ready_event_watch: Mutex<Option<ReadyEventWatch>>,
     #[cfg(test)]
@@ -541,6 +581,7 @@ impl ClientRuntime {
             wake: Arc::new(tokio::sync::Notify::new()),
             art_reads: tokio::sync::Semaphore::new(4),
             room_writes: tokio::sync::Mutex::new(()),
+            post_game_writes: tokio::sync::Mutex::new(()),
             selection_writes: tokio::sync::Mutex::new(()),
             ready_event_watch: Mutex::new(None),
             #[cfg(test)]
@@ -591,11 +632,14 @@ impl ClientRuntime {
             let instance = client.instance;
             let transport = self.transport.clone();
             let wake = Arc::clone(&self.wake);
+            let rounds = Arc::new(Mutex::new(lcu_events::ReadyEventDeduper::default()));
+            let events = Arc::clone(&rounds);
             let task = tauri::async_runtime::spawn(async move {
-                lcu_events::watch_ready_events(client, transport, wake).await;
+                lcu_events::watch_ready_events(client, transport, wake, events).await;
             });
             *watch = Some(ReadyEventWatch {
                 instance,
+                rounds,
                 task,
             });
         }
@@ -702,6 +746,9 @@ impl ClientRuntime {
             self.dispatch_due_room(app, client, generation, action)
                 .await;
         }
+        if let Some(turn) = self.post_game_turn() {
+            self.process_post_game(app, client, generation, turn).await;
+        }
     }
 
     #[cfg(test)]
@@ -732,6 +779,8 @@ impl ClientRuntime {
             lobby,
             search,
             search_read: true,
+            ready_round: 0,
+            ready_verified: false,
         }
         .sample(instance, Some(PLAYER), &aux_activity);
         let room_unconfirmed = matches!(aux_activity, AuxActivity::Unconfirmed);
@@ -1380,17 +1429,42 @@ impl ClientRuntime {
         Ok(())
     }
 
-    async fn read_aux_room(&self, target: &LcuTarget<'_>, phase: &str, enabled: bool) -> RoomReads {
+    fn ready_round(&self, instance: ClientInstance) -> lcu_events::ReadyRound {
+        self.ready_event_watch.lock().ok().and_then(|watch| {
+            let watch = watch.as_ref().filter(|w| w.instance == instance)?;
+            watch.rounds.lock().ok().map(|rounds| rounds.current())
+        }).unwrap_or_default()
+    }
+
+    fn verify_ready_read(
+        &self,
+        instance: ClientInstance,
+        before: lcu_events::ReadyRound,
+        in_progress: bool,
+    ) -> (lcu_events::ReadyRound, bool) {
+        if let Ok(watch) = self.ready_event_watch.lock() {
+            if let Some(watch) = watch.as_ref().filter(|watch| watch.instance == instance) {
+                if let Ok(mut rounds) = watch.rounds.lock() {
+                    let verified = in_progress && rounds.confirm_http(before);
+                    return (rounds.current(), verified);
+                }
+            }
+        }
+        let after = lcu_events::ReadyRound::default();
+        (after, in_progress && before == after)
+    }
+
+    async fn read_aux_room(&self, target: &LcuTarget<'_>, instance: ClientInstance, phase: &str, enabled: bool) -> RoomReads {
         if !enabled || !matches!(phase, "Lobby" | "Matchmaking" | "ReadyCheck") {
             return RoomReads::default();
         }
+        let before = self.ready_round(instance);
         let direct_ready = async {
             if phase != "ReadyCheck" {
                 return None;
             }
             optional_lcu(self.transport.read_aux_ready_check(target))
                 .await
-                .flatten()
         };
         let (lobby, search_result, direct_ready) = join3(
             optional_lcu(self.transport.read_aux_lobby(target)),
@@ -1399,26 +1473,30 @@ impl ClientRuntime {
         )
         .await;
         let search_read = search_result.is_some();
-        let mut search = search_result.flatten();
-        if let Some(ready) = direct_ready.filter(Value::is_object) {
-            let from_search = search
-                .as_ref()
-                .and_then(|s| s["readyCheck"]["playerResponse"].as_str());
-            let from_ready = ready["playerResponse"].as_str();
-            // The dedicated ready-check is authoritative for a confirmed change of answer.
-            // A still-pending response must not replace an accepted/declined search event.
-            if matches!(from_ready, Some("Accepted" | "Declined"))
-                || (!matches!(from_search, Some("Accepted" | "Declined"))
-                    && (from_search != Some("None")
-                        || matches!(ready["state"].as_str(), Some("Invalid" | "EveryoneReady"))))
-            {
-                search.get_or_insert_with(|| json!({}))["readyCheck"] = ready;
+        let mut search = search_result.flatten().filter(Value::is_object);
+        let ready = direct_ready.as_ref().and_then(Option::as_ref);
+        let in_progress = ready.is_some_and(|ready| {
+            ready["state"] == "InProgress"
+                && matches!(ready["playerResponse"].as_str(), Some("None" | "Accepted" | "Declined"))
+        });
+        let (after, ready_verified) = self.verify_ready_read(instance, before, in_progress);
+        if phase == "ReadyCheck" {
+            if ready_verified {
+                // The nested search result can still hold the previous round's answer.
+                search.get_or_insert_with(|| json!({}))["readyCheck"] =
+                    direct_ready.flatten().expect("verified ready response");
+            } else if after.closed || before != after || direct_ready.is_some() {
+                if let Some(search) = &mut search {
+                    search["readyCheck"] = Value::Null;
+                }
             }
         }
         RoomReads {
             lobby: lobby.flatten(),
             search,
             search_read,
+            ready_round: after.number,
+            ready_verified,
         }
     }
 
@@ -1434,24 +1512,48 @@ impl ClientRuntime {
             return Ok(None);
         }
         let target = client.target()?;
-        let Some(phase) = self.transport.read_phase(&target).await? else {
-            return Ok(None);
-        };
         let room_enabled = self
             .state
             .lock()
             .is_ok_and(|s| s.room_flow.options.search || s.room_flow.options.accept);
-        let (summoner, session, reads) = join3(
-            self.transport.read_current_summoner(&target),
+        let phase_read = self.transport.read_phase(&target);
+        let summoner_read = self.transport.read_current_summoner(&target);
+        tokio::pin!(phase_read, summoner_read);
+        let first = Duration::from_millis(750);
+        let (session, direct, summoner) = join3(
             optional_lcu(self.transport.read_gameflow_session(&target)),
-            self.read_aux_room(&target, &phase, demand.aux || room_enabled),
+            tokio::time::timeout(first, &mut phase_read),
+            tokio::time::timeout(first, &mut summoner_read),
         )
         .await;
-        let summoner = summoner?;
         let flow_snapshot = session.flatten();
+        let flow = flow_snapshot.as_ref();
+        let flow_is_draft = demand.reads_aux_selection("", flow);
+        // A missing endpoint can only be replaced by other fresh evidence from this client.
+        // Keep the usual request deadline in other modes and propagate authentication failures.
+        let direct = match direct {
+            Ok(result) => result,
+            Err(_) if flow_is_draft => Err(LcuError::Timeout),
+            Err(_) => phase_read.await,
+        };
+        let direct = aux_sample_read(direct, flow_is_draft)?;
+        let phase = match direct.as_deref() {
+            Some(phase) if !phase.is_empty() => phase,
+            _ if flow_is_draft && flow.is_some_and(|game| game.phase == "ReadyCheck") => "ReadyCheck",
+            _ if flow_is_draft => "ChampSelect",
+            _ => return Ok(None),
+        };
+        let raw_phase = direct.as_deref().unwrap_or("");
+        let read_aux_draft = demand.reads_aux_selection(raw_phase, flow);
+        let summoner = match summoner {
+            Ok(result) => result,
+            Err(_) if read_aux_draft => Err(LcuError::Timeout),
+            Err(_) => summoner_read.await,
+        };
+        let summoner = aux_sample_read(summoner, read_aux_draft)?;
         let session = flow_snapshot
             .as_ref()
-            .filter(|session| session.phase == phase);
+            .filter(|session| session.phase == raw_phase);
         let mut shard = None;
         if let Some(player) = summoner.as_ref() {
             shard = if let Some((_, shard)) =
@@ -1470,14 +1572,14 @@ impl ClientRuntime {
             };
         }
         let select = async {
-            if demand.reads_selection(&phase, session, automate) {
+            if demand.reads_selection(raw_phase, flow, automate) {
                 optional_lcu(self.transport.read_champ_select(&target)).await
             } else {
                 None
             }
         };
         let own_champion = async {
-            if demand.reads_aux_selection(&phase, session) {
+            if read_aux_draft {
                 tokio::time::timeout(
                     Duration::from_millis(550),
                     self.transport.read_aux_current_champion(&target),
@@ -1490,7 +1592,17 @@ impl ClientRuntime {
                 None
             }
         };
-        let (selection, current_champion) = futures_util::future::join(select, own_champion).await;
+        let (selection, current_champion, reads) = join3(
+            select, own_champion, self.read_aux_room(&target, client.instance, raw_phase, demand.aux || room_enabled)
+        ).await;
+        let player = summoner.as_ref().map(|player| player.puuid.as_str());
+        let previous_game_mode = selection.as_ref().filter(|s| {
+            read_aux_draft && raw_phase == "ChampSelect" && s["queueId"].as_u64().unwrap_or(0) == 0
+        }).and_then(|select| {
+            let state = self.state.lock().ok()?;
+            let previous = state.snapshot.active.as_ref().filter(|active| active.instance == client.instance)?;
+            previous.aux_activity.view()?.mode_for_same_game(player, select)
+        });
         let companions = demand.targets(
             client.instance,
             session,
@@ -1498,7 +1610,7 @@ impl ClientRuntime {
             summoner.as_ref().map(|player| player.puuid.as_str()),
             previous_chart,
         );
-        let extras = if demand.aux && phase == "ChampSelect" {
+        let extras = if demand.aux && raw_phase == "ChampSelect" {
             if let Some(select) = selection.as_ref().filter(|select| select.is_object()) {
                 self.transport
                     .read_aux_selection_extras(&target, select)
@@ -1511,7 +1623,7 @@ impl ClientRuntime {
             None
         };
         let activity = AuxActivity::project_observed(
-            &phase,
+            raw_phase,
             flow_snapshot.as_ref(),
             reads.lobby.as_ref(),
             reads.search.as_ref(),
@@ -1519,7 +1631,8 @@ impl ClientRuntime {
                 session: selection.as_ref(),
                 extras: extras.as_ref(),
                 current_champion,
-                player: summoner.as_ref().map(|player| player.puuid.as_str()),
+                player,
+                previous_game_mode,
             },
         );
         let room = reads.sample(
@@ -1542,7 +1655,7 @@ impl ClientRuntime {
         Ok(client.alive().then(|| {
             let client = ActiveClient {
                 instance: client.instance,
-                phase,
+                phase: phase.to_owned(),
                 session: gameflow_view,
                 summoner: json!(summoner),
                 companions,
@@ -1653,6 +1766,15 @@ impl ClientRuntime {
             self.dispatch_due_room(app, client, generation, action)
                 .await;
         }
+        if let (Some(client), Some(turn)) = (candidate, self.post_game_turn()) {
+            let app = app.clone();
+            let client = Arc::clone(client);
+            tauri::async_runtime::spawn(async move {
+                app.state::<ClientRuntime>()
+                    .process_post_game(&app, &client, generation, turn)
+                    .await;
+            });
+        }
         if let (Some(client), Some(options), Some((flow, select))) = (candidate, options, selection)
         {
             self.automate_aram(generation, client, &flow, &select, &options)
@@ -1690,7 +1812,9 @@ impl ClientRuntime {
         generation: u64,
         action: crate::lcu::RoomAction,
     ) {
-        if let Err(error) = self.write_room(client, action, generation, true).await {
+        let result = self.write_room(client, action, generation, true).await;
+        let retry_read = matches!(result, Ok(false)) && action == RoomAction::AcceptReadyCheck;
+        if let Err(error) = result {
             let event = if action == crate::lcu::RoomAction::AcceptReadyCheck {
                 "error-accept-match"
             } else {
@@ -1703,7 +1827,7 @@ impl ClientRuntime {
             }
         }
         if let Ok(mut state) = self.state.lock() {
-            if state.generation == generation {
+            if state.generation == generation && !retry_read {
                 state.room_flow.cancel(action);
             }
             state.publish_room(app);
@@ -1716,7 +1840,9 @@ impl ClientRuntime {
         action: crate::lcu::RoomAction,
         generation: u64,
     ) -> Result<(), String> {
-        self.write_room(client, action, generation, false).await
+        self.write_room(client, action, generation, false)
+            .await
+            .map(|_| ())
     }
 
     async fn write_room(
@@ -1725,7 +1851,7 @@ impl ClientRuntime {
         action: crate::lcu::RoomAction,
         generation: u64,
         automatic: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let _writer = self.room_writes.lock().await;
         let same_client = |state: &RuntimeState| {
             state.generation == generation
@@ -1744,7 +1870,7 @@ impl ClientRuntime {
         };
         let stale = || {
             if automatic {
-                Ok(())
+                Ok(false)
             } else {
                 Err("房间或准备确认状态已改变，请重新查看。".to_string())
             }
@@ -1764,9 +1890,14 @@ impl ClientRuntime {
         let (summoner, flow, reads) = join3(
             self.transport.read_current_summoner(&target),
             optional_lcu(self.transport.read_gameflow_session(&target)),
-            self.read_aux_room(&target, &phase, true),
+            self.read_aux_room(&target, client.instance, &phase, true),
         )
         .await;
+        if matches!(action, RoomAction::AcceptReadyCheck | RoomAction::DeclineReadyCheck)
+            && !reads.ready_verified
+        {
+            return stale();
+        }
         let summoner = summoner.map_err(|e| e.to_string())?;
         let activity = AuxActivity::project_observed(
             &phase,
@@ -1785,7 +1916,9 @@ impl ClientRuntime {
         };
         {
             let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
-            if !same_client(&state) || !state.room_flow.current(&fresh, action, automatic) {
+            let round = self.ready_round(client.instance);
+            if !same_client(&state) || !fresh.round_is_current(round.number, round.closed)
+                || !state.room_flow.current(&fresh, action, automatic) {
                 return stale();
             }
             state.room_flow.mark_sent(action);
@@ -1797,7 +1930,7 @@ impl ClientRuntime {
             }
         }
         self.refresh_soon();
-        result.map_err(|e| e.to_string())
+        result.map(|_| true).map_err(|e| e.to_string())
     }
 
     async fn automate_aram(
@@ -1908,18 +2041,8 @@ impl ClientRuntime {
     }
 }
 
-async fn load_game_data(app: AppHandle, instance: ClientInstance, ticket: u64) {
+async fn load_game_data(app: AppHandle, client: Arc<LocalClient>, ticket: u64) {
     let runtime = app.state::<ClientRuntime>();
-    let Ok(Some(client)) = tauri::async_runtime::spawn_blocking(move || {
-        discover_clients()
-            .ok()?
-            .into_iter()
-            .find(|client| client.instance == instance)
-    })
-    .await
-    else {
-        return;
-    };
     let Ok(target) = client.target() else {
         return;
     };
@@ -1929,7 +2052,7 @@ async fn load_game_data(app: AppHandle, instance: ClientInstance, ticket: u64) {
     let Ok(mut state) = runtime.state.lock() else {
         return;
     };
-    if state.data_ticket != ticket || state.data_client != Some(instance) || !client.alive() {
+    if state.data_ticket != ticket || state.data_client != Some(client.instance) || !client.alive() {
         return;
     }
     state.revision += 1;

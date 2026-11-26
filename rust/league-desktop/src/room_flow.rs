@@ -14,6 +14,8 @@ pub(crate) fn is_room_setting(key: &str) -> bool {
         key,
         "autoAcceptEnabled"
             | "autoAcceptDelaySeconds"
+            | "autoHonorEnabled"
+            | "playAgainEnabled"
             | "autoMatchmakingEnabled"
             | "autoMatchmakingDelaySeconds"
             | "autoMatchmakingMinimumMembers"
@@ -37,6 +39,8 @@ pub(crate) fn valid_number(key: &str, value: &Value) -> bool {
 pub(crate) struct RoomOptions {
     pub(crate) search: bool,
     pub(crate) accept: bool,
+    pub(crate) honor: bool,
+    pub(crate) play_again: bool,
     pub(crate) search_delay: Duration,
     pub(crate) accept_delay: Duration,
     pub(crate) minimum_members: usize,
@@ -48,6 +52,8 @@ impl Default for RoomOptions {
         Self {
             search: false,
             accept: false,
+            honor: false,
+            play_again: false,
             search_delay: Duration::from_secs(5),
             accept_delay: Duration::ZERO,
             minimum_members: 1,
@@ -68,6 +74,8 @@ impl RoomOptions {
         Self {
             search: settings["autoMatchmakingEnabled"] == true,
             accept: settings["autoAcceptEnabled"] == true,
+            honor: settings["autoHonorEnabled"] == true,
+            play_again: settings["playAgainEnabled"] == true,
             search_delay: delay("autoMatchmakingDelaySeconds", defaults.search_delay),
             accept_delay: delay("autoAcceptDelaySeconds", defaults.accept_delay),
             minimum_members: settings["autoMatchmakingMinimumMembers"]
@@ -101,6 +109,8 @@ pub(crate) struct RoomSample {
     penalty: Option<bool>,
     can_start: Option<bool>,
     ready: Option<ReadyResponse>,
+    ready_round: u64,
+    ready_game_id: Option<u64>,
 }
 
 impl RoomSample {
@@ -148,6 +158,8 @@ impl RoomSample {
             invitations_pending,
             penalty,
             ready,
+            ready_round: 0,
+            ready_game_id: None,
             party: lobby
                 .and_then(|l| l["partyId"].as_str())
                 .filter(|s| !s.is_empty())
@@ -161,10 +173,27 @@ impl RoomSample {
         }
     }
 
+    pub(crate) fn with_ready_round(mut self, number: u64, game_id: Option<u64>) -> Self {
+        if self.phase == AuxPhase::ReadyCheck {
+            self.ready_round = number;
+            self.ready_game_id = game_id;
+        }
+        self
+    }
+
+    pub(crate) fn round_is_current(&self, number: u64, closed: bool) -> bool {
+        self.phase != AuxPhase::ReadyCheck || (!closed && self.ready_round == number)
+    }
+
     pub(crate) fn same_room(&self, other: &Self) -> bool {
         self.instance == other.instance
             && self.player == other.player
             && self.phase == other.phase
+            && self.ready_round == other.ready_round
+            && self
+                .ready_game_id
+                .zip(other.ready_game_id)
+                .is_none_or(|(left, right)| left == right)
             && self
                 .party
                 .as_ref()
@@ -325,8 +354,15 @@ impl RoomFlow {
 
     pub(crate) fn next_poll(&self, now: Instant) -> Option<Duration> {
         self.pending.as_ref().map(|p| {
-            p.delay
-                .saturating_sub(now.saturating_duration_since(p.since))
+            let left = p
+                .delay
+                .saturating_sub(now.saturating_duration_since(p.since));
+            if left.is_zero() {
+                // A due confirmation whose final read was inconclusive can retry without spinning.
+                Duration::from_millis(250)
+            } else {
+                left
+            }
         })
     }
 

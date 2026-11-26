@@ -58,6 +58,9 @@ pub(crate) mod aux_activity;
 #[path = "player_tab_read.rs"]
 pub(crate) mod player_tab_read;
 
+#[path = "lcu_post_game.rs"]
+pub(crate) mod post_game;
+
 /// Borrow the port and token that trusted desktop discovery verified for the same client generation.
 pub(crate) struct LcuTarget<'a> {
     port: NonZeroU16,

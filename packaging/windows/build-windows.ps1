@@ -23,6 +23,10 @@ $revision = (git -C $root rev-parse HEAD).Trim()
 if ($env:GITHUB_SHA -and $revision -cne $env:GITHUB_SHA) { throw 'Unexpected workflow checkout.' }
 
 $known = [ordered]@{
+  'trusted-1.0.0-beta.13.json' = '3f46a024b631c0b615fe7ea2610818e512892cfbfa94168e92cf7287286e3ac1'
+  'trusted-1.0.0-beta.14.json' = '68304581334ce96a441d6140e13cfec18ea32f878660d76fdd12d4a2afa1c923'
+  'trusted-1.0.0-beta.15.json' = 'df7e870ab9de3ebb6f03b78d7ec524883cebd6ffb676127b224c98b7df7976b0'
+  'trusted-1.0.0-beta.16-final.json' = '9a5698c4fcabb73375a3a06f4889b6971ffbd4fbaf8c14917e0cf93b45b1216f'
   'trusted-1.0.0-beta.16-interactive.json' = '08abc5eb5cf0d473a3e1c8305a2abef710faf066a72951bbd112e92216eff1ea'
   'trusted-1.0.0-beta.16-preview.json' = 'dc5d1b5b204c7115d21fda8d6b9203f95d2cc4ac04f1bf6f080b8536876bc08c'
   'trusted-1.0.0-beta.5.json' = '85c33b257b4bcb4faa77ea8bbe947cd69deadbffdda0618711e0cc5177d50bc9'
@@ -81,8 +85,20 @@ try {
     } finally {
       $env:HKSLGT_HISTORY_ONLY = $previousHistoryOnly
     }
+    foreach ($scenario in @('HKSLGT_PARTIAL_KIWI_ONLY', 'HKSLGT_CHAMPION_PICKER_ONLY', 'HKSLGT_POST_GAME_ONLY')) {
+      $previousScenario = [Environment]::GetEnvironmentVariable($scenario)
+      try {
+        [Environment]::SetEnvironmentVariable($scenario, '1')
+        cargo test @cargoArgs --manifest-path $desktopManifest $companionTest -- --ignored --exact --nocapture
+      } finally {
+        [Environment]::SetEnvironmentVariable($scenario, $previousScenario)
+      }
+    }
     foreach ($case in @(
       'ready_check_event_wakes_monitor_and_accepts_once_with_slow_lcu_reads',
+      'second_ready_check_after_accept_is_accepted_again_without_intermediate_champ_select',
+      'new_pending_ready_check_restarts_accept_delay_after_delete_create',
+      'missing_direct_ready_check_never_accepts_stale_search_pending',
       'polling_baseline_accept_waits_for_next_two_second_monitor_tick',
       'monitor_falls_back_to_normal_polling_after_event_socket_closes',
       'ready_check_event_does_not_accept_non_aram_queue'

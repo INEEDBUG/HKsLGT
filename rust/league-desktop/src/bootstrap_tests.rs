@@ -141,14 +141,18 @@ fn room_controls_reopen_legacy_sqlite_settings_and_reject_invalid_numbers() {
         let db = profile.open();
         let defaults = room_options(&db).unwrap();
         assert!(!defaults.accept && !defaults.search);
+        assert!(!defaults.honor && !defaults.play_again);
         assert_eq!(defaults.search_delay, Duration::from_secs(5));
         for (name, value) in [
             ("autoAcceptEnabled", json!(true)),
+            ("autoHonorEnabled", json!(true)),
+            ("playAgainEnabled", json!(true)),
             ("autoMatchmakingEnabled", json!(true)),
             ("autoAcceptDelaySeconds", json!(1.5)),
             ("autoMatchmakingMinimumMembers", json!(99)),
             ("autoMatchmakingWaitForInvitees", json!(false)),
         ] {
+            assert!(crate::room_flow::is_room_setting(name));
             backend_pref(crate::room_flow::NAMESPACE, name)
                 .unwrap()
                 .write(&db, &value)
@@ -170,6 +174,7 @@ fn room_controls_reopen_legacy_sqlite_settings_and_reject_invalid_numbers() {
     let db = profile.open();
     let restored = room_options(&db).unwrap();
     assert!(restored.accept && restored.search && !restored.wait_for_invitees);
+    assert!(restored.honor && restored.play_again);
     assert_eq!(restored.accept_delay, Duration::from_millis(1500));
     assert_eq!(restored.minimum_members, 99);
     assert_eq!(
