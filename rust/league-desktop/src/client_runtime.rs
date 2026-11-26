@@ -822,17 +822,19 @@ impl ClientRuntime {
             search.as_ref(),
             selection.as_ref(),
         );
+        let gameflow_view = json!(session);
+        let use_for_automation = automate && session.is_some();
         Ok(client.alive().then(|| {
             let client = ActiveClient {
                 instance: client.instance,
                 phase,
-                session: json!(session),
+                session: gameflow_view,
                 summoner: json!(summoner),
                 companions,
                 aux_activity,
                 shard,
             };
-            let selection = if automate && session.is_some() {
+            let selection = if use_for_automation {
                 flow_snapshot.zip(selection)
             } else {
                 None
