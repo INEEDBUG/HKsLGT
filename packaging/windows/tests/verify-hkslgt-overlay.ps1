@@ -7,7 +7,8 @@ param(
   [ValidatePattern('^\d+\.\d+\.\d+-beta\.\d+$')][string]$BaselineVersion = '1.0.0-beta.5',
   [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$BaselineSha256 = 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4',
   [string]$SameVersionBaseline,
-  [ValidateSet('currentuser','allusers')][string]$InstallScope = 'currentuser'
+  [ValidateSet('currentuser','allusers')][string]$InstallScope = 'currentuser',
+  [switch]$UserToMachine
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,10 +22,10 @@ function Run-Installer([string]$File, [string]$Arguments) {
   if ($result.ExitCode -ne 0) { throw "League installer returned $($result.ExitCode)." }
 }
 
-function Assert-Install([string]$ExpectedVersion) {
-  $version = Get-ItemPropertyValue -LiteralPath $uninstallKey -Name DisplayVersion
-  $location = (Get-ItemPropertyValue -LiteralPath $installKey -Name InstallLocation).Trim('"')
-  if ($version -cne $ExpectedVersion -or $location -ine $program -or !(Test-Path -LiteralPath $executable -PathType Leaf)) {
+function Assert-Install([string]$ExpectedVersion, [string]$RegistryHive = $hive, [string]$Directory = $program) {
+  $version = Get-ItemPropertyValue -LiteralPath "$RegistryHive\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity" -Name DisplayVersion
+  $location = (Get-ItemPropertyValue -LiteralPath "$RegistryHive\Software\$identity" -Name InstallLocation).Trim('"')
+  if ($version -cne $ExpectedVersion -or $location -ine $Directory -or !(Test-Path -LiteralPath (Join-Path $Directory 'MaxGameStudioLeagueToolbox.exe') -PathType Leaf)) {
     throw 'The installed version or program location did not match.'
   }
 }
@@ -79,8 +80,16 @@ if ((Get-FileHash -LiteralPath $baseline).Hash -ine $BaselineSha256) {
 }
 
 $installArgs = "/S /$InstallScope /D=$program"
-Run-Installer $baseline $installArgs
-Assert-Install $baselineVersion
+if ($UserToMachine) {
+  if ($InstallScope -ne 'allusers' -or $SameVersionBaseline) { throw 'Use a fresh per-user predecessor for cross-scope verification.' }
+  $oldProgram = Join-Path $scratch 'PerUserProgram'
+  if (Test-Path -LiteralPath "HKCU:\Software\$identity") { throw 'Expected a clean per-user registration.' }
+  Run-Installer $baseline "/S /currentuser /D=$oldProgram"
+  Assert-Install $baselineVersion 'HKCU:' $oldProgram
+} else {
+  Run-Installer $baseline $installArgs
+  Assert-Install $baselineVersion
+}
 if ($BaselineRepository -eq 'MaxGameStudio' -and !(Test-Path -LiteralPath (Join-Path $program 'resources/app.asar') -PathType Leaf)) {
   throw 'The old Electron installation was incomplete.'
 }
@@ -134,6 +143,20 @@ function Test-CandidateOverlay([string]$FromVersion) {
     Assert-Profile
     $programBytes = (Get-ChildItem -LiteralPath $program -File -Recurse | Measure-Object -Property Length -Sum).Sum
     Write-Host "HKSLGT_STARTUP_SAMPLE: installedBytes=$programBytes mainProcessWorkingSetBytes=$($process.WorkingSet64)"
+    if ($UserToMachine) {
+      $oldEntry = Test-Path -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity"
+      $oldExe = Test-Path -LiteralPath (Join-Path $oldProgram 'MaxGameStudioLeagueToolbox.exe')
+      Write-Host "HKSLGT_USER_TO_MACHINE: priorUserEntry=$oldEntry priorUserExecutable=$oldExe dataLocatorAndRecordsVerified=true"
+      $shell = New-Object -ComObject WScript.Shell
+      foreach ($desktop in 'DesktopDirectory','CommonDesktopDirectory') {
+        $folder = [Environment]::GetFolderPath($desktop)
+        foreach ($link in Get-ChildItem -LiteralPath $folder -Filter '*.lnk' -File -ErrorAction SilentlyContinue) {
+          $target = $shell.CreateShortcut($link.FullName).TargetPath
+          if ($target -ieq $executable) { Write-Host "HKSLGT_SHORTCUT: $desktop -> upgraded toolbox" }
+          if ($target -ieq (Join-Path $oldProgram 'MaxGameStudioLeagueToolbox.exe')) { Write-Host "HKSLGT_SHORTCUT: $desktop -> previous toolbox" }
+        }
+      }
+    }
   } finally {
     if (!$process.HasExited) {
       $process.Kill()

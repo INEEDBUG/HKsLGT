@@ -17,6 +17,11 @@ on:
         type: choice
         options: [currentuser, allusers]
         default: currentuser
+      user_to_machine:
+        description: Begin with a per-user installation before installing for all users
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -30,6 +35,7 @@ jobs:
       SOURCE_RUN: ${{ inputs.run_id }}
       LEAGUE_VERSION: ${{ inputs.version }}
       INSTALL_SCOPE: ${{ inputs.installation_scope }}
+      USER_TO_MACHINE: ${{ inputs.user_to_machine }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -78,11 +84,12 @@ jobs:
             }
             $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineVersion=$baseline.version; BaselineSha256=$baseline.installerSha256 }
           }
-          if ($miniCandidate) {
+          $crossScope = $env:USER_TO_MACHINE -eq 'true'
+          if ($miniCandidate -and !$crossScope) {
             $old = Join-Path $env:RUNNER_TEMP 'previous-private-preview'
             gh run download 45864067463 --repo $env:GITHUB_REPOSITORY --name "HKsLGT-$env:LEAGUE_VERSION-windows-x64" --dir $old
             $oldInstaller = Join-Path $old $name
             if ((Get-FileHash -LiteralPath $oldInstaller).Hash -ine '62217a18d26e24655fe22ba7ecfbfa24fe8628340c2b7d3faaf8cfc3cd5b7492') { throw 'Previous private preview digest mismatch.' }
             $baselineOptions.SameVersionBaseline = $oldInstaller
           }
-          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 -InstallScope $env:INSTALL_SCOPE @baselineOptions
+          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 -InstallScope $env:INSTALL_SCOPE -UserToMachine:$crossScope @baselineOptions
