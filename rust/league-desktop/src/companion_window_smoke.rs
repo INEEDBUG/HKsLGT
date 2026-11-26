@@ -191,7 +191,7 @@ async fn exercise(app: &AppHandle) {
 
     let opgg = wait_for_popup(app, "opgg", kiwi).await;
     let resg = wait_for_popup(app, "resg", kiwi).await;
-    check_bundled_draft(&opgg, "ARAM Mayhem", 22, kiwi).await;
+    check_bundled_draft(&opgg, "ARAM Mayhem", "22", kiwi).await;
     println!("Recovered first-open failures in the same KIWI draft and verified visible native OP.GG/RESG windows and bundled OP.GG content");
 
     set_preference(app, AUX_WINDOW, "enabled", true);
@@ -269,7 +269,12 @@ async fn exercise(app: &AppHandle) {
     set_preference(app, OPGG_WINDOW, "enabled", true);
     set_preference(app, RESG_NAMESPACE, "enabled", true);
     let ordinary = wait_for_popup(app, "opgg", aram).await;
-    check_bundled_draft(&ordinary, "ARAM", 55, aram).await;
+    // The live TLS fixture loaded the champion catalog during the preceding room sequence.
+    assert_eq!(
+        runtime.opgg_target().unwrap().view(),
+        json!({"gameMode":"ARAM","championId":55})
+    );
+    check_bundled_draft(&ordinary, "ARAM", "Katarina", aram).await;
     assert_hidden(app, "resg", "ordinary ARAM has no Hextech RESG popup");
     assert!(
         visible_window(app, "aux").is_some(),
@@ -621,21 +626,21 @@ async fn wait_for_close(app: &AppHandle, label: &str, refresh: impl Fn()) {
 async fn check_bundled_draft(
     window: &WebviewWindow,
     mode: &str,
-    champion: u32,
+    champion_title: &str,
     refresh: impl Fn(),
 ) {
     let script = format!(
         r#"location.pathname.endsWith('/opgg-window.html') && window.__TAURI__?.core != null &&
             document.querySelector('.opgg-companion .mode')?.textContent.trim() === {} &&
-            document.querySelector('.opgg-companion h1')?.textContent.trim() === '{}' &&
+            document.querySelector('.opgg-companion h1')?.textContent.trim() === {} &&
             document.querySelector('.opgg-companion button')?.textContent.includes('OP.GG')"#,
         json!(mode),
-        champion
+        json!(champion_title)
     );
     check_renderer(
         window,
         &script,
-        &format!("OP.GG {mode} draft and champion {champion}"),
+        &format!("OP.GG {mode} draft and champion {champion_title}"),
         refresh,
     )
     .await;
