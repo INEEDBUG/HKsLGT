@@ -782,7 +782,10 @@ impl ClientRuntime {
         )
         .await;
         let summoner = summoner?;
-        let session = session.flatten().filter(|session| session.phase == phase);
+        let flow_snapshot = session.flatten();
+        let session = flow_snapshot
+            .as_ref()
+            .filter(|session| session.phase == phase);
         let mut shard = None;
         if let Some(player) = summoner.as_ref() {
             shard = if let Some((_, shard)) =
@@ -800,21 +803,21 @@ impl ClientRuntime {
                 .and_then(Result::ok)
             };
         }
-        let selection = if demand.reads_selection(&phase, session.as_ref(), automate) {
+        let selection = if demand.reads_selection(&phase, session, automate) {
             optional_lcu(self.transport.read_champ_select(&target)).await
         } else {
             None
         };
         let companions = demand.targets(
             client.instance,
-            session.as_ref(),
+            session,
             selection.as_ref(),
             summoner.as_ref().map(|player| player.puuid.as_str()),
             previous_chart,
         );
         let aux_activity = demand.aux_activity(
             &phase,
-            session.as_ref(),
+            flow_snapshot.as_ref(),
             lobby.as_ref(),
             search.as_ref(),
             selection.as_ref(),
@@ -829,8 +832,8 @@ impl ClientRuntime {
                 aux_activity,
                 shard,
             };
-            let selection = if automate {
-                session.zip(selection)
+            let selection = if automate && session.is_some() {
+                flow_snapshot.zip(selection)
             } else {
                 None
             };

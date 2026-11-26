@@ -44,7 +44,10 @@ impl AuxActivity {
         search: Option<&Value>,
         selection: Option<&Value>,
     ) -> Self {
-        let flow = flow.filter(|flow| flow.phase == phase);
+        // Phase and session can be sampled on opposite sides of a transition.
+        if flow.is_some_and(|flow| !flow.phase.is_empty() && flow.phase != phase) {
+            return Self::Unconfirmed;
+        }
         let phase = match phase {
             "Lobby" => AuxPhase::Lobby,
             "Matchmaking" => AuxPhase::Matchmaking,
@@ -304,6 +307,20 @@ mod tests {
         selection["gameId"] = json!(102);
         assert_eq!(
             AuxActivity::project("ChampSelect", Some(&flow), None, None, Some(&selection)),
+            AuxActivity::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn does_not_open_from_a_lobby_sample_during_a_known_phase_transition() {
+        let flow: GameflowSession = serde_json::from_value(json!({
+            "phase": "InProgress",
+            "gameData": {"queue": {"id": 450, "gameMode": "ARAM"}}
+        }))
+        .unwrap();
+        let lobby = json!({"gameConfig":{"queueId": 450, "gameMode": "ARAM"}});
+        assert_eq!(
+            AuxActivity::project("Lobby", Some(&flow), Some(&lobby), None, None),
             AuxActivity::Unconfirmed
         );
     }
