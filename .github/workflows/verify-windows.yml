@@ -6,7 +6,7 @@ on:
       version:
         description: League Beta version
         required: true
-        default: '1.0.0-beta.15'
+        default: '1.0.0-beta.16'
         type: string
 
 permissions:
