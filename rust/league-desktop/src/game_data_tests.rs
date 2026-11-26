@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn projects_the_six_catalogs_into_the_pinned_vue_store_shape() {
+fn projects_the_catalogs_into_the_pinned_vue_store_shape() {
     use GameDataEndpoint::*;
     let mut read = GameDataRead::default();
     for (endpoint, payload) in [
@@ -38,12 +38,17 @@ fn projects_the_six_catalogs_into_the_pinned_vue_store_shape() {
             json!([{"id": 1001, "name": "速度之靴", "price": 300, "priceTotal": 300,
                 "from": [], "to": [3006], "description": "<mainText><stats>移速</stats></mainText>"}]),
         ),
+        (
+            Augments,
+            json!([{"id":1133,"nameTRA":"魔法飞弹","rarity":"kGold",
+                "augmentSmallIconPath":"/lol-game-data/assets/ASSETS/Maps/Particles/Kiwi/MagicMissile_small.png"}]),
+        ),
         (Queues, json!([{"id": 450, "name": "极地大乱斗"}])),
     ] {
         read.record(endpoint, Ok(Some(payload))).unwrap();
     }
     assert!(read.unavailable.is_empty());
-    assert_eq!(read.fields.len(), 6);
+    assert_eq!(read.fields.len(), 7);
     assert_eq!(read.fields["champions"]["-1"]["id"], -1);
     assert_eq!(read.fields["champions"]["22"]["name"], "艾希");
     assert!(read.fields["champions"]["22"].get("futureField").is_none());
@@ -62,6 +67,11 @@ fn projects_the_six_catalogs_into_the_pinned_vue_store_shape() {
         "原初惩戒"
     );
     assert_eq!(read.fields["items"]["1001"]["to"], json!([3006]));
+    assert_eq!(read.fields["augments"]["1133"]["nameTRA"], "魔法飞弹");
+    assert_eq!(read.fields["augments"]["1133"]["rarity"], "kGold");
+    assert!(read.fields["augments"]["1133"]["augmentSmallIconPath"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("/MagicMissile_small.png")));
     assert_eq!(read.fields["queues"]["450"]["name"], "极地大乱斗");
 }
 
@@ -131,6 +141,9 @@ fn rejects_bad_table_shapes_without_discarding_a_successful_catalog() {
         Perkstyles.normalize(json!({"schemaVersion": "2", "styles": []})),
         Err(LcuError::InvalidPayload)
     );
+    assert!(GameDataReadError::Missing.can_retry());
+    assert!(GameDataReadError::Read(LcuError::UnexpectedStatus(503)).can_retry());
+    assert!(!GameDataReadError::Read(LcuError::InvalidPayload).can_retry());
     let oversized = Value::Array(vec![json!({"id": 1, "name": "Spell"}); 129]);
     assert_eq!(
         SummonerSpells.normalize(oversized),
@@ -169,6 +182,7 @@ fn reuses_the_verified_lcu_origin_and_bounded_get_routes() {
         (Perkstyles, "perkstyles", 128),
         (SummonerSpells, "summoner-spells", 128),
         (Items, "items", 2048),
+        (Augments, "cherry-augments", 512),
         (Queues, "queues", 1024),
     ] {
         let route = ReadEndpoint::GameData(endpoint);

@@ -1,6 +1,6 @@
 //! Read-only game data for the retained Vue store, using the verified local client.
 
-use super::{LcuError, LcuTarget, LcuTransport, ReadEndpoint};
+use super::{game_art::GameArtPath, LcuError, LcuTarget, LcuTransport, ReadEndpoint};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -12,16 +12,18 @@ pub(crate) enum GameDataEndpoint {
     Perkstyles,
     SummonerSpells,
     Items,
+    Augments,
     Queues,
 }
 
 impl GameDataEndpoint {
-    const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Champions,
         Self::Perks,
         Self::Perkstyles,
         Self::SummonerSpells,
         Self::Items,
+        Self::Augments,
         Self::Queues,
     ];
 
@@ -32,6 +34,7 @@ impl GameDataEndpoint {
             Self::Perkstyles => "/lol-game-data/assets/v1/perkstyles.json",
             Self::SummonerSpells => "/lol-game-data/assets/v1/summoner-spells.json",
             Self::Items => "/lol-game-data/assets/v1/items.json",
+            Self::Augments => "/lol-game-data/assets/v1/cherry-augments.json",
             Self::Queues => "/lol-game-data/assets/v1/queues.json",
         }
     }
@@ -41,7 +44,7 @@ impl GameDataEndpoint {
     pub(super) const fn body_limit(self) -> usize {
         let kib = match self {
             Self::Champions => 256,
-            Self::Perks => 512,
+            Self::Perks | Self::Augments => 512,
             Self::Perkstyles | Self::SummonerSpells => 128,
             Self::Items => 2048,
             Self::Queues => 1024,
@@ -56,6 +59,7 @@ impl GameDataEndpoint {
             Self::Perkstyles => "perkstyles",
             Self::SummonerSpells => "summonerSpells",
             Self::Items => "items",
+            Self::Augments => "augments",
             Self::Queues => "queues",
         }
     }
@@ -63,7 +67,7 @@ impl GameDataEndpoint {
     const fn row_limit(self) -> usize {
         match self {
             Self::Champions => 512,
-            Self::Perks => 1024,
+            Self::Perks | Self::Augments => 1024,
             Self::Perkstyles => 32,
             Self::SummonerSpells => 128,
             Self::Items => 8192,
@@ -139,6 +143,7 @@ impl GameDataEndpoint {
             Self::Perkstyles => project::<Perkstyle>(row)?,
             Self::SummonerSpells => project::<SummonerSpell>(row)?,
             Self::Items => project::<Item>(row)?,
+            Self::Augments => project::<Augment>(row)?,
             Self::Queues => project::<Queue>(row)?,
         };
         let Value::Object(mut fields) = projected else {
@@ -146,6 +151,7 @@ impl GameDataEndpoint {
         };
         fields.retain(|name, value| match name.as_str() {
             "iconPath" | "squarePortraitPath" => value.as_str().is_some_and(local_asset_path),
+            "augmentSmallIconPath" => value.as_str().and_then(GameArtPath::parse).is_some(),
             _ => !value.is_null(),
         });
         if let Some(assets) = fields.get_mut("assetMap").and_then(Value::as_object_mut) {
@@ -180,6 +186,18 @@ pub(crate) enum GameDataReadError {
     Read(LcuError),
 }
 
+impl GameDataReadError {
+    pub(crate) fn can_retry(self) -> bool {
+        matches!(
+            self,
+            Self::Missing
+                | Self::Read(
+                    LcuError::Timeout | LcuError::Transport | LcuError::UnexpectedStatus(500..=599)
+                )
+        )
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct GameDataRead {
     pub(crate) fields: Map<String, Value>,
@@ -210,14 +228,14 @@ impl GameDataRead {
 }
 
 impl LcuTransport {
-    /// Read once per verified client instance, outside the gameflow polling loop.
-    /// Publish the fields only if the initiating client and generation are still current.
+    /// Read only the requested catalogs, outside the gameflow polling loop.
     pub(crate) async fn read_game_data(
         &self,
         target: &LcuTarget<'_>,
+        endpoints: &[GameDataEndpoint],
     ) -> Result<GameDataRead, LcuError> {
         let mut read = GameDataRead::default();
-        for endpoint in GameDataEndpoint::ALL {
+        for &endpoint in endpoints {
             let value = self.read(target, ReadEndpoint::GameData(endpoint)).await;
             read.record(endpoint, value)?;
         }
@@ -399,6 +417,15 @@ struct Item {
     price: Option<u32>,
     price_total: Option<u32>,
     icon_path: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Augment {
+    #[serde(rename = "nameTRA")]
+    name: String,
+    augment_small_icon_path: String,
+    rarity: String,
 }
 
 #[derive(Deserialize, Serialize)]

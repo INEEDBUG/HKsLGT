@@ -11,15 +11,26 @@ const stagedSource = resolve('staged-league-fixture')
 const outDir = resolve('native-webview-dist')
 
 test('a missing local champion portrait can use its official color image without forwarding a client path', async () => {
-  const { championPortraitFallback } = await import('./champion-portrait.mjs')
+  const { gameArtFallback } = await import('./game-art-fallback.mjs')
   const path = 'http://league-art.localhost/lol-game-data/assets/v1/champion-icons/136.png'
   const champions = { 136: { alias: 'AurelionSol' } }
-  assert.equal(championPortraitFallback(path, champions), 'https://game.gtimg.cn/images/lol/act/img/champion/AurelionSol.png')
+  assert.equal(gameArtFallback(path, champions), 'https://game.gtimg.cn/images/lol/act/img/champion/AurelionSol.png')
   for (const invalid of [null, path + '?auth=example', path.replace('136.png', '-1.png'), path.replace('champion-icons', 'profile-icons'), path.replace('league-art.localhost', 'other.invalid')]) {
-    assert.equal(championPortraitFallback(invalid, champions), null)
+    assert.equal(gameArtFallback(invalid, champions), null)
   }
-  assert.equal(championPortraitFallback(path, {}), null)
-  assert.equal(championPortraitFallback(path, {136: { alias: '../other' }}), null)
+  assert.equal(gameArtFallback(path, {}), null)
+  assert.equal(gameArtFallback(path, {136: { alias: '../other' }}), null)
+})
+
+test('missing local profile icons use only their numeric official Tencent asset', async () => {
+  const { gameArtFallback } = await import('./game-art-fallback.mjs')
+  const dir = 'http://league-art.localhost/lol-game-data/assets/v1/profile-icons/'
+  assert.equal(gameArtFallback(dir + '29.jpg', {}), 'https://game.gtimg.cn/images/lol/act/img/profileicon/29.png')
+  assert.equal(gameArtFallback(dir + '0.jpg', {}), 'https://game.gtimg.cn/images/lol/act/img/profileicon/0.png')
+  for (const invalid of ['029.jpg', '-1.jpg', '4294967296.jpg', '29.jpg?token=example', '29.jpg#a', '../29.jpg']) {
+    assert.equal(gameArtFallback(dir + invalid, {}), null)
+  }
+  assert.equal(gameArtFallback(dir.replace('league-art.localhost', 'other.invalid') + '29.jpg', {}), null)
 })
 
 test('the native renderer substitutes local vector artwork for bundled brand and game images', () => {

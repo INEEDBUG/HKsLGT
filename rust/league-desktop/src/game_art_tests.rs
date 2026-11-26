@@ -124,6 +124,25 @@ fn accepts_local_skin_carousel_previews_without_opening_the_character_asset_tree
 }
 
 #[test]
+fn accepts_augment_icons_without_opening_the_generic_particle_tree() {
+    for path in [
+        "ASSETS/UX/Cherry/Augments/Icons/ADAPt_small.png",
+        "ASSETS/UX/Kiwi/Augments/Icons/FirstAidKit_small.png",
+        "ASSETS/Maps/Particles/Kiwi/MagicMissile_small.png",
+        "ASSETS/Maps/Particles/Kiwi/SelfDestruct_small.png",
+    ] {
+        assert!(GameArtPath::parse(&format!("{ASSET_PREFIX}{path}")).is_some(), "{path}");
+    }
+    for path in [
+        "ASSETS/UX/Kiwi/Augments/Icons/first-aid.svg",
+        "ASSETS/UX/Kiwi/Augments/Other/icon.png",
+        "ASSETS/Maps/Particles/Kiwi/Unlisted_small.png",
+    ] {
+        assert!(GameArtPath::parse(&format!("{ASSET_PREFIX}{path}")).is_none(), "{path}");
+    }
+}
+
+#[test]
 fn rejects_traversal_other_origins_queries_unknown_formats_and_other_asset_families() {
     for path in [
         "https://127.0.0.1:31111/lol-game-data/assets/v1/champion-icons/22.png",

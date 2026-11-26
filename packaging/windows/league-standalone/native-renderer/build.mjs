@@ -275,7 +275,7 @@ function nativeRendererPlugin(sourceRoot) {
     ['class="lcu-image" @error="handleError"', 'class="lcu-image" referrerpolicy="no-referrer" @error="handleError"'],
     ["import { ref, watchEffect } from 'vue'", `import { computed, ref, watch } from 'vue'
 import { useLeagueClientStore } from '@renderer-shared/shards/league-client/store'
-import { championPortraitFallback } from 'virtual:hkslgt-champion-portrait'`],
+import { gameArtFallback } from 'virtual:hkslgt-game-art-fallback'`],
     [`const url = ref<string | null>(null)
 const resources = useGameResourceProvider()
 
@@ -298,7 +298,7 @@ const failedRemote = ref<string | null>(null)
 watch(local, () => { failedLocal.value = false; failedRemote.value = null }, { flush: 'sync' })
 const url = computed(() => {
   if (!failedLocal.value) return local.value
-  const remote = championPortraitFallback(local.value, client.gameData.champions)
+  const remote = gameArtFallback(local.value, client.gameData.champions)
   return remote !== failedRemote.value ? remote : null
 })
 const handleError = (event: Event) => {
@@ -511,7 +511,7 @@ const startNativeDrag = ${dragHandler}`
     name: 'mgs-league-native-renderer',
     enforce: 'pre',
     resolveId(id) {
-      if (id === 'virtual:hkslgt-champion-portrait') return fileURLToPath(new URL('./champion-portrait.mjs', import.meta.url))
+      if (id === 'virtual:hkslgt-game-art-fallback') return fileURLToPath(new URL('./game-art-fallback.mjs', import.meta.url))
       if (id === IPC_MODULE) return IPC_SOURCE
       if (id === GAME_SHORTCUT_MODULE) return gameShortcut
       if (id === MINI_ACTIVITY_MODULE) return miniActivity

@@ -18,6 +18,12 @@ const BITMAP_FAMILIES: &[&str] = &[
     "ASSETS/Items/Icons2D/",
     "DATA/Spells/Icons2D/",
     "ASSETS/UX/Jade/S3Icons/SameSized/",
+    "ASSETS/UX/Cherry/Augments/Icons/",
+    "ASSETS/UX/Kiwi/Augments/Icons/",
+];
+const KIWI_PARTICLE_ICONS: &[&str] = &[
+    "ASSETS/Maps/Particles/Kiwi/MagicMissile_small.png",
+    "ASSETS/Maps/Particles/Kiwi/SelfDestruct_small.png",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -188,6 +194,7 @@ fn supports_bitmap(relative: &str, format: BitmapFormat) -> bool {
         };
     }
     MODE_BADGES.contains(&relative)
+        || KIWI_PARTICLE_ICONS.contains(&relative)
         || BITMAP_FAMILIES
             .iter()
             .any(|prefix| relative.starts_with(prefix))

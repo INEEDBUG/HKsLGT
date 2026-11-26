@@ -12,6 +12,7 @@ use crate::{
             self, AuxActivity, AuxPhase, AuxSelectionExtras, AuxSelectionObservation, AuxView,
         },
         game_art::{GameArt, GameArtPath},
+        game_data::GameDataEndpoint,
         player_search::PlayerSearchShard,
         player_tab_read::PlayerTabRead,
         AuxChampSelectAction, GameflowSession, LcuError, LcuTarget, LcuTransport, RoomAction,
@@ -2043,22 +2044,38 @@ impl ClientRuntime {
 
 async fn load_game_data(app: AppHandle, client: Arc<LocalClient>, ticket: u64) {
     let runtime = app.state::<ClientRuntime>();
-    let Ok(target) = client.target() else {
-        return;
-    };
-    let Ok(read) = runtime.transport.read_game_data(&target).await else {
-        return;
-    };
-    let Ok(mut state) = runtime.state.lock() else {
-        return;
-    };
-    if state.data_ticket != ticket || state.data_client != Some(client.instance) || !client.alive() {
-        return;
-    }
-    state.revision += 1;
-    state.game_data = read.fields;
-    for (key, value) in &state.game_data {
-        publish_property(&app, CLIENT, "gameData", key, value, state.revision);
+    let mut catalogs = GameDataEndpoint::ALL.to_vec();
+    // A connected League client may still be preparing some of its game data.
+    // Publish healthy catalogs promptly and retry only the ones that failed temporarily.
+    for delay in [0, 350, 1000] {
+        if catalogs.is_empty() {
+            break;
+        }
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        let Ok(target) = client.target() else {
+            return;
+        };
+        let Ok(read) = runtime.transport.read_game_data(&target, &catalogs).await else {
+            return;
+        };
+        let Ok(mut state) = runtime.state.lock() else {
+            return;
+        };
+        if state.data_ticket != ticket || state.data_client != Some(client.instance) || !client.alive() {
+            return;
+        }
+        if !read.fields.is_empty() {
+            state.revision += 1;
+            for (key, value) in read.fields {
+                publish_property(&app, CLIENT, "gameData", &key, &value, state.revision);
+                state.game_data.insert(key, value);
+            }
+        }
+        catalogs.clear();
+        catalogs.extend(read.unavailable.into_iter()
+            .filter_map(|(endpoint, error)| error.can_retry().then_some(endpoint)));
     }
 }
 

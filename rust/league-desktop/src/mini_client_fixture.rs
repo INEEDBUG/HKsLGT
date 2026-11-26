@@ -169,25 +169,28 @@ fn serve(
     }
     let mut body = vec![0; size];
     reader.read_exact(&mut body)?;
-    if authenticated && method == "GET" {
+    let history_art = if authenticated && method == "GET" {
         if let Some((status, response)) = history.get(path) {
             let bytes = serde_json::to_vec(&response)?;
             write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len())?;
             stream.write_all(&bytes)?;
             return stream.flush();
         }
-    }
+        history.art(path)
+    } else {
+        None
+    };
     let mut scene = scene.lock().unwrap();
     let (status, mime, bytes) = if !authenticated {
         (401, "application/json", vec![])
-    } else if method == "GET" && path == OWNED_SKIN_PREVIEW {
+    } else if method == "GET" && (path == OWNED_SKIN_PREVIEW || history_art == Some("image/jpeg")) {
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD.decode(concat!(
             "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/",
             "2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAACAAMDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/",
             "8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/",
             "8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD8zn+JnjCV2d/Fetu7HJZtRmJJ9fvUUUVzVPjl6nyWL/3mp/if5n//2Q=="
-        )).expect("synthetic skin-preview JPEG");
+        )).expect("synthetic fixture JPEG");
         (200, "image/jpeg", bytes)
     } else if method == "GET"
         && path.starts_with("/lol-game-data/assets/")

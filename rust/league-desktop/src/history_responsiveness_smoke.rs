@@ -6,6 +6,7 @@ use super::{
 use crate::{client_discovery::LocalClient, client_runtime::reconcile_companions};
 use serde_json::{json, Value};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
@@ -26,6 +27,55 @@ const BUDGET: Duration = Duration::from_millis(1500);
 const FIRST_GAME: u64 = 8_050_001;
 const PAGE_SIZE: u64 = 20;
 const NEW_GAME: u64 = FIRST_GAME + PAGE_SIZE;
+const KIWI_GAME: u64 = NEW_GAME - 1;
+const ASSETS: &str = "/lol-game-data/assets/";
+const PROFILE: &str = "v1/profile-icons/29.jpg";
+const TEAMMATE_PROFILE: &str = "v1/profile-icons/0.jpg";
+const ITEMS: [(u32, &str); 7] = [
+    (
+        3006,
+        "ASSETS/Items/Icons2D/3006_Class_T2_BerserkersGreaves.png",
+    ),
+    (
+        6672,
+        "ASSETS/Items/Icons2D/6672_Marksman_T4_BehemothSlayer.png",
+    ),
+    (3085, "ASSETS/Items/Icons2D/3085_Marksman_T3_Runaans.png"),
+    (
+        3031,
+        "ASSETS/Items/Icons2D/3031_Marksman_T3_InfinityEdge.png",
+    ),
+    (
+        3036,
+        "ASSETS/Items/Icons2D/3036_Marksman_T3_DominikRegards.png",
+    ),
+    (
+        3072,
+        "ASSETS/Items/Icons2D/3072_Fighter_T3_Bloodthirster.png",
+    ),
+    (2052, "ASSETS/Items/Icons2D/2052_Poro_Snack.png"),
+];
+const FLASH: &str = "DATA/Spells/Icons2D/Summoner_flash.png";
+const MARK: &str = "DATA/Spells/Icons2D/Summoner_Mark.png";
+const PERK: &str = "v1/perk-images/Styles/Precision/PressTheAttack/PressTheAttack.png";
+const PERK_STYLE: &str = "v1/perk-images/Styles/7200_Domination.png";
+const AUGMENT: &str = "ASSETS/Maps/Particles/Kiwi/MagicMissile_small.png";
+
+fn expected_art() -> impl Iterator<Item = &'static str> {
+    ITEMS.into_iter().map(|(_, path)| path).chain([
+        PROFILE,
+        TEAMMATE_PROFILE,
+        FLASH,
+        MARK,
+        PERK,
+        PERK_STYLE,
+        AUGMENT,
+    ])
+}
+
+fn asset_path(path: &str) -> String {
+    format!("{ASSETS}{path}")
+}
 
 // LCU list responses contain the requesting participant. The game endpoint supplies both teams.
 fn game(id: u64, full: bool) -> Value {
@@ -46,7 +96,8 @@ fn game(id: u64, full: bool) -> Value {
             format!("Fixture player {slot}")
         };
         identities.push(json!({"participantId":slot,"player":{"puuid":player,"currentPlatformId":"HN1","platformId":"HN1",
-            "accountId":41+slot,"summonerId":41+slot,"gameName":name,"summonerName":name,"tagLine":"MOCK","profileIcon":42}}));
+            "accountId":41+slot,"summonerId":41+slot,"gameName":name,"summonerName":name,"tagLine":"MOCK",
+            "profileIcon":if slot == 2 {0} else {29}}}));
         let mut stats = json!({"participantId":slot,"win":slot<=5,"kills":if slot==1 {own_kills} else {6},
             "deaths":3,"assists":19,"champLevel":18,"goldEarned":18900,"totalDamageDealtToChampions":34567,
             "totalDamageTaken":19500,"totalMinionsKilled":41,"neutralMinionsKilled":0,"magicDamageDealtToChampions":1500,
@@ -54,14 +105,21 @@ fn game(id: u64, full: bool) -> Value {
             "physicalDamageTaken":1000,"magicalDamageTaken":12000,"trueDamageTaken":500,"totalHeal":0,
             "totalUnitsHealed":0,"visionScore":0,"perkPrimaryStyle":8000,"perkSubStyle":8100});
         let fields = stats.as_object_mut().unwrap();
-        for (index, item) in [3006, 6672, 3085, 3031, 3036, 3072, 2052]
-            .into_iter()
-            .enumerate()
-        {
-            fields.insert(format!("item{index}"), json!(item));
+        for (index, (item, _)) in ITEMS.into_iter().enumerate() {
+            fields.insert(
+                format!("item{index}"),
+                json!(if id == NEW_GAME && index == 0 {
+                    0
+                } else {
+                    item
+                }),
+            );
         }
         for (index, perk) in [8005, 8009, 9104, 8014, 8139, 8106].into_iter().enumerate() {
             fields.insert(format!("perk{index}"), json!(perk));
+        }
+        if id == KIWI_GAME {
+            fields.insert("playerAugment1".into(), json!(1133));
         }
         participants.push(
             json!({"participantId":slot,"teamId":if slot<=5 {100} else {200},
@@ -70,8 +128,9 @@ fn game(id: u64, full: bool) -> Value {
         );
     }
     json!({"gameId":id,"gameCreation":1_795_138_400_000_u64 + hour*3_600_000,
-        "gameCreationDate":format!("2026-11-20T{:02}:33:20.000Z", 1+hour),"gameDuration":1380,"gameMode":"ARAM","gameType":"MATCHED_GAME",
-        "mapId":12,"queueId":450,"platformId":"HN1","gameVersion":"16.22.1","seasonId":0,"endOfGameResult":"GameComplete",
+        "gameCreationDate":format!("2026-11-20T{:02}:33:20.000Z", 1+hour),"gameDuration":1380,
+        "gameMode":if id == KIWI_GAME {"KIWI"} else {"ARAM"},"gameType":"MATCHED_GAME",
+        "mapId":12,"queueId":if id == KIWI_GAME {2400} else {450},"platformId":"HN1","gameVersion":"16.22.1","seasonId":0,"endOfGameResult":"GameComplete",
         "gameModeMutators":[],"participantIdentities":identities,"participants":participants,
         "teams":[{"teamId":100,"win":"Win","bans":[]},{"teamId":200,"win":"Fail","bans":[]}]})
 }
@@ -96,6 +155,9 @@ struct HistoryRequests {
     failed_pages: usize,
     new_game_reads: usize,
     champion_images: usize,
+    history_art: BTreeSet<&'static str>,
+    catalog_reads: BTreeMap<&'static str, usize>,
+    recover_catalogs: bool,
     ranked: usize,
     profiles: usize,
     details: usize,
@@ -134,8 +196,30 @@ impl HistoryFixture {
 
     fn end(&self) {
         self.active.store(false, Ordering::Release);
-        self.requests.lock().unwrap().hold_details = false;
+        let mut state = self.requests.lock().unwrap();
+        state.hold_details = false;
+        state.recover_catalogs = true;
+        drop(state);
         self.release_page();
+    }
+
+    fn release_catalogs(&self) {
+        self.requests.lock().unwrap().recover_catalogs = true;
+        self.release.notify_all();
+    }
+
+    pub(super) fn art(&self, path: &str) -> Option<&'static str> {
+        if !self.active() {
+            return None;
+        }
+        let relative = path.strip_prefix(ASSETS)?;
+        let asset = expected_art().find(|asset| asset.eq_ignore_ascii_case(relative))?;
+        self.requests.lock().unwrap().history_art.insert(asset);
+        Some(if asset.ends_with(".jpg") {
+            "image/jpeg"
+        } else {
+            "image/png"
+        })
     }
 
     pub(super) fn get(&self, path: &str) -> Option<(u16, Value)> {
@@ -143,6 +227,34 @@ impl HistoryFixture {
             return None;
         }
         let mut requests = self.requests.lock().unwrap();
+        let catalog = match path {
+            "/lol-game-data/assets/v1/champion-summary.json" => Some("champions"),
+            "/lol-game-data/assets/v1/perks.json" => Some("perks"),
+            "/lol-game-data/assets/v1/perkstyles.json" => Some("perkstyles"),
+            "/lol-game-data/assets/v1/items.json" => Some("items"),
+            "/lol-game-data/assets/v1/summoner-spells.json" => Some("spells"),
+            "/lol-game-data/assets/v1/cherry-augments.json" => Some("augments"),
+            _ => None,
+        };
+        if let Some(catalog) = catalog {
+            let attempts = requests.catalog_reads.entry(catalog).or_default();
+            *attempts += 1;
+            if matches!(catalog, "items" | "spells") {
+                if *attempts == 1 {
+                    println!("HKSLGT_HISTORY_CATALOG_503: {catalog}");
+                    return Some((503, json!({"message":"Fixture catalog still loading"})));
+                }
+                let (state, elapsed) = self
+                    .release
+                    .wait_timeout_while(requests, Duration::from_secs(5), |r| !r.recover_catalogs)
+                    .unwrap();
+                requests = state;
+                if elapsed.timed_out() {
+                    requests.timed_out = true;
+                    return Some((503, json!({"message":"Fixture catalog gate timed out"})));
+                }
+            }
+        }
         let details = path
             .strip_prefix("/lol-match-history/v1/games/")
             .map(|id| (id, false))
@@ -198,10 +310,28 @@ impl HistoryFixture {
                 Some((
                     200,
                     json!({"puuid":PLAYER,"accountId":42,"summonerId":42,"gameName":"History Fixture","displayName":"History Fixture",
-                    "internalName":"History Fixture","tagLine":"MOCK","profileIconId":42,"summonerLevel":45,
+                    "internalName":"History Fixture","tagLine":"MOCK","profileIconId":29,"summonerLevel":45,
                     "xpSinceLastLevel":30,"xpUntilNextLevel":70,"privacy":"PUBLIC"}),
                 ))
             }
+            "/lol-game-data/assets/v1/items.json" => Some((200, json!(ITEMS.map(|(id,path)| json!({
+                "id":id,"name":format!("Fixture item {id}"),"iconPath":asset_path(path),
+                "description":"<mainText>Fixture item</mainText>","from":[],"to":[],"price":500,"priceTotal":2800
+            }))))),
+            "/lol-game-data/assets/v1/summoner-spells.json" => Some((200, json!([
+                {"id":4,"name":"Flash","iconPath":asset_path(FLASH),"description":"Blink briefly.","summonerLevel":7,"cooldown":300,"gameModes":["ARAM","KIWI"]},
+                {"id":32,"name":"Mark","iconPath":asset_path(MARK),"description":"Mark an opponent.","summonerLevel":1,"cooldown":80,"gameModes":["ARAM","KIWI"]}
+            ]))),
+            "/lol-game-data/assets/v1/perks.json" => Some((200, json!([
+                {"id":8005,"name":"Press the Attack","iconPath":asset_path(PERK),"longDesc":"Repeated attacks apply damage.","endOfGameStatDescs":[]}
+            ]))),
+            "/lol-game-data/assets/v1/perkstyles.json" => Some((200, json!({"schemaVersion":2,"styles":[
+                {"id":8100,"name":"Domination","iconPath":asset_path(PERK_STYLE),"tooltip":"Burst damage","assetMap":{}}
+            ]}))),
+            "/lol-game-data/assets/v1/cherry-augments.json" => Some((200, json!([
+                {"id":1133,"augmentNameId":"ARAM_MagicMissile","nameTRA":"Magic Missile","simpleNameTRA":"",
+                    "augmentSmallIconPath":asset_path(AUGMENT),"rarity":"kGold"}
+            ]))),
             "/lol-ranked/v1/ranked-stats/11111111-2222-4333-8444-555555555555" => {
                 requests.ranked += 1;
                 Some((200, json!({"queues":[],"queueMap":{}})))
@@ -499,6 +629,61 @@ const LOADING: &str =
 const CARDS: &str = r#"document.querySelectorAll('[class*="contain-intrinsic-size:116px"]').length === 20 && [...document.querySelectorAll('[class*="contain-intrinsic-size:116px"]')].some(card => /12\s*\/\s*3\s*\/\s*19/.test(card.innerText))"#;
 const RECOVERED: &str = r#"(() => { const cards = document.querySelectorAll('[class*="contain-intrinsic-size:116px"]'); return cards.length === 20 && /13\s*\/\s*3\s*\/\s*19/.test(cards[0].innerText); })()"#;
 
+const DECODED_ART: &str = r#"(() => {
+    const images = [...document.querySelectorAll('.mb-6.h-28 img, [class*="contain-intrinsic-size:116px"] img, img[class~="size-4.5"]')];
+    return images.flatMap(img => {
+        if (!img.complete || img.naturalWidth < 2 || img.naturalHeight < 2 || !img.getClientRects().length) return [];
+        const url = new URL(img.currentSrc);
+        const prefix = '/lol-game-data/assets/';
+        return url.host === 'league-art.localhost' && url.pathname.startsWith(prefix)
+            ? [decodeURIComponent(url.pathname.slice(prefix.length)).toLowerCase()] : [];
+    });
+})()"#;
+
+const CATALOGS_PENDING: &str = r#"(() => {
+    const cards = [...document.querySelectorAll('[class*="contain-intrinsic-size:116px"]')];
+    const icons = cards.flatMap(card => [...card.querySelectorAll('img')]);
+    return cards.length === 20 &&
+        icons.some(img => img.naturalWidth > 1 && img.currentSrc.endsWith('/PressTheAttack.png')) &&
+        icons.some(img => img.naturalWidth > 1 && img.currentSrc.includes('/v1/champion-icons/')) &&
+        !icons.some(img => /\/Icons2D\//i.test(img.currentSrc));
+})()"#;
+
+const TEAMMATE_AND_EMPTY_SLOT: &str = r#"(() => {
+    const teammate = [...document.querySelectorAll('img[class~="size-4.5"]')].find(img =>
+        img.currentSrc.endsWith('/v1/profile-icons/0.jpg') && img.naturalWidth > 1 &&
+        img.closest('.flex.items-center')?.innerText.includes('Fixture player 2'));
+    const newest = document.querySelector('[class*="contain-intrinsic-size:116px"]');
+    return !!teammate && /13\s*\/\s*3\s*\/\s*19/.test(newest?.innerText ?? '') &&
+        newest.querySelectorAll('img.item, img.trinket').length === 6 &&
+        newest.querySelectorAll('.item.empty').length === 1;
+})()"#;
+
+async fn check_history_art(main: &WebviewWindow, history: &HistoryFixture) {
+    let started = Instant::now();
+    loop {
+        let decoded: BTreeSet<String> =
+            tokio::time::timeout(BUDGET, page_result(main, DECODED_ART))
+                .await
+                .expect("read genuinely decoded history images from WebView2");
+        let fetched = history.requests.lock().unwrap().history_art.clone();
+        let missing: Vec<_> = expected_art()
+            .filter(|asset| {
+                !decoded.contains(&asset.to_ascii_lowercase()) || !fetched.contains(asset)
+            })
+            .collect();
+        if missing.is_empty() {
+            println!("HKSLGT_HISTORY_ART_PASS: {} profile, item, spell, rune and KIWI augment icons fetched over TLS and decoded in real WebView2", fetched.len());
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "HKSLGT_HISTORY_ART_MISSING: {missing:?}; TLS assets={fetched:?}; decoded={decoded:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn click_ready_refresh(main: &WebviewWindow, label: &'static str) {
     let started = Instant::now();
     loop {
@@ -573,6 +758,11 @@ pub(super) async fn check(app: &AppHandle) {
         (enabled, auto_update)
     };
     set_preference(app, AUX_WINDOW, "enabled", false);
+    let runtime = app.state::<ClientRuntime>();
+    // The bundled suite reuses its PID after the Mini scene. Begin this scene with a fresh catalog.
+    runtime
+        .select(app, None)
+        .expect("disconnect the preceding test scene");
     let server = app.state::<MiniClient>();
     let previous_phase = {
         let mut scene = server.scene.lock().unwrap();
@@ -587,7 +777,7 @@ pub(super) async fn check(app: &AppHandle) {
                 .webview_directory()
                 .expect("shared fixture WebView2 directory"),
         )
-        .inner_size(1100.0, 760.0)
+        .inner_size(1280.0, 760.0)
         .decorations(false)
         .on_navigation(super::super::bundled_navigation)
         .build()
@@ -607,7 +797,6 @@ pub(super) async fn check(app: &AppHandle) {
         || {},
     )
     .await;
-    let runtime = app.state::<ClientRuntime>();
     runtime.sample_fixture(app, &client).await;
     reconcile_companions(app);
     super::assert_hidden(
@@ -730,14 +919,26 @@ pub(super) async fn check(app: &AppHandle) {
     check_renderer(
         &main,
         CARDS,
-        "20 ARAM match cards with the fixture player's KDA on first entry",
+        "20 match cards with the fixture player's KDA on first entry",
         || {},
     )
     .await;
     println!(
-        "HKSLGT_HISTORY_FIRST_PAGE: 20 ARAM cards rendered at {:?}",
+        "HKSLGT_HISTORY_FIRST_PAGE: 20 match cards rendered at {:?}",
         started.elapsed()
     );
+    check_renderer(
+        &main,
+        CATALOGS_PENDING,
+        "visible champion and rune art while transient item and spell catalogs are unavailable",
+        || {},
+    )
+    .await;
+    let document_origin: f64 = page_result(&main, "performance.timeOrigin").await;
+    println!(
+        "HKSLGT_HISTORY_CATALOG_PENDING: champions and runes decoded; item and spell images absent"
+    );
+    server.history.release_catalogs();
     tokio::time::timeout(Duration::from_secs(12), async {
         while server.history.requests.lock().unwrap().timelines < PAGE_SIZE as usize {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -767,6 +968,26 @@ pub(super) async fn check(app: &AppHandle) {
             returned_wall - open_wall, loaded_wall - open_wall as f64, fired_wall - open_wall);
     }
     input_round_trip(&main, "full history rendered alongside visible room").await;
+    check_history_art(&main, &server.history).await;
+    assert_eq!(
+        page_result::<f64>(&main, "performance.timeOrigin").await,
+        document_origin
+    );
+    {
+        let state = server.history.requests.lock().unwrap();
+        assert_eq!(
+            state.catalog_reads,
+            BTreeMap::from([
+                ("augments", 1),
+                ("champions", 1),
+                ("items", 2),
+                ("perks", 1),
+                ("perkstyles", 1),
+                ("spells", 2)
+            ])
+        );
+    }
+    println!("HKSLGT_HISTORY_CATALOG_RECOVERED: items and spells retried once in the same WebView; healthy catalogs stayed at one read");
 
     *stage.lock().unwrap() = "failed refresh and retry";
     server.history.requests.lock().unwrap().fail = true;
@@ -810,6 +1031,13 @@ pub(super) async fn check(app: &AppHandle) {
     )
     .await;
     input_round_trip(&main, "history after HTTP 503 retry").await;
+    check_renderer(
+        &main,
+        TEAMMATE_AND_EMPTY_SLOT,
+        "decoded recently played teammate avatar and one intentionally empty item slot",
+        || {},
+    )
+    .await;
     drop(stop);
     let (pings, worst) = ping
         .join()
