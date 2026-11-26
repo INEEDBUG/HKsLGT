@@ -11,6 +11,15 @@ on:
         description: Beta version to verify
         required: true
         type: string
+      install_scope:
+        description: Installation scope for the candidate
+        type: choice
+        default: currentuser
+        options: [currentuser, allusers]
+      user_to_machine:
+        description: Upgrade a per-user baseline to a machine-wide installation
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -23,6 +32,8 @@ jobs:
     env:
       SOURCE_RUN: ${{ inputs.run_id }}
       LEAGUE_VERSION: ${{ inputs.version }}
+      INSTALL_SCOPE: ${{ inputs.install_scope }}
+      USER_TO_MACHINE: ${{ inputs.user_to_machine }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -47,7 +58,10 @@ jobs:
           $compiled = @($jobs.jobs | ForEach-Object steps | Where-Object {
             $_.name -ceq 'Run locked Rust tests and build the Windows x64 installer' -and $_.conclusion -eq 'success'
           })
-          if ($build.head_branch -cne 'main' -or $compiled.Count -ne 1) { throw 'The requested package did not come from a successful HKsLGT main build step.' }
+          $sameCandidate = $env:GITHUB_REF_NAME -ceq 'codex/hkslgt-live-aram-panels' -and
+            $build.head_branch -ceq $env:GITHUB_REF_NAME -and $build.head_sha -ceq $env:GITHUB_SHA -and
+            $build.path -ceq '.github/workflows/verify-windows.yml' -and $build.conclusion -ceq 'success'
+          if (($build.head_branch -cne 'main' -and !$sameCandidate) -or $compiled.Count -ne 1) { throw 'Expected a verified HKsLGT build.' }
           $directory = Join-Path $env:RUNNER_TEMP 'hkslgt-candidate'
           $proof = Get-Content -LiteralPath (Join-Path $directory 'provenance.json') -Raw | ConvertFrom-Json
           $name = "MaxGameStudioLeague_$($env:LEAGUE_VERSION)_x64-setup.exe"
@@ -63,4 +77,4 @@ jobs:
             ./packaging/windows/prepare-beta-baseline.ps1 -Version $baseline.version -InstallerSha256 $baseline.installerSha256 -CatalogPath (Join-Path $env:RUNNER_TEMP 'hkslgt-predecessor-catalog.json')
             $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineVersion=$baseline.version; BaselineSha256=$baseline.installerSha256 }
           }
-          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 @baselineOptions
+          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 -InstallScope $env:INSTALL_SCOPE -UserToMachine:($env:USER_TO_MACHINE -eq 'true') @baselineOptions

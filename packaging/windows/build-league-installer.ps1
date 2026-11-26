@@ -93,6 +93,7 @@ try {
     [IO.File]::ReadAllText((Join-Path $standalone 'native-renderer/artwork/IONICONS-LICENSE.txt'))
     [IO.File]::ReadAllText((Join-Path $standalone 'native-renderer/artwork/COMFORTAA-OFL.txt'))
     [IO.File]::ReadAllText((Join-Path $standalone 'native-shell-links.LICENSE.txt'))
+    [IO.File]::ReadAllText((Join-Path $standalone 'native-websocket.LICENSE.txt'))
   )
   [IO.File]::WriteAllText($notice, ($nativeNotices -join "`r`n`r`n"), $encoding)
   $hashes['LeagueAkari-MIT.txt'] = (Get-FileHash -LiteralPath $notice -Algorithm SHA256).Hash.ToLowerInvariant()

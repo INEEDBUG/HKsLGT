@@ -4,6 +4,30 @@ const PNG_PATH: &str = "/lol-game-data/assets/v1/champion-icons/22.png";
 const JPEG_PATH: &str = "/lol-game-data/assets/v1/profile-icons/29.jpg";
 const WEBP_PATH: &str = "/lol-game-data/assets/v1/perk-images/Styles/Example.webp";
 
+#[test]
+fn normalizes_only_the_mode_badges_reported_by_map_assets() {
+    let shared_badge =
+        "/lol-game-data/assets/content/src/LeagueClient/GameModeAssets/ARAM/img/game-select-icon-hover.png";
+    let crepe_badge =
+        "/lol-game-data/assets/content/src/LeagueClient/GameModeAssets/Crepe/img/game-select-icon-hover.png";
+    for badge in [shared_badge, crepe_badge] {
+        assert_eq!(GameArtPath::parse(&badge[1..]).map(|path| path.canonical), None);
+        for raw in [&badge[1..], badge, &badge.to_ascii_lowercase()] {
+            let path = GameArtPath::parse_mode_icon(raw).unwrap();
+            assert_eq!(path.path(), badge);
+            assert!(GameArtPath::parse(path.path()).is_some());
+        }
+    }
+    for other in [
+        PNG_PATH.to_owned(),
+        format!("/{shared_badge}"),
+        format!("https://example.invalid{shared_badge}"),
+        format!("{shared_badge}?account=not-accepted"),
+    ] {
+        assert!(GameArtPath::parse_mode_icon(&other).is_none());
+    }
+}
+
 // Synthetic 3×2 bitmaps encoded with cached Pillow. No game artwork in the fixtures.
 const PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,

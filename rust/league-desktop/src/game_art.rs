@@ -8,8 +8,11 @@ const MAX_PATH_BYTES: usize = 1024;
 const MAX_ART_BYTES: usize = 1024 * 1024;
 const MAX_DIMENSION: u32 = 2048;
 
-const ARAM_BADGE: &str =
-    "content/src/LeagueClient/GameModeAssets/ARAM/img/game-select-icon-hover.png";
+const MODE_BADGES: &[&str] = &[
+    "content/src/LeagueClient/GameModeAssets/ARAM/img/game-select-icon-hover.png",
+    "content/src/LeagueClient/GameModeAssets/Crepe/img/game-select-icon-hover.png",
+    "content/src/LeagueClient/GameModeAssets/KIWI/img/game-select-icon-hover.png",
+];
 const BITMAP_FAMILIES: &[&str] = &[
     "v1/perk-images/",
     "ASSETS/Items/Icons2D/",
@@ -95,6 +98,18 @@ impl GameArtPath {
         &self.canonical
     }
 
+    pub(super) fn parse_mode_icon(path: &str) -> Option<Self> {
+        // Riot's map catalog uses "lol-game-data/assets/...", without the URL slash.
+        let relative = path
+            .strip_prefix('/')
+            .unwrap_or(path)
+            .strip_prefix("lol-game-data/assets/")?;
+        let badge = MODE_BADGES
+            .iter()
+            .find(|badge| badge.eq_ignore_ascii_case(relative))?;
+        Self::parse(&format!("{ASSET_PREFIX}{badge}"))
+    }
+
     fn finish(&self, mime: Option<&str>, body: Vec<u8>) -> Result<GameArt, LcuError> {
         let valid = self.format.accepts_mime(mime)
             && self
@@ -172,10 +187,7 @@ fn supports_bitmap(relative: &str, format: BitmapFormat) -> bool {
             _ => false,
         };
     }
-    if relative == "content/src/LeagueClient/GameModeAssets/KIWI/img/game-select-icon-hover.png" {
-        return true;
-    }
-    relative == ARAM_BADGE
+    MODE_BADGES.contains(&relative)
         || BITMAP_FAMILIES
             .iter()
             .any(|prefix| relative.starts_with(prefix))

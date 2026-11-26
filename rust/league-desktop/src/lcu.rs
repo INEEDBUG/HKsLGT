@@ -1,5 +1,6 @@
 //! Narrow HTTPS reads from an already verified local League client.
 
+use base64::Engine as _;
 use crate::aram_automation::{AramOptions, ScheduledStep, SelectionLists};
 use maxgamestudio_league_core::{auto_select::AutoSelectAction, resg::select_resg_champion};
 use reqwest::{redirect::Policy, Client, RequestBuilder, StatusCode};
@@ -62,6 +63,10 @@ pub(crate) struct LcuTarget<'a> {
     port: NonZeroU16,
     token: &'a str,
 }
+
+pub(crate) type LcuEventStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
 
 impl<'a> LcuTarget<'a> {
     pub(crate) fn new(port: u16, token: &'a str) -> Result<Self, LcuError> {
@@ -180,7 +185,7 @@ impl GameflowSession {
             .as_ref()?
             .get("game-select-icon-hover")?
             .as_str()?;
-        game_art::GameArtPath::parse(path).map(|path| path.path().to_owned())
+        game_art::GameArtPath::parse_mode_icon(path).map(|path| path.path().to_owned())
     }
 
     fn game_mode(&self) -> Option<&str> {
@@ -276,6 +281,7 @@ enum ReadEndpoint {
     CurrentSummoner,
     GameflowSession,
     ChampSelect,
+    CurrentChampion,
     AuxLobby,
     AuxMatchmaking,
     AuxReadyCheck,
@@ -296,6 +302,7 @@ impl ReadEndpoint {
             Self::CurrentSummoner => "/lol-summoner/v1/current-summoner",
             Self::GameflowSession => "/lol-gameflow/v1/session",
             Self::ChampSelect => "/lol-champ-select/v1/session",
+            Self::CurrentChampion => "/lol-champ-select/v1/current-champion",
             Self::AuxLobby => "/lol-lobby/v2/lobby",
             Self::AuxMatchmaking => "/lol-matchmaking/v1/search",
             Self::AuxReadyCheck => "/lol-matchmaking/v1/ready-check",
@@ -312,7 +319,7 @@ impl ReadEndpoint {
 
     fn body_limit(self) -> usize {
         match self {
-            Self::Phase => 1024,
+            Self::Phase | Self::CurrentChampion => 1024,
             Self::CurrentSummoner => 16 * 1024,
             Self::GameflowSession | Self::ChampSelect => 256 * 1024,
             Self::AuxLobby => 128 * 1024,
@@ -399,8 +406,10 @@ fn push_skin_option(result: &mut Vec<aux_activity::AuxSkin>, row: &Value, chroma
     });
 }
 
+#[derive(Clone)]
 pub(crate) struct LcuTransport {
     client: Client,
+    event_tls: Arc<ClientConfig>,
 }
 
 impl LcuTransport {
@@ -420,6 +429,8 @@ impl LcuTransport {
             .with_no_client_auth();
         // Each local read authenticates its current peer across client restarts.
         tls.resumption = Resumption::disabled();
+        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let event_tls = Arc::new(tls.clone());
 
         let client = Client::builder()
             .tls_backend_preconfigured(tls)
@@ -434,7 +445,48 @@ impl LcuTransport {
             .build()
             .map_err(|_| LcuError::ClientConfiguration)?;
 
-        Ok(Self { client })
+        Ok(Self { client, event_tls })
+    }
+
+    pub(crate) async fn connect_ready_events(
+        &self,
+        target: &LcuTarget<'_>,
+    ) -> Result<LcuEventStream, LcuError> {
+        use tokio_tungstenite::{
+            connect_async_tls_with_config,
+            tungstenite::{client::IntoClientRequest, http::header::{HeaderValue, AUTHORIZATION}},
+            Connector,
+        };
+
+        let mut request = format!("wss://127.0.0.1:{}/", target.port)
+            .into_client_request()
+            .map_err(|_| LcuError::InvalidTarget)?;
+        let authorization = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(
+            format!("riot:{}", target.token)
+        ));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&authorization).map_err(|_| LcuError::InvalidTarget)?,
+        );
+        let (stream, _response) = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_async_tls_with_config(
+                request,
+                None,
+                true,
+                Some(Connector::Rustls(Arc::clone(&self.event_tls))),
+            ),
+        )
+        .await
+        .map_err(|_| LcuError::Timeout)?
+        .map_err(|error| {
+            if matches!(error, tokio_tungstenite::tungstenite::Error::Tls(_)) {
+                LcuError::AuthenticationRejected
+            } else {
+                LcuError::Transport
+            }
+        })?;
+        Ok(stream)
     }
 
     pub(crate) async fn read_phase(
@@ -476,6 +528,16 @@ impl LcuTransport {
             .read(target, ReadEndpoint::ChampSelect)
             .await?
             .unwrap_or(Value::Null))
+    }
+
+    pub(crate) async fn read_aux_current_champion(
+        &self,
+        target: &LcuTarget<'_>,
+    ) -> Result<Option<u32>, LcuError> {
+        Ok(self
+            .read::<u32>(target, ReadEndpoint::CurrentChampion)
+            .await?
+            .filter(|&id| id < 100_000))
     }
 
     pub(crate) async fn read_aux_lobby(

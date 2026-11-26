@@ -150,6 +150,8 @@ const DRAG_REGIONS = [
     '@mousedown.self.left',
     'main'
   ],
+  ['src-main-window/components/titlebar/PlayerTabsTitle.vue', 'class="player-tabs-title"', '@mousedown.self.left', 'main', 'tsx'],
+  ['src-main-window/components/sidebar/Sidebar.vue', 'class="app-sidebar__logo"', '@mousedown.left', 'main', 'tsx'],
   [
     'src-aux-window/components/AuxWindowTitlebar.vue',
     'class="flex h-full flex-1 items-center px-2 pt-1 pb-0.5 transition-all"',
@@ -469,18 +471,36 @@ async function saveGameHotkey(shortcut: string | null) {
     ["import { OpggRenderer } from './opgg'\n", ''],
     ['manager.use(OpggRenderer)\n', '']
   ])
-  for (const [relative, anchor, gesture, label] of DRAG_REGIONS) {
+  // WebView2 maps Electron caption regions to native child windows. Animating
+  // the player tab's loading icon in that region can stall the Win32 message pump.
+  transforms.set(`${stagedSourcePrefix}src/renderer/src-main-window/App.vue`, [
+    ['<style scoped>', `<style>
+* {
+  -webkit-app-region: initial !important;
+  app-region: initial !important;
+}
+</style>
+
+<style scoped>`]
+  ])
+  for (const [relative, anchor, gesture, label, scriptLang = 'ts'] of DRAG_REGIONS) {
     const file = join(sourceRoot, 'src/renderer', relative).replaceAll('\\', '/')
+    const script = `<script setup lang="${scriptLang}">`
+    const dragHandler = label === 'main'
+      ? `(event: MouseEvent) => event.detail === 2
+  ? nativeWindowIpc.call('window-manager-main/main-window', 'toggleMaximize')
+  : nativeWindowIpc.call('window-manager-main/main-window', 'startDragging')`
+      : `() => nativeWindowIpc.call('window-manager-main/${label}-window', 'startDragging')`
     transforms.set(file, [
       [anchor, `${anchor} ${gesture}="startNativeDrag"`],
       [
-        '<script setup lang="ts">',
-        `<script setup lang="ts">
+        script,
+        `${script}
 import { useInstance as useNativeShard } from '@renderer-shared/shards'
 import { AkariIpcRenderer as NativeIpc } from '@renderer-shared/shards/ipc'
 
 const nativeWindowIpc = useNativeShard(NativeIpc)
-const startNativeDrag = () => nativeWindowIpc.call('window-manager-main/${label}-window', 'startDragging')`
+const startNativeDrag = ${dragHandler}`
       ]
     ])
   }

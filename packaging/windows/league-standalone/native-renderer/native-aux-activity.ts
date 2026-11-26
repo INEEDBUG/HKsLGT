@@ -1,3 +1,4 @@
+import { useGameResourceProvider } from '@renderer-shared/providers/game-resource/context'
 import { useInstance } from '@renderer-shared/shards'
 import { useAppCommonStore } from '@renderer-shared/shards/app-common/store'
 import { AutoGameflowRenderer } from '@renderer-shared/shards/auto-gameflow'
@@ -9,10 +10,12 @@ import { PiniaMobxUtilsRenderer } from '@renderer-shared/shards/pinia-mobx-utils
 import type { OpggAramBalanceItem } from '@shared/types/opgg'
 import { useIntervalFn } from '@vueuse/core'
 import { useMessage } from 'naive-ui'
-import { computed, inject, onMounted, provide, ref, shallowReactive, watch, type InjectionKey } from 'vue'
+import { computed, inject, onMounted, provide, ref, shallowReactive, watch, type InjectionKey, type Ref } from 'vue'
 
 const NAMESPACE = 'aux-activity-main'
 const ARAM_ICON = '/lol-game-data/assets/content/src/LeagueClient/GameModeAssets/ARAM/img/game-select-icon-hover.png'
+// Riot's map asset catalog for map 12 specifies the same queue badge for ARAM and KIWI.
+const PUBLIC_ARAM_ICON = 'https://raw.communitydragon.org/16.19/plugins/rcp-be-lol-game-data/global/default/content/src/leagueclient/gamemodeassets/aram/img/game-select-icon-hover.png'
 const OPGG_ARAM_BALANCE = 'https://lol-api-champion.op.gg/api/contents/aram-balance'
 const BALANCE_VALUES = [
   'attack_speed', 'damage_dealt', 'damage_taken', 'cooldown_reduction', 'healing',
@@ -46,6 +49,7 @@ interface AuxView {
   benchEnabled?: boolean
   timerPhase?: string
   localActions?: LocalAction[]
+  selectionActionable?: boolean
   localPlayerCellId?: number
   rerollsRemaining?: number
   allowRerolling?: boolean
@@ -65,6 +69,7 @@ export function provideNativeAuxActivity() {
   const view = computed(() => state.view)
   const chinese = computed(() => app.settings.locale.startsWith('zh'))
   const pending = ref(false)
+  const selectionBlocked = computed(() => view.value?.phase === 'ChampSelect' && view.value.selectionActionable !== true)
 
   onMounted(async () => {
     try {
@@ -75,7 +80,7 @@ export function provideNativeAuxActivity() {
   })
 
   async function withFeedback(action: () => Promise<unknown>) {
-    if (!view.value || pending.value) return false
+    if (!view.value || pending.value || selectionBlocked.value) return false
     pending.value = true
     try {
       await action()
@@ -103,7 +108,7 @@ export function provideNativeAuxActivity() {
     })
   }
 
-  const activity = { view, pending, chinese, run, withFeedback }
+  const activity = { view, pending, selectionBlocked, chinese, run, withFeedback }
   provide(nativeAuxActivity, activity)
   return activity
 }
@@ -161,10 +166,7 @@ export function useNativeAuxClient() {
         phase: current.phase,
         session: {
           gameData: { queue: { gameMode: current.gameMode, name: current.queueName || gameName }, isCustomGame: false },
-          map: {
-            name: current.mapName,
-            assets: { 'game-select-icon-hover': current.modeIconPath || (current.gameMode === 'ARAM' ? ARAM_ICON : undefined) }
-          }
+          map: { name: current.mapName }
         }
       }
     },
@@ -202,6 +204,34 @@ export function useNativeAuxClient() {
   }
 }
 
+export function useNativeModeIcon(view: Readonly<Ref<AuxView | null>>) {
+  const { assets } = useGameResourceProvider()
+  const gameMode = computed(() => view.value?.gameMode)
+  const local = computed(() => gameMode.value === 'ARAM' || gameMode.value === 'KIWI'
+    ? assets.resolve(view.value?.modeIconPath || ARAM_ICON)
+    : null)
+  const failedLocal = ref(false)
+  const failedPublic = ref(false)
+  watch([gameMode, local], () => {
+    failedLocal.value = false
+    failedPublic.value = false
+  }, { flush: 'sync' })
+
+  const modeIconSrc = computed(() => {
+    if (gameMode.value !== 'ARAM' && gameMode.value !== 'KIWI') return null
+    if (local.value && !failedLocal.value) return local.value
+    return failedPublic.value ? null : PUBLIC_ARAM_ICON
+  })
+  function handleModeIconError(event: Event) {
+    const failed = (event.currentTarget as HTMLImageElement).currentSrc
+    if (failed !== modeIconSrc.value) return
+    if (failed === PUBLIC_ARAM_ICON) failedPublic.value = true
+    else failedLocal.value = true
+  }
+
+  return { modeIconSrc, handleModeIconError }
+}
+
 export function useNativeAuxLounge() {
   const activity = useNativeAuxActivity()
   const { view, run, withFeedback } = activity
@@ -218,7 +248,7 @@ export function useNativeAuxLounge() {
   }, { immediate: true })
 
   return {
-    ...activity, lcs, agfs,
+    ...activity, lcs, agfs, ...useNativeModeIcon(view),
     willAcceptIn: computed(() => Math.max(0, (agfs.willAcceptAt - now.value) / 1000)),
     willSearchMatchIn: computed(() => Math.max(0, (agfs.willSearchMatchAt - now.value) / 1000)),
     penaltyTime: computed(() => view.value?.penaltySeconds ?? null),

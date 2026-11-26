@@ -23,6 +23,10 @@ mod mini_client_fixture;
 use mini_client_fixture::MiniClient;
 #[path = "mini_optional_actions_smoke.rs"]
 mod mini_optional_actions_smoke;
+#[path = "history_responsiveness_smoke.rs"]
+mod history_responsiveness_smoke;
+#[path = "partial_kiwi_selection_smoke.rs"]
+mod partial_kiwi_selection_smoke;
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(200);
@@ -110,6 +114,14 @@ fn champ_select_opens_real_windows() {
 }
 
 async fn exercise(app: &AppHandle) {
+    if std::env::var_os("HKSLGT_PARTIAL_KIWI_ONLY").is_some() {
+        partial_kiwi_selection_smoke::check(app).await;
+        return;
+    }
+    if std::env::var_os("HKSLGT_HISTORY_ONLY").is_some() {
+        history_responsiveness_smoke::check(app).await;
+        return;
+    }
     sample(app, "KIWI", "ChampSelect", 7100, 22);
     reconcile_companions(app);
     assert_hidden(app, "aux", "aux disabled during KIWI selection");
@@ -260,6 +272,8 @@ async fn exercise(app: &AppHandle) {
     wait_for_close(app, "opgg", started).await;
     wait_for_close(app, "aux", started).await;
     println!("An ordinary ARAM draft opened its own bundled OP.GG and aux popups and leaving ChampSelect closed them");
+    history_responsiveness_smoke::check(app).await;
+    partial_kiwi_selection_smoke::check(app).await;
 }
 
 async fn check_aux_room_and_selection(app: &AppHandle) {

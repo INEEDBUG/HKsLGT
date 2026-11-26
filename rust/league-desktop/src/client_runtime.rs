@@ -8,7 +8,9 @@ use crate::{
         emit,
     },
     lcu::{
-        aux_activity::{self, AuxActivity, AuxPhase, AuxSelectionExtras, AuxView},
+        aux_activity::{
+            self, AuxActivity, AuxPhase, AuxSelectionExtras, AuxSelectionObservation, AuxView,
+        },
         game_art::{GameArt, GameArtPath},
         player_search::PlayerSearchShard,
         player_tab_read::PlayerTabRead,
@@ -27,6 +29,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
+
+#[path = "lcu_events.rs"]
+mod lcu_events;
 
 const CLIENT_DISCOVERY: &str = "league-client-ux-main";
 const SGP: &str = "sgp-main";
@@ -72,18 +77,23 @@ impl CompanionDemand {
         }
     }
 
+    fn reads_aux_selection(self, phase: &str, game: Option<&GameflowSession>) -> bool {
+        self.aux
+            && phase == "ChampSelect"
+            && game.and_then(GameflowSession::aux_game_mode)
+                .is_none_or(|mode| matches!(mode, "ARAM" | "KIWI"))
+    }
+
     fn reads_selection(self, phase: &str, game: Option<&GameflowSession>, automate: bool) -> bool {
         phase == "ChampSelect"
-            && ((self.aux
-                && game
-                    .and_then(GameflowSession::aux_game_mode)
-                    .is_none_or(|mode| matches!(mode, "ARAM" | "KIWI")))
+            && (self.reads_aux_selection(phase, game)
                 || game.is_some_and(|game| {
                     ((automate || self.opgg) && game.is_aram())
                         || (self.resg && game.is_hextech_aram())
                 }))
     }
 
+    #[cfg(test)]
     fn aux_activity(
         self,
         phase: &str,
@@ -158,6 +168,17 @@ struct FreshAuxSelection {
     flow: GameflowSession,
     selection: Value,
     extras: AuxSelectionExtras,
+}
+
+struct ReadyEventWatch {
+    instance: ClientInstance,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl Drop for ReadyEventWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 #[derive(Default)]
@@ -416,9 +437,7 @@ impl RuntimeState {
         let active_matches = self.snapshot.active.as_ref().is_some_and(|active| {
             active.instance == instance
                 && active.aux_activity.view().is_some_and(|view| {
-                    view.phase == expected.phase
-                        && view.game_mode == expected.game_mode
-                        && (expected.game_id.is_none() || view.game_id == expected.game_id)
+                    view.confirms_selection(expected)
                 })
         });
         if self.generation != generation || !active_matches {
@@ -499,10 +518,15 @@ impl RuntimeState {
 pub(crate) struct ClientRuntime {
     transport: LcuTransport,
     state: Mutex<RuntimeState>,
-    wake: tokio::sync::Notify,
+    wake: Arc<tokio::sync::Notify>,
     art_reads: tokio::sync::Semaphore,
     room_writes: tokio::sync::Mutex<()>,
     selection_writes: tokio::sync::Mutex<()>,
+    ready_event_watch: Mutex<Option<ReadyEventWatch>>,
+    #[cfg(test)]
+    fixture_clients: Mutex<Option<Vec<Arc<LocalClient>>>>,
+    #[cfg(test)]
+    fixture_events_disabled: std::sync::atomic::AtomicBool,
 }
 
 impl ClientRuntime {
@@ -514,11 +538,67 @@ impl ClientRuntime {
                 aram_options,
                 ..Default::default()
             }),
-            wake: tokio::sync::Notify::new(),
+            wake: Arc::new(tokio::sync::Notify::new()),
             art_reads: tokio::sync::Semaphore::new(4),
             room_writes: tokio::sync::Mutex::new(()),
             selection_writes: tokio::sync::Mutex::new(()),
+            ready_event_watch: Mutex::new(None),
+            #[cfg(test)]
+            fixture_clients: Mutex::new(None),
+            #[cfg(test)]
+            fixture_events_disabled: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    fn use_fixture_clients(&self, clients: Vec<Arc<LocalClient>>) {
+        *self.fixture_clients.lock().unwrap() = Some(clients);
+    }
+
+    #[cfg(test)]
+    fn disable_fixture_events(&self) {
+        self.fixture_events_disabled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_ready_event_watch(&self) {
+        #[cfg(test)]
+        let client = if self
+            .fixture_events_disabled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            None
+        } else {
+            self.selected_client()
+        };
+        #[cfg(not(test))]
+        let client = self.selected_client();
+
+        let Ok(mut watch) = self.ready_event_watch.lock() else {
+            return;
+        };
+        if watch.as_ref().is_some_and(|current| {
+            client
+                .as_ref()
+                .is_some_and(|client| client.instance == current.instance)
+        }) {
+            return;
+        }
+        if let Some(previous) = watch.take() {
+            previous.task.abort();
+        }
+        if let Some(client) = client {
+            let instance = client.instance;
+            let transport = self.transport.clone();
+            let wake = Arc::clone(&self.wake);
+            let task = tauri::async_runtime::spawn(async move {
+                lcu_events::watch_ready_events(client, transport, wake).await;
+            });
+            *watch = Some(ReadyEventWatch {
+                instance,
+                task,
+            });
+        }
     }
 
     pub(crate) fn fields(
@@ -736,6 +816,9 @@ impl ClientRuntime {
             .view()
             .cloned()
             .ok_or("当前客户端没有可操作的大乱斗状态。")?;
+        if view.phase == AuxPhase::ChampSelect && !view.selection_actionable {
+            return Err("仍在确认当前选人状态，请稍后再试。".into());
+        }
         let client = state
             .art_client
             .as_ref()
@@ -760,9 +843,7 @@ impl ClientRuntime {
                 && state.snapshot.active.as_ref().is_some_and(|active| {
                     active.instance == client.instance
                         && active.aux_activity.view().is_some_and(|view| {
-                            view.phase == expected.phase
-                                && view.game_mode == expected.game_mode
-                                && (expected.game_id.is_none() || view.game_id == expected.game_id)
+                            view.confirms_selection(expected)
                         })
                 })
         })
@@ -786,7 +867,7 @@ impl ClientRuntime {
         if phase.as_deref() != Some("ChampSelect") {
             return Err("英雄选择阶段已经结束，请重新查看状态。".into());
         }
-        let (flow, selection) = futures_util::future::join(
+        let (flow, selection, player) = join3(
             tokio::time::timeout(
                 Duration::from_secs(2),
                 self.transport.read_gameflow_session(&target),
@@ -794,6 +875,10 @@ impl ClientRuntime {
             tokio::time::timeout(
                 Duration::from_secs(2),
                 self.transport.read_champ_select(&target),
+            ),
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                self.transport.read_current_summoner(&target),
             ),
         )
         .await;
@@ -804,6 +889,12 @@ impl ClientRuntime {
         let selection = selection
             .map_err(|_| "读取英雄选择状态超时，请重试。")?
             .map_err(|_| "无法读取英雄选择状态，请重试。")?;
+        let player = player
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .filter(|player| original.selection_player.as_deref() == Some(player.puuid.as_str()))
+            .ok_or("当前登录玩家已变化或暂时无法确认，请重新查看状态。")?;
         if flow.phase != "ChampSelect" {
             return Err("英雄选择阶段已经结束，请重新查看状态。".into());
         }
@@ -820,21 +911,23 @@ impl ClientRuntime {
             .read_aux_selection_extras(&target, &selection)
             .await
             .unwrap_or_default();
-        let activity = AuxActivity::project_with_extras(
+        let activity = AuxActivity::project_observed(
             "ChampSelect",
             Some(&flow),
             None,
             None,
-            Some(&selection),
-            Some(&extras),
+            AuxSelectionObservation {
+                session: Some(&selection),
+                extras: Some(&extras),
+                player: Some(&player.puuid),
+                ..Default::default()
+            },
         );
         let current = activity
             .view()
             .cloned()
             .ok_or("当前大乱斗英雄选择状态不可确认，请重试。")?;
-        if current.game_mode != original.game_mode
-            || (original.game_id.is_some() && current.game_id != original.game_id)
-        {
+        if !current.confirms_selection(&original) {
             return Err("当前对局已变化，请重新查看状态。".into());
         }
         if !self.aux_snapshot_is_current(&client, generation, &original) {
@@ -1376,11 +1469,28 @@ impl ClientRuntime {
                 .and_then(Result::ok)
             };
         }
-        let selection = if demand.reads_selection(&phase, session, automate) {
-            optional_lcu(self.transport.read_champ_select(&target)).await
-        } else {
-            None
+        let select = async {
+            if demand.reads_selection(&phase, session, automate) {
+                optional_lcu(self.transport.read_champ_select(&target)).await
+            } else {
+                None
+            }
         };
+        let own_champion = async {
+            if demand.reads_aux_selection(&phase, session) {
+                tokio::time::timeout(
+                    Duration::from_millis(550),
+                    self.transport.read_aux_current_champion(&target),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+            } else {
+                None
+            }
+        };
+        let (selection, current_champion) = futures_util::future::join(select, own_champion).await;
         let companions = demand.targets(
             client.instance,
             session,
@@ -1400,13 +1510,17 @@ impl ClientRuntime {
         } else {
             None
         };
-        let activity = AuxActivity::project_with_extras(
+        let activity = AuxActivity::project_observed(
             &phase,
             flow_snapshot.as_ref(),
             reads.lobby.as_ref(),
             reads.search.as_ref(),
-            selection.as_ref(),
-            extras.as_ref(),
+            AuxSelectionObservation {
+                session: selection.as_ref(),
+                extras: extras.as_ref(),
+                current_champion,
+                player: summoner.as_ref().map(|player| player.puuid.as_str()),
+            },
         );
         let room = reads.sample(
             client.instance,
@@ -1471,14 +1585,7 @@ impl ClientRuntime {
                     .then(|| state.aram_options.clone()),
             )
         };
-        let clients = tauri::async_runtime::spawn_blocking(discover_clients)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .map(Arc::new)
-            .collect::<Vec<_>>();
+        let clients = self.discover_clients_for_refresh().await;
         let find_client = |instance| clients.iter().find(|client| client.instance == instance);
         let candidate = if let Some(selection) = manual {
             find_client(selection)
@@ -1554,6 +1661,26 @@ impl ClientRuntime {
         if let Ok(mut state) = self.state.lock() {
             state.publish_draft(app);
         }
+    }
+
+    async fn discover_clients_for_refresh(&self) -> Vec<Arc<LocalClient>> {
+        #[cfg(test)]
+        if let Some(clients) = self
+            .fixture_clients
+            .lock()
+            .ok()
+            .and_then(|clients| clients.clone())
+        {
+            return clients;
+        }
+        tauri::async_runtime::spawn_blocking(discover_clients)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect()
     }
 
     async fn dispatch_due_room(
@@ -1641,12 +1768,12 @@ impl ClientRuntime {
         )
         .await;
         let summoner = summoner.map_err(|e| e.to_string())?;
-        let activity = AuxActivity::project(
+        let activity = AuxActivity::project_observed(
             &phase,
             flow.flatten().as_ref(),
             reads.lobby.as_ref(),
             reads.search.as_ref(),
-            None,
+            AuxSelectionObservation::default(),
         );
         let fresh = reads.sample(
             client.instance,
@@ -1859,7 +1986,9 @@ fn validate_choose_champion(
     if fresh.current.champion_id.is_some() {
         return validate_bench_swap(fresh, champion_id);
     }
-    if !fresh.current.bench_enabled || fresh.current.timer_phase.as_deref() != Some("BAN_PICK") {
+    if fresh.selection["benchEnabled"] != true
+        || fresh.current.timer_phase.as_deref() != Some("BAN_PICK")
+    {
         return Err("当前阶段没有可进行的英雄选择操作。".into());
     }
     require_pickable(fresh, champion_id)?;
@@ -1905,7 +2034,7 @@ fn validate_bench_swap(
     let phase = fresh.current.timer_phase.as_deref();
     let phase_allows_swap = phase == Some("FINALIZATION")
         || (phase == Some("BAN_PICK") && fresh.current.allow_subset_champion_picks);
-    if !fresh.current.bench_enabled || !phase_allows_swap {
+    if fresh.selection["benchEnabled"] != true || !phase_allows_swap {
         return Err("当前阶段不允许从备战席换取英雄。".into());
     }
     if fresh.current.champion_id == Some(champion_id) {
@@ -1969,6 +2098,7 @@ pub(crate) async fn monitor(app: AppHandle) {
     let runtime = app.state::<ClientRuntime>();
     loop {
         runtime.refresh(&app, CompanionDemand::from_app(&app)).await;
+        runtime.ensure_ready_event_watch();
         reconcile_companions(&app);
         let interval = runtime
             .state
@@ -2142,8 +2272,17 @@ mod aux_action_tests {
             "queueId":450,"gameId":0,"localPlayerCellId":0,
             "myTeam":[{"cellId":0,"championId":22}]
         });
-        let activity =
-            AuxActivity::project("ChampSelect", Some(&flow), None, None, Some(&selection));
+        let activity = AuxActivity::project_observed(
+            "ChampSelect",
+            Some(&flow),
+            None,
+            None,
+            AuxSelectionObservation {
+                session: Some(&selection),
+                player: Some("fixture-player"),
+                ..Default::default()
+            },
+        );
         let expected = activity.view().cloned().expect("projected ARAM draft");
         let mut state = RuntimeState {
             generation: 7,
@@ -2178,3 +2317,7 @@ mod aux_action_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ready_accept_smoke.rs"]
+mod ready_accept_smoke;

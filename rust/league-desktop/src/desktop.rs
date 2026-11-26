@@ -878,6 +878,13 @@ async fn league_call(
             }
             (MAIN_WINDOW, method) if window.label() == "main" => {
                 match method {
+                    "toggleMaximize" if args.is_empty() => {
+                        if window.is_maximized()? {
+                            window.unmaximize()?;
+                        } else {
+                            window.maximize()?;
+                        }
+                    }
                     "minimize" => window.minimize()?,
                     "maximize" => window.maximize()?,
                     "unmaximize" => window.unmaximize()?,

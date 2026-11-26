@@ -159,7 +159,7 @@ test('Mini actions wait for current activity, send scoped payloads once and surf
     async sync(namespace, name, state) {
       assert.equal(namespace, 'aux-activity-main')
       assert.equal(name, 'state')
-      state.view = { phase: 'ChampSelect' }
+      state.view = { phase: 'ChampSelect', selectionActionable: false }
     }
   }
   const ipc = {
@@ -181,6 +181,11 @@ test('Mini actions wait for current activity, send scoped payloads once and surf
   )
   assert.equal(await activity.run('leaveGame'), false)
   await mounted()
+  assert.equal(activity.selectionBlocked.value, true)
+  assert.equal(await activity.run('swapBenchChampion', 103), false)
+  assert.equal(await activity.run('leaveGame'), false)
+  assert.deepEqual(calls, [])
+  activity.view.value.selectionActionable = true
   const pick = activity.run('chooseChampion', 22, false)
   assert.equal(activity.pending.value, true)
   assert.equal(await activity.run('swapBenchChampion', 103), false)
@@ -202,6 +207,51 @@ test('Mini actions wait for current activity, send scoped payloads once and surf
     'The selected champion is no longer available.',
     'Rerolled. The original champion was not recovered. The bench changed.'
   ])
+})
+
+test('Mini tries the local Riot queue badge before its fixed public copy in ARAM and Mayhem only', () => {
+  const renderer = createNativeRendererConfig({}, stagedSource, outDir).plugins[0]
+  const source = renderer.load(renderer.resolveId(MINI_ACTIVITY_MODULE)).replace(/^import .*$/gm, '').replace(/^export /gm, '')
+  const script = stripTypeScriptTypes(source, { mode: 'transform' })
+  const create = new Function(
+    'useGameResourceProvider', 'ref', 'computed', 'watch', 'view', `${script}\nreturn useNativeModeIcon(view)`
+  )
+  const badge = '/lol-game-data/assets/content/src/LeagueClient/GameModeAssets/ARAM/img/game-select-icon-hover.png'
+  const proxy = 'http://league-art.localhost'
+  const publicBadge = 'https://raw.communitydragon.org/16.19/plugins/rcp-be-lol-game-data/global/default/content/src/leagueclient/gamemodeassets/aram/img/game-select-icon-hover.png'
+  const view = { value: null }
+  let handlers
+  const icon = create(
+    () => ({ assets: { resolve: (path) => proxy + path } }),
+    (value) => ({ value }),
+    (getter) => ({ get value() { return getter() } }),
+    (sources, callback) => { handlers = { sources, callback } },
+    view
+  )
+  function show(gameMode, modeIconPath) {
+    const before = handlers.sources.map((source) => typeof source === 'function' ? source() : source.value)
+    view.value = { gameMode, modeIconPath }
+    const after = handlers.sources.map((source) => typeof source === 'function' ? source() : source.value)
+    if (before.some((value, index) => value !== after[index])) handlers.callback()
+  }
+  const fail = (currentSrc) => icon.handleModeIconError({ currentTarget: { currentSrc } })
+  assert.equal(icon.modeIconSrc.value, null)
+  show('ARAM', badge)
+  assert.equal(icon.modeIconSrc.value, proxy + badge)
+  fail('https://other.invalid/stale.png')
+  assert.equal(icon.modeIconSrc.value, proxy + badge)
+  fail(proxy + badge)
+  assert.equal(icon.modeIconSrc.value, publicBadge)
+  show('ARAM', badge)
+  assert.equal(icon.modeIconSrc.value, publicBadge)
+  fail(publicBadge)
+  assert.equal(icon.modeIconSrc.value, null)
+  show('KIWI', null)
+  assert.equal(icon.modeIconSrc.value, proxy + badge)
+  fail(proxy + badge)
+  assert.equal(icon.modeIconSrc.value, publicBadge)
+  show('UNKNOWN', badge)
+  assert.equal(icon.modeIconSrc.value, null)
 })
 
 test('the Mini requests genuine OP.GG balance data once in standard ARAM selection only', async () => {
@@ -360,6 +410,23 @@ test('connects the main title bar drag gesture to the native main window only', 
   assert.match(native, /class="shard-area" @mousedown\.self\.left="startNativeDrag"/)
   assert.match(native, /call\('window-manager-main\/main-window', 'startDragging'\)/)
   assert.equal(renderer.transform(component, join(stagedSource, 'other.vue')), undefined)
+})
+
+test('the main window handles caption gestures without animated WebView2 drag regions', () => {
+  const renderer = createNativeRendererConfig({}, stagedSource, outDir).plugins[0]
+  const main = join(stagedSource, 'src/renderer/src-main-window')
+  const style = '<template><main /></template>\n<style scoped>main { display: block }</style>'
+  const app = renderer.transform(style, join(main, 'App.vue'))?.code ?? style
+  assert.match(app, /<style>\s*\*\s*\{[^}]*-webkit-app-region:\s*initial !important;/)
+  for (const [file, anchor, modifiers] of [
+    ['components/titlebar/PlayerTabsTitle.vue', 'player-tabs-title', 'self.left'],
+    ['components/sidebar/Sidebar.vue', 'app-sidebar__logo', 'left']
+  ]) {
+    const component = `<template><div class="${anchor}"></div></template>\n<script setup lang="tsx">\n</script>`
+    const result = renderer.transform(component, join(main, file))?.code ?? component
+    assert.ok(result.includes(`@mousedown.${modifiers}="startNativeDrag"`))
+    assert.ok(result.includes("'toggleMaximize'"))
+  }
 })
 
 test('checks through Rust and downloads only the checked version from the native updater', async () => {

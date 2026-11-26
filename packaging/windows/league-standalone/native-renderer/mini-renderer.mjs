@@ -12,7 +12,32 @@ const miniPatches = {
     ['  <KeepAlive>', '  <div class="aux-activity h-full" :data-phase="view?.phase"><KeepAlive>'],
     ['  </KeepAlive>', '  </KeepAlive></div>']
   ],
+  'views/ChampSelect.vue': [
+    ['  <NScrollbar class="box-border px-3 py-2">', `  <NScrollbar class="box-border px-3 py-2">
+    <div v-if="selectionBlocked" class="aux-draft-waiting mb-2 text-xs text-gray-500 dark:text-gray-400" role="status">
+      {{ chinese ? '正在确认选人状态，操作暂不可用。' : 'Verifying champion select. Actions are temporarily unavailable.' }}
+    </div>`],
+    ["import { NScrollbar } from 'naive-ui'", `import { NScrollbar } from 'naive-ui'
+import { useNativeAuxActivity } from '${MINI_ACTIVITY_MODULE}'
+
+const { selectionBlocked, chinese } = useNativeAuxActivity()`]
+  ],
   'views/Lounge.vue': [
+    [`      <LcuImage
+        v-if="lcs.gameflow.session?.map?.assets?.['game-select-icon-hover']"
+        class="mb-4 h-16 w-16"
+        :src="lcs.gameflow.session?.map?.assets?.['game-select-icon-hover']"
+      />`, `      <img
+        v-if="modeIconSrc"
+        :key="modeIconSrc"
+        :crossorigin="modeIconSrc.startsWith('https:') ? 'anonymous' : undefined"
+        referrerpolicy="no-referrer"
+        :src="modeIconSrc"
+        alt=""
+        class="mode-icon block mb-4 h-16 w-16"
+        @dragstart.prevent
+        @error="handleModeIconError"
+      />`],
     ['v-else-if="lcs.matchmaking.readyCheck?.playerResponse === \'Accepted\'">\n          <span class="mb-2', 'v-else-if="lcs.matchmaking.readyCheck?.playerResponse === \'Accepted\'">\n          <span class="ready-response mb-2'],
     ['          v-if="lcs.matchmaking.search"', '          class="queue-time"\n          v-if="lcs.matchmaking.search"'],
     ['          class="mb-2 text-[13px] text-gray-500 dark:text-gray-400"\n          class="queue-time"', '          class="queue-time mb-2 text-[13px] text-gray-500 dark:text-gray-400"'],
@@ -27,19 +52,22 @@ const miniPatches = {
     }))
   ],
   'components/BenchChampionsMini.vue': [
+    ['v-if="combinedChampions && gameMode"', 'v-if="gameMode && (combinedChampions || lcs.champSelect.currentChampion)"'],
+    ['<NDivider vertical />', '<NDivider v-if="combinedChampions" vertical />'],
     [scopedClient[0], `import { useNativeAuxClient, useNativeAuxActivity, useNativeAramBalance } from '${MINI_ACTIVITY_MODULE}'`],
-    ['const lcs = useLeagueClientStore()', 'const lcs = useNativeAuxClient()\nconst { view, pending, run } = useNativeAuxActivity()\nuseNativeAramBalance()'],
+    ['const lcs = useLeagueClientStore()', 'const lcs = useNativeAuxClient()\nconst { view, pending, selectionBlocked, run } = useNativeAuxActivity()\nuseNativeAramBalance()'],
     ["import { LeagueClientRenderer } from '@renderer-shared/shards/league-client'\n", ''],
     ['const lc = useInstance(LeagueClientRenderer)\n', ''],
     ['class="size-9 cursor-default rounded-full', 'class="current-champion size-9 cursor-default rounded-full'],
+    ['            <ChampionIcon\n              class="current-champion', '            <ChampionIcon\n              v-if="lcs.champSelect.currentChampion || !selectionBlocked"\n              class="current-champion'],
     [':champion-id="lcs.champSelect.currentChampion || -1"', ':champion-id="lcs.champSelect.currentChampion || -1" :data-champion-id="lcs.champSelect.currentChampion"'],
-    ['<div class="grid grid-cols-5 gap-1">', '<div class="bench grid grid-cols-5 gap-1">'],
-    [':disabled="rerollsRemaining === 0 || isRerolling"\n            size="tiny"', ':disabled="pending || rerollsRemaining === 0 || isRerolling"\n            size="tiny"'],
-    [':disabled="rerollsRemaining === 0 || isRerolling"\n            @click="() => handleReroll(true)"', ':disabled="pending || rerollsRemaining === 0 || isRerolling"\n            @click="() => handleReroll(true)"'],
+    ['<div class="grid grid-cols-5 gap-1">', '<div v-if="combinedChampions" class="bench grid grid-cols-5 gap-1">'],
+    [':disabled="rerollsRemaining === 0 || isRerolling"\n            size="tiny"', ':disabled="pending || selectionBlocked || rerollsRemaining === 0 || isRerolling"\n            size="tiny"'],
+    [':disabled="rerollsRemaining === 0 || isRerolling"\n            @click="() => handleReroll(true)"', ':disabled="pending || selectionBlocked || rerollsRemaining === 0 || isRerolling"\n            @click="() => handleReroll(true)"'],
     ['            :title="\n              t(\'auxWindow.championBench.reroll\'', '            data-action="reroll"\n            :title="\n              t(\'auxWindow.championBench.reroll\''],
     ['            :title="\n              t(\'auxWindow.championBench.charity\'', '            data-action="charity-reroll"\n            :title="\n              t(\'auxWindow.championBench.charity\''],
     [`                  'cursor-not-allowed grayscale-[0.8]':
-                    !isChampionSwappable(c.championId) || !canUseBench`, `                  'cursor-not-allowed': pending || !canUseBench || !isChampionSwappable(c.championId),
+                    !isChampionSwappable(c.championId) || !canUseBench`, `                  'cursor-not-allowed': pending || selectionBlocked || !canUseBench || !isChampionSwappable(c.championId),
                   'grayscale-[0.8]':
                     (view?.pickableChampionIds != null && !isChampionSwappable(c.championId)) ||
                     (view?.timerPhase && !canUseBench)`],
@@ -48,8 +76,8 @@ const miniPatches = {
               @click.right="handleBenchSwapOrPick(c.championId, false)"`, `              :champion-id="c.championId"
               :data-champion-id="c.championId"
               :aria-label="lcs.gameData.championName(c.championId)"
-              :aria-disabled="pending || !canUseBench || !isChampionSwappable(c.championId)"
-              :tabindex="!pending && canUseBench && isChampionSwappable(c.championId) ? 0 : -1"
+              :aria-disabled="pending || selectionBlocked || !canUseBench || !isChampionSwappable(c.championId)"
+              :tabindex="!pending && !selectionBlocked && canUseBench && isChampionSwappable(c.championId) ? 0 : -1"
               role="button"
               @click="() => handleBenchSwapOrPick(c.championId)"
               @keydown.enter.prevent="handleBenchSwapOrPick(c.championId)"
@@ -91,8 +119,8 @@ const miniPatches = {
   ],
   'components/ChampSelectOperations.vue': [
     ['@positive-click="dodgeLoop"', `@positive-click="() => run('leaveGame')"`],
-    [':disabled="isLoopingDodge"\n        :negative-text', ':disabled="pending"\n        :negative-text'],
-    [':disabled="isLoopingDodge">', ':disabled="pending" data-action="leave-game">'],
+    [':disabled="isLoopingDodge"\n        :negative-text', ':disabled="pending || selectionBlocked"\n        :negative-text'],
+    [':disabled="isLoopingDodge">', ':disabled="pending || selectionBlocked" data-action="leave-game">'],
     ["            <template v-if=\"iteration\">({{ iteration >= 1000 ? '999+' : iteration }})</template>\n", ''],
     [`      <NButton
         v-if="isLoopingDodge"
@@ -104,12 +132,12 @@ const miniPatches = {
         {{ t('auxWindow.champSelect.operations.dodge.cancel') }}
       </NButton>
 `, ''],
-    ['@update:value="(val) => as.setTemporarilyDisabled(val)"', `:disabled="pending" data-action="pause-auto-select" @update:value="(val) => run('pauseAutoSelect', val)"`]
+    ['@update:value="(val) => as.setTemporarilyDisabled(val)"', `:disabled="pending || selectionBlocked" data-action="pause-auto-select" @update:value="(val) => run('pauseAutoSelect', val)"`]
   ],
   'components/SkinSelectionMini.vue': [
     ['v-if="aws.settings.showSkinSelector && lcs.champSelect.currentChampion && skinOptions.length"', 'v-if="showSkinSelector && skinOptions.length"'],
     [':value="lcs.champSelect.skinSelectorInfo?.selectedSkinId"', ':value="view?.selectedSkinId ?? undefined"'],
-    [':loading="isSettingSkin"', ':loading="pending" :disabled="pending || view?.skinSelectionDisabled" data-action="select-skin"']
+    [':loading="isSettingSkin"', ':loading="pending" :disabled="pending || selectionBlocked || view?.skinSelectionDisabled" data-action="select-skin"']
   ]
 }
 
@@ -130,7 +158,6 @@ const currentPage = computed(() => {
 `],
   'views/Lounge.vue': ["const handleAccept = async () =>", `
 import LoungeOperations from '@aux-window/components/LoungeOperations.vue'
-import LcuImage from '@renderer-shared/components/LcuImage.vue'
 import { useTranslation } from 'i18next-vue'
 import { NButton } from 'naive-ui'
 import { useNativeAuxLounge } from '${MINI_ACTIVITY_MODULE}'
@@ -138,6 +165,7 @@ import { useNativeAuxLounge } from '${MINI_ACTIVITY_MODULE}'
 const { t } = useTranslation()
 const {
   lcs, agfs, pending, penaltyTime, penaltyTotalTime, willAcceptIn, willSearchMatchIn,
+  modeIconSrc, handleModeIconError,
   handleAccept, handleDecline, handleCancelAutoAccept, handleCancelAutoSearchMatch, handleCancelSearching
 } = useNativeAuxLounge()
 
@@ -171,7 +199,7 @@ import { useNativeAuxActivity } from '${MINI_ACTIVITY_MODULE}'
 const { t } = useTranslation()
 const as2 = useAutoSelectStore()
 const isCustomGame = false
-const { pending, run } = useNativeAuxActivity()
+const { pending, selectionBlocked, run } = useNativeAuxActivity()
 `],
   'components/SkinSelectionMini.vue': ['getCarouselSkins()', `
 import LcuImage from '@renderer-shared/components/LcuImage.vue'
@@ -182,7 +210,7 @@ import { computed } from 'vue'
 import { useNativeAuxActivity } from '${MINI_ACTIVITY_MODULE}'
 
 const { t } = useTranslation()
-const { view, pending, run } = useNativeAuxActivity()
+const { view, pending, selectionBlocked, run } = useNativeAuxActivity()
 const aws = useAuxWindowStore()
 const showSkinSelector = computed(() => aws.settings.showSkinSelector && view.value?.skinSelectorAvailable === true)
 const skinOptions = computed(() => (view.value?.skins ?? []).map((skin) => ({

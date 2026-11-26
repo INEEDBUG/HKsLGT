@@ -28,12 +28,14 @@ pub(super) struct Scene {
     pub rerolls_remaining: u32,
     pub reject_next: bool,
     pub writes: Vec<(String, String)>,
+    pub partial_kiwi: Option<super::partial_kiwi_selection_smoke::DraftFixture>,
 }
 
 pub(super) struct MiniClient {
     pub port: u16,
     pub root: CertificateDer<'static>,
     pub scene: Arc<Mutex<Scene>>,
+    pub history: Arc<super::history_responsiveness_smoke::HistoryFixture>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -65,31 +67,47 @@ impl MiniClient {
             rerolls_remaining: 2,
             reject_next: false,
             writes: vec![],
+            partial_kiwi: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let history = Arc::new(super::history_responsiveness_smoke::HistoryFixture::default());
         let worker = {
             let (scene, stop, config) = (Arc::clone(&scene), Arc::clone(&stop), Arc::new(config));
+            let history = Arc::clone(&history);
             thread::spawn(move || {
-                for socket in listener.incoming().flatten() {
-                    if stop.load(Ordering::Acquire) {
-                        break;
+                thread::scope(|requests| {
+                    for socket in listener.incoming().flatten() {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let concurrent = history.active();
+                        let serve_one = || {
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut stream = StreamOwned::new(
+                                ServerConnection::new(Arc::clone(&config)).unwrap(),
+                                socket,
+                            );
+                            // The browser can cancel an image while the view switches phases.
+                            let _ = serve(&mut stream, &scene, &history);
+                        };
+                        // A deliberately slow history page must not block the concurrent League
+                        // requests for rank, identity or the companion window at this test server.
+                        if concurrent {
+                            requests.spawn(serve_one);
+                        } else {
+                            serve_one();
+                        }
                     }
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut stream = StreamOwned::new(
-                        ServerConnection::new(Arc::clone(&config)).unwrap(),
-                        socket,
-                    );
-                    // The browser can cancel an image while the view switches phases.
-                    let _ = serve(&mut stream, &scene);
-                }
+                })
             })
         };
         Self {
             port,
             root,
             scene,
+            history,
             stop,
             worker: Some(worker),
         }
@@ -104,7 +122,7 @@ impl Drop for MiniClient {
     }
 }
 
-const PLAYER: &str = "11111111-2222-4333-8444-555555555555";
+pub(super) const PLAYER: &str = "11111111-2222-4333-8444-555555555555";
 const OWNED_SKIN_PREVIEW: &str =
     "/lol-game-data/assets/ASSETS/Characters/Ahri/Skins/Skin01/Images/ahri_splash_centered_1.jpg";
 pub(super) const OWNED_SKIN_ID: u32 = 103001;
@@ -116,6 +134,7 @@ pub(super) const LEAVE_TARGET: &str = concat!(
 fn serve(
     stream: &mut StreamOwned<ServerConnection, TcpStream>,
     scene: &Mutex<Scene>,
+    history: &super::history_responsiveness_smoke::HistoryFixture,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(&mut *stream);
     let mut first = String::new();
@@ -144,6 +163,14 @@ fn serve(
     }
     let mut body = vec![0; size];
     reader.read_exact(&mut body)?;
+    if authenticated && method == "GET" {
+        if let Some((status, response)) = history.get(path) {
+            let bytes = serde_json::to_vec(&response)?;
+            write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len())?;
+            stream.write_all(&bytes)?;
+            return stream.flush();
+        }
+    }
     let mut scene = scene.lock().unwrap();
     let (status, mime, bytes) = if !authenticated {
         (401, "application/json", vec![])
@@ -190,6 +217,16 @@ fn serve(
 
 impl Scene {
     fn get(&self, path: &str) -> Option<Value> {
+        if let Some(draft) = self.partial_kiwi.as_ref() {
+            match path {
+                "/lol-gameflow/v1/session" => return draft.gameflow.clone(),
+                "/lol-champ-select/v1/session" => return draft.selection.clone(),
+                "/lol-champ-select/v1/current-champion" => {
+                    return draft.current_champion.map(|id| json!(id));
+                }
+                _ => {}
+            }
+        }
         Some(match path {
             "/lol-summoner/v1/current-summoner" => {
                 json!({"puuid":PLAYER,"summonerId":1,"gameName":"Window test","tagLine":"TEST"})
@@ -207,6 +244,9 @@ impl Scene {
             }
             "/lol-matchmaking/v1/ready-check" => {
                 json!({"state":"InProgress","playerResponse":self.response})
+            }
+            "/lol-champ-select/v1/current-champion" if self.phase == "ChampSelect" => {
+                json!(self.champion)
             }
             "/lol-champ-select/v1/session" if self.phase == "ChampSelect" => {
                 json!({"queueId":450,"gameId":0,"isSpectating":false,"isCustomGame":false,"localPlayerCellId":2,

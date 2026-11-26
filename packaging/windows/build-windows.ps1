@@ -23,6 +23,7 @@ $revision = (git -C $root rev-parse HEAD).Trim()
 if ($env:GITHUB_SHA -and $revision -cne $env:GITHUB_SHA) { throw 'Unexpected workflow checkout.' }
 
 $known = [ordered]@{
+  'trusted-1.0.0-beta.16-interactive.json' = '08abc5eb5cf0d473a3e1c8305a2abef710faf066a72951bbd112e92216eff1ea'
   'trusted-1.0.0-beta.16-preview.json' = 'dc5d1b5b204c7115d21fda8d6b9203f95d2cc4ac04f1bf6f080b8536876bc08c'
   'trusted-1.0.0-beta.5.json' = '85c33b257b4bcb4faa77ea8bbe947cd69deadbffdda0618711e0cc5177d50bc9'
   'trusted-1.0.0-beta.8.json' = '358d78e5417cadeff0153539e2f99cbe8b0be5a6123c0b58e1182005334aac7b'
@@ -72,6 +73,22 @@ try {
   if ($VerifyCompanionWindows) {
     $companionTest = 'desktop::companion_window_smoke::champ_select_opens_real_windows'
     cargo test @cargoArgs --manifest-path $desktopManifest $companionTest -- --ignored --exact --nocapture
+    # The full match flow reuses the room window. Exercise its first creation during a history read as well.
+    $previousHistoryOnly = $env:HKSLGT_HISTORY_ONLY
+    try {
+      $env:HKSLGT_HISTORY_ONLY = '1'
+      cargo test @cargoArgs --manifest-path $desktopManifest $companionTest -- --ignored --exact --nocapture
+    } finally {
+      $env:HKSLGT_HISTORY_ONLY = $previousHistoryOnly
+    }
+    foreach ($case in @(
+      'ready_check_event_wakes_monitor_and_accepts_once_with_slow_lcu_reads',
+      'polling_baseline_accept_waits_for_next_two_second_monitor_tick',
+      'monitor_falls_back_to_normal_polling_after_event_socket_closes',
+      'ready_check_event_does_not_accept_non_aram_queue'
+    )) {
+      cargo test @cargoArgs --manifest-path $desktopManifest "client_runtime::ready_accept_smoke::$case" -- --ignored --exact --nocapture
+    }
   }
   cargo build @cargoArgs --manifest-path $desktopManifest
 

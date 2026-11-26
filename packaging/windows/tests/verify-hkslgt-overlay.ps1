@@ -6,7 +6,9 @@ param(
   [ValidateSet('MaxGameStudio','HKsLGT')][string]$BaselineRepository = 'MaxGameStudio',
   [ValidatePattern('^\d+\.\d+\.\d+-beta\.\d+$')][string]$BaselineVersion = '1.0.0-beta.5',
   [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$BaselineSha256 = 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4',
-  [string]$SameVersionBaseline
+  [string]$SameVersionBaseline,
+  [ValidateSet('currentuser','allusers')][string]$InstallScope = 'currentuser',
+  [switch]$UserToMachine
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,10 +22,10 @@ function Run-Installer([string]$File, [string]$Arguments) {
   if ($result.ExitCode -ne 0) { throw "League installer returned $($result.ExitCode)." }
 }
 
-function Assert-Install([string]$ExpectedVersion) {
-  $version = Get-ItemPropertyValue -LiteralPath $uninstallKey -Name DisplayVersion
-  $location = (Get-ItemPropertyValue -LiteralPath $installKey -Name InstallLocation).Trim('"')
-  if ($version -cne $ExpectedVersion -or $location -ine $program -or !(Test-Path -LiteralPath $executable -PathType Leaf)) {
+function Assert-Install([string]$ExpectedVersion, [string]$RegistryHive = $hive, [string]$Directory = $program) {
+  $version = Get-ItemPropertyValue -LiteralPath "$RegistryHive\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity" -Name DisplayVersion
+  $location = (Get-ItemPropertyValue -LiteralPath "$RegistryHive\Software\$identity" -Name InstallLocation).Trim('"')
+  if ($version -cne $ExpectedVersion -or $location -ine $Directory -or !(Test-Path -LiteralPath (Join-Path $Directory 'MaxGameStudioLeagueToolbox.exe') -PathType Leaf)) {
     throw 'The installed version or program location did not match.'
   }
 }
@@ -49,18 +51,23 @@ if ((Split-Path -Leaf $installer) -cne "MaxGameStudioLeague_$($Version)_x64-setu
   throw 'Unexpected League installer name.'
 }
 $identity = 'b1d9ab62-895c-574e-a779-36d3f2ee3611'
-$installKey = "HKCU:\Software\$identity"
-$uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity"
+$hive = if ($InstallScope -eq 'allusers') { 'HKLM:' } else { 'HKCU:' }
+$installKey = "$hive\Software\$identity"
+$uninstallKey = "$hive\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity"
 $control = Join-Path $env:APPDATA 'MaxGameStudioLeague'
 $scratch = Join-Path $env:RUNNER_TEMP ('hkslgt-overlay-' + [Guid]::NewGuid().ToString('n'))
-$program = Join-Path $scratch 'Program'
+$program = if ($InstallScope -eq 'allusers') {
+  Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'MaxGameStudioLeagueToolbox'
+} else {
+  Join-Path $scratch 'Program'
+}
 $profile = Join-Path $scratch 'Profile'
 $executable = Join-Path $program 'MaxGameStudioLeagueToolbox.exe'
 $uninstaller = Join-Path $program 'Uninstall MaxGameStudioLeagueToolbox.exe'
 $locator = Join-Path $control 'data-location.txt'
 $settings = Join-Path $profile 'base-config.json'
 $database = Join-Path $profile 'LeagueAkari.db'
-if (@($installKey, $uninstallKey, $control, $scratch | Where-Object { Test-Path -LiteralPath $_ }).Count) {
+if (@($installKey, $uninstallKey, $control, $scratch, $program | Where-Object { Test-Path -LiteralPath $_ }).Count) {
   throw 'Expected a clean disposable fixture.'
 }
 $null = New-Item -ItemType Directory -Path $scratch, $profile, $control
@@ -72,9 +79,17 @@ if ((Get-FileHash -LiteralPath $baseline).Hash -ine $BaselineSha256) {
   throw 'The released League baseline installer did not match its pinned SHA-256.'
 }
 
-$installArgs = "/S /currentuser /D=$program"
-Run-Installer $baseline $installArgs
-Assert-Install $baselineVersion
+$installArgs = "/S /$InstallScope /D=$program"
+if ($UserToMachine) {
+  if ($InstallScope -ne 'allusers' -or $SameVersionBaseline) { throw 'Use a fresh per-user predecessor for cross-scope verification.' }
+  $oldProgram = Join-Path $scratch 'PerUserProgram'
+  if (Test-Path -LiteralPath "HKCU:\Software\$identity") { throw 'Expected a clean per-user registration.' }
+  Run-Installer $baseline "/S /currentuser /D=$oldProgram"
+  Assert-Install $baselineVersion 'HKCU:' $oldProgram
+} else {
+  Run-Installer $baseline $installArgs
+  Assert-Install $baselineVersion
+}
 if ($BaselineRepository -eq 'MaxGameStudio' -and !(Test-Path -LiteralPath (Join-Path $program 'resources/app.asar') -PathType Leaf)) {
   throw 'The old Electron installation was incomplete.'
 }
@@ -128,6 +143,20 @@ function Test-CandidateOverlay([string]$FromVersion) {
     Assert-Profile
     $programBytes = (Get-ChildItem -LiteralPath $program -File -Recurse | Measure-Object -Property Length -Sum).Sum
     Write-Host "HKSLGT_STARTUP_SAMPLE: installedBytes=$programBytes mainProcessWorkingSetBytes=$($process.WorkingSet64)"
+    if ($UserToMachine) {
+      $oldEntry = Test-Path -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity"
+      $oldExe = Test-Path -LiteralPath (Join-Path $oldProgram 'MaxGameStudioLeagueToolbox.exe')
+      Write-Host "HKSLGT_USER_TO_MACHINE: priorUserEntry=$oldEntry priorUserExecutable=$oldExe dataLocatorAndRecordsVerified=true"
+      $shell = New-Object -ComObject WScript.Shell
+      foreach ($desktop in 'DesktopDirectory','CommonDesktopDirectory') {
+        $folder = [Environment]::GetFolderPath($desktop)
+        foreach ($link in Get-ChildItem -LiteralPath $folder -Filter '*.lnk' -File -ErrorAction SilentlyContinue) {
+          $target = $shell.CreateShortcut($link.FullName).TargetPath
+          if ($target -ieq $executable) { Write-Host "HKSLGT_SHORTCUT: $desktop -> upgraded toolbox" }
+          if ($target -ieq (Join-Path $oldProgram 'MaxGameStudioLeagueToolbox.exe')) { Write-Host "HKSLGT_SHORTCUT: $desktop -> previous toolbox" }
+        }
+      }
+    }
   } finally {
     if (!$process.HasExited) {
       $process.Kill()
@@ -135,12 +164,12 @@ function Test-CandidateOverlay([string]$FromVersion) {
     }
   }
 
-  Run-Installer $uninstaller '/S /currentuser'
+  Run-Installer $uninstaller "/S /$InstallScope"
   Assert-Profile
   if ((Test-Path -LiteralPath $installKey) -or (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $executable)) {
     throw 'Uninstall did not remove the upgraded program and registration.'
   }
-  Write-Host "HKSLGT_OVERLAY_VERIFIED: $FromVersion -> $Version, custom program and data paths, settings and SQLite data preserved, startup and uninstall verified."
+  Write-Host "HKSLGT_OVERLAY_VERIFIED: $FromVersion -> $Version, scope=$InstallScope, registered program location, custom data path, settings and SQLite data preserved, startup and uninstall verified."
 }
 
 Test-CandidateOverlay $baselineVersion
