@@ -65,6 +65,21 @@ pub(crate) struct LocalClient {
 }
 
 impl LocalClient {
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Option<Self> {
+        let executable = std::env::current_exe().ok()?;
+        let pid = std::process::id();
+        let (process, image, created_at) =
+            open_named_process(pid, executable.file_name()?.to_str()?)?;
+        Some(Self {
+            process,
+            instance: ClientInstance { pid, created_at },
+            install_directory: image.parent()?.to_owned(),
+            port: 0,
+            token: String::new(),
+        })
+    }
+
     pub(crate) fn alive(&self) -> bool {
         // The retained handle refers to the selected process even if Windows recycles its PID.
         unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) == WAIT_TIMEOUT }

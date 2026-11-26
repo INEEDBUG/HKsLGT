@@ -28,12 +28,20 @@ use tauri::{
 };
 use tauri_plugin_opener::OpenerExt;
 
+#[path = "aux_window.rs"]
+pub(crate) mod aux_window;
+
 #[path = "bootstrap.rs"]
 mod bootstrap;
+
+#[cfg(test)]
+#[path = "companion_window_smoke.rs"]
+mod companion_window_smoke;
 
 #[path = "updater.rs"]
 mod updater;
 
+use aux_window::AuxWindow;
 use bootstrap::{AUTO_SELECT, AUX_WINDOW, OPGG_WINDOW};
 
 const SYNC_NAMESPACE: &str = "mobx-utils-main";
@@ -438,7 +446,7 @@ pub(crate) fn show_companion(
     if let Some(expected) = opgg_draft {
         let opgg = app.state::<OpggWindow>();
         match opgg.target(app) {
-            Some(current) if current.scope == expected => opgg.mark_shown(expected),
+            Some(current) if current.scope == expected => {}
             Some(_) => return Err("当前大乱斗选人已变更。".into()),
             None => {
                 let _ = close_opgg_companion(app);
@@ -447,6 +455,15 @@ pub(crate) fn show_companion(
         }
     }
     target.show()?;
+    if let Some(scope) = opgg_draft {
+        app.state::<OpggWindow>().mark_shown(scope);
+    } else if !inactive {
+        let scope = app
+            .state::<ClientRuntime>()
+            .aux_draft()
+            .map(|(scope, _)| scope);
+        app.state::<AuxWindow>().mark_manual_show(scope);
+    }
     if !inactive {
         target.unminimize()?;
         target.set_focus()?;
@@ -794,6 +811,11 @@ async fn league_call(
                 let value = value.expect("settings reads have returned");
                 let revision = revision.next();
                 drop(db);
+                if namespace == AUX_WINDOW && matches!(key, "enabled" | "autoShow") {
+                    let value = value.as_bool().ok_or("无效的小型辅助面板设置值。")?;
+                    app.state::<AuxWindow>().update_setting(key, value)?;
+                    client.refresh_soon();
+                }
                 if namespace == OPGG_WINDOW && matches!(key, "enabled" | "autoShow") {
                     let opgg = app.state::<OpggWindow>();
                     let value = value.as_bool().ok_or("无效的 OP.GG 设置值。")?;
@@ -880,7 +902,14 @@ pub(crate) fn run() -> tauri::Result<()> {
             let profile = DesktopProfile::prepare(app)
                 .map_err(|error| io::Error::other(format!("工具箱数据无法准备。{error}")))?;
             let webview_directory = profile.webview_directory()?;
-            let (auto_connect, resg_preferences, aram_options, opgg_preferences, game_shortcut) = {
+            let (
+                auto_connect,
+                resg_preferences,
+                aram_options,
+                aux,
+                opgg_preferences,
+                game_shortcut,
+            ) = {
                 let db = profile
                     .database
                     .lock()
@@ -890,6 +919,9 @@ pub(crate) fn run() -> tauri::Result<()> {
                     .map_err(io::Error::other)?
                     .as_bool()
                     .unwrap_or(true);
+                let aux = bootstrap::initial_state(&db, AUX_WINDOW, "settings")
+                    .map_err(io::Error::other)?
+                    .expect("known auxiliary window settings");
                 let opgg = bootstrap::initial_state(&db, OPGG_WINDOW, "settings")
                     .map_err(io::Error::other)?
                     .expect("known OP.GG window settings");
@@ -897,6 +929,7 @@ pub(crate) fn run() -> tauri::Result<()> {
                     auto_connect,
                     bootstrap::resg_preferences(&db).map_err(io::Error::other)?,
                     bootstrap::aram_options(&db).map_err(io::Error::other)?,
+                    AuxWindow::new(aux["enabled"] == true, aux["autoShow"] == true),
                     OpggPreferences {
                         enabled: opgg["enabled"] == true,
                         auto_show: opgg["autoShow"] == true,
@@ -909,6 +942,7 @@ pub(crate) fn run() -> tauri::Result<()> {
             app.manage(profile);
             app.manage(ClientRuntime::new(auto_connect, aram_options)?);
             app.manage(ResgWindow::new(resg_preferences));
+            app.manage(aux);
             app.manage(OpggWindow::new(opgg_preferences));
             app.manage(SettingsRevision::default());
             app.manage(updater::LeagueUpdater::default());
@@ -973,48 +1007,50 @@ pub(crate) fn run() -> tauri::Result<()> {
             tauri::async_runtime::spawn(monitor(app.handle().clone()));
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if window.label() == resg_window::LABEL && matches!(event, WindowEvent::Destroyed) {
-                let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(controller) = app.try_state::<ResgWindow>() {
-                        let _ = controller.reconcile(&app, ResgAction::Synchronize);
-                    }
-                });
-                return;
-            }
-            if !LOCAL_WINDOWS.contains(&window.label()) {
-                return;
-            }
-            let Some(webview) = window.app_handle().get_webview_window(window.label()) else {
-                return;
-            };
-            match event {
-                WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    if window.label() == "main" {
-                        let profile = window.state::<DesktopProfile>();
-                        let _ = close_main(&webview, saved_close_action(&profile).unwrap_or("ask"));
-                    } else if webview.hide().is_ok() {
-                        let _ = publish_window_property(&webview, "show", json!(false));
-                    }
-                }
-                WindowEvent::Focused(focused) => {
-                    let _ = publish_window_property(
-                        &webview,
-                        "focus",
-                        json!(if *focused { "focused" } else { "blurred" }),
-                    );
-                }
-                WindowEvent::Resized(_) => {
-                    if let Ok(status) = window_status(&webview) {
-                        let _ = publish_window_property(&webview, "status", json!(status));
-                    }
-                }
-                _ => {}
-            }
-        })
+        .on_window_event(handle_window_event)
         .run(tauri::generate_context!())
+}
+
+fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
+    if window.label() == resg_window::LABEL && matches!(event, WindowEvent::Destroyed) {
+        let app = window.app_handle().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(controller) = app.try_state::<ResgWindow>() {
+                let _ = controller.reconcile(&app, ResgAction::Synchronize);
+            }
+        });
+        return;
+    }
+    if !LOCAL_WINDOWS.contains(&window.label()) {
+        return;
+    }
+    let Some(webview) = window.app_handle().get_webview_window(window.label()) else {
+        return;
+    };
+    match event {
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            if window.label() == "main" {
+                let profile = window.state::<DesktopProfile>();
+                let _ = close_main(&webview, saved_close_action(&profile).unwrap_or("ask"));
+            } else if webview.hide().is_ok() {
+                let _ = publish_window_property(&webview, "show", json!(false));
+            }
+        }
+        WindowEvent::Focused(focused) => {
+            let _ = publish_window_property(
+                &webview,
+                "focus",
+                json!(if *focused { "focused" } else { "blurred" }),
+            );
+        }
+        WindowEvent::Resized(_) => {
+            if let Ok(status) = window_status(&webview) {
+                let _ = publish_window_property(&webview, "status", json!(status));
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

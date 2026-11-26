@@ -8,7 +8,10 @@ use crate::{
     lcu::GameflowSession,
 };
 use serde_json::{json, Value};
-use std::sync::Mutex;
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -96,9 +99,12 @@ enum OpggDecision {
     Ignore,
 }
 
+const OPEN_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 struct OpggState {
     preferences: OpggPreferences,
     announced: Option<SelectionScope>,
+    retry_after: Option<(SelectionScope, Instant)>,
 }
 
 impl OpggState {
@@ -106,6 +112,7 @@ impl OpggState {
         Self {
             preferences,
             announced: None,
+            retry_after: None,
         }
     }
 
@@ -113,19 +120,45 @@ impl OpggState {
         self.preferences.enabled = enabled;
         if !enabled {
             self.announced = None;
+            self.retry_after = None;
         }
     }
 
     fn decision(&mut self, target: Option<OpggTarget>) -> OpggDecision {
+        self.decision_at(target, Instant::now())
+    }
+
+    fn decision_at(&mut self, target: Option<OpggTarget>, now: Instant) -> OpggDecision {
         let Some(target) = target.filter(|_| self.preferences.enabled) else {
             return OpggDecision::Close;
         };
         if self.preferences.auto_show && self.announced != Some(target.scope) {
-            // Closing or minimizing a window does not re-open it on the next poll.
-            self.announced = Some(target.scope);
+            if self
+                .retry_after
+                .is_some_and(|(scope, retry_at)| scope == target.scope && now < retry_at)
+            {
+                return OpggDecision::Ignore;
+            }
+            self.retry_after = Some((target.scope, now + OPEN_RETRY_DELAY));
             OpggDecision::Show
         } else {
             OpggDecision::Ignore
+        }
+    }
+
+    fn mark_shown(&mut self, scope: SelectionScope) {
+        self.announced = Some(scope);
+        self.retry_after = None;
+    }
+
+    fn record_open_error(&mut self, scope: SelectionScope, visible: bool, now: Instant) {
+        if visible {
+            self.mark_shown(scope);
+        } else {
+            if self.announced == Some(scope) {
+                self.announced = None;
+            }
+            self.retry_after = Some((scope, now + OPEN_RETRY_DELAY));
         }
     }
 }
@@ -161,7 +194,7 @@ impl OpggWindow {
 
     pub(crate) fn mark_shown(&self, scope: SelectionScope) {
         if let Ok(mut state) = self.0.lock() {
-            state.announced = Some(scope);
+            state.mark_shown(scope);
         }
     }
 
@@ -175,12 +208,24 @@ impl OpggWindow {
         match decision {
             OpggDecision::Close => close_opgg_companion(app)?,
             OpggDecision::Show => {
+                let scope = target
+                    .expect("Show decision requires an eligible target")
+                    .scope;
                 if app
                     .get_webview_window(LABEL)
                     .is_none_or(|window| !window.is_visible().unwrap_or(false))
                 {
-                    show_opgg_companion(app)?;
+                    if let Err(error) = show_opgg_companion(app) {
+                        let visible = app
+                            .get_webview_window(LABEL)
+                            .is_some_and(|window| window.is_visible().unwrap_or(false));
+                        if let Ok(mut state) = self.0.lock() {
+                            state.record_open_error(scope, visible, Instant::now());
+                        }
+                        return Err(error);
+                    }
                 }
+                self.mark_shown(scope);
             }
             OpggDecision::Ignore => {}
         }
@@ -203,3 +248,60 @@ impl OpggWindow {
 #[cfg(test)]
 #[path = "opgg_window_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Instant;
+
+    #[test]
+    fn automatic_decision_does_not_consume_scope_before_window_shows() {
+        let instance = ClientInstance {
+            pid: 14,
+            created_at: 1000,
+        };
+        let flow: GameflowSession = serde_json::from_value(json!({
+            "phase": "ChampSelect",
+            "gameData": {
+                "gameId": 45,
+                "isCustomGame": false,
+                "queue": {"gameMode": "ARAM", "type": "ARAM"}
+            }
+        }))
+        .unwrap();
+        let select = json!({
+            "gameId": 45,
+            "isCustomGame": false,
+            "isSpectating": false,
+            "localPlayerCellId": 1,
+            "myTeam": [{"cellId": 1, "championId": 22}]
+        });
+        let target = OpggTarget::from_sample(instance, &flow, &select).unwrap();
+        let mut state = OpggState::new(OpggPreferences {
+            enabled: true,
+            auto_show: true,
+        });
+
+        assert_eq!(state.decision(Some(target)), OpggDecision::Show);
+        assert!(
+            state.announced.is_none(),
+            "the native window has not shown yet"
+        );
+        let scope = target.scope;
+        let now = Instant::now();
+        state.record_open_error(scope, false, now);
+        assert_eq!(state.decision_at(Some(target), now), OpggDecision::Ignore);
+        assert_eq!(
+            state.decision_at(Some(target), now + OPEN_RETRY_DELAY),
+            OpggDecision::Show
+        );
+        state.mark_shown(scope);
+        state.record_open_error(scope, true, now + OPEN_RETRY_DELAY);
+        assert!(state.announced.is_some(), "a visible window remains shown");
+        assert_eq!(
+            state.decision_at(Some(target), now + OPEN_RETRY_DELAY + OPEN_RETRY_DELAY),
+            OpggDecision::Ignore
+        );
+    }
+}

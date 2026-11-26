@@ -3,7 +3,7 @@
 use crate::{
     aram_automation::{AramOptions, AramSchedule, ScheduledStep, SelectionScope},
     client_discovery::{discover_clients, ClientInstance, LocalClient},
-    desktop::emit,
+    desktop::{aux_window::AuxWindow, emit},
     lcu::{
         game_art::{GameArt, GameArtPath},
         player_search::PlayerSearchShard,
@@ -37,9 +37,86 @@ struct ActiveClient {
     phase: String,
     session: Value,
     summoner: Value,
-    resg: Option<ResgTarget>,
-    opgg: Option<OpggTarget>,
+    companions: CompanionTargets,
     shard: Option<PlayerSearchShard>,
+}
+
+#[derive(Default, PartialEq)]
+struct CompanionTargets {
+    aux: Option<SelectionScope>,
+    opgg: Option<OpggTarget>,
+    resg: Option<ResgTarget>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CompanionDemand {
+    aux: bool,
+    opgg: bool,
+    resg: bool,
+}
+
+impl CompanionDemand {
+    fn from_app(app: &AppHandle) -> Self {
+        Self {
+            aux: app.state::<AuxWindow>().auto_enabled(),
+            opgg: app.state::<OpggWindow>().enabled(),
+            resg: app.state::<ResgWindow>().enabled(),
+        }
+    }
+
+    fn reads_selection(self, game: &GameflowSession, automate: bool) -> bool {
+        game.phase == "ChampSelect"
+            && (((automate || self.aux || self.opgg) && game.is_aram())
+                || (self.resg && game.is_hextech_aram()))
+    }
+
+    fn targets(
+        self,
+        instance: ClientInstance,
+        game: Option<&GameflowSession>,
+        selection: Option<&Value>,
+        puuid: Option<&str>,
+        previous_chart: Option<ResgTarget>,
+    ) -> CompanionTargets {
+        let Some(game) = game else {
+            return CompanionTargets::default();
+        };
+        let aux = selection
+            .filter(|_| self.aux)
+            .and_then(|select| SelectionScope::from_sample(instance, game, select));
+        let opgg = selection
+            .filter(|_| self.opgg && puuid.is_some())
+            .and_then(|select| OpggTarget::from_sample(instance, game, select));
+        let mut resg = None;
+        if self.resg && game.is_hextech_aram() {
+            let game_id = game
+                .game_data
+                .as_ref()
+                .and_then(|data| data.game_id)
+                .filter(|&id| id != 0);
+            let chart_selection = if game.phase == "ChampSelect" {
+                selection
+            } else {
+                Some(&Value::Null)
+            };
+            resg = if let Some(selection) = chart_selection {
+                game.resg_champion(selection, puuid)
+                    .map(|champion_id| ResgTarget {
+                        instance,
+                        game_id,
+                        champion_id,
+                    })
+            } else {
+                // Keep the current chart during an optional read timeout for the same verified game.
+                previous_chart.filter(|previous| {
+                    game_id.is_some()
+                        && previous.game_id == game_id
+                        && previous.instance == instance
+                })
+            };
+        }
+        CompanionTargets { aux, opgg, resg }
+    }
 }
 
 struct Sample {
@@ -92,7 +169,7 @@ impl Snapshot {
             })),
             (CLIENT, "summoner") => Some(json!({"me": active.map(|client| &client.summoner)})),
             (opgg_window::NAMESPACE, "state") => Some(json!({
-                "draft": active.and_then(|client| client.opgg).map(OpggTarget::view),
+                "draft": active.and_then(|client| client.companions.opgg).map(OpggTarget::view),
             })),
             (SGP, "state") => Some(json!({
                 "availability": {
@@ -171,12 +248,30 @@ impl RuntimeState {
 
     fn verified_opgg_target(&self) -> Option<OpggTarget> {
         let active = self.snapshot.active.as_ref()?;
-        let target = active.opgg?;
+        let target = active.companions.opgg?;
         let client = self.art_client.as_ref()?;
         (self.opgg_checked_at?.elapsed() <= Duration::from_secs(5)
             && client.instance == active.instance
             && client.alive())
         .then_some(target)
+    }
+
+    fn apply_snapshot(
+        &mut self,
+        app: &AppHandle,
+        snapshot: Snapshot,
+        client: Option<Arc<LocalClient>>,
+    ) {
+        if self.snapshot != snapshot {
+            self.revision += 1;
+            publish_changes(app, &self.snapshot, &snapshot, self.revision);
+            self.snapshot = snapshot;
+        }
+        let active = self.snapshot.active.as_ref();
+        self.art_client =
+            client.filter(|client| active.is_some_and(|active| active.instance == client.instance));
+        self.opgg_checked_at =
+            active.and_then(|active| active.companions.opgg.map(|_| Instant::now()));
     }
 
     fn refresh_game_data(&mut self, app: &AppHandle) {
@@ -252,7 +347,68 @@ impl ClientRuntime {
     }
 
     pub(crate) fn resg_target(&self) -> Option<ResgTarget> {
-        self.state.lock().ok()?.snapshot.active.as_ref()?.resg
+        self.state
+            .lock()
+            .ok()?
+            .snapshot
+            .active
+            .as_ref()?
+            .companions
+            .resg
+    }
+
+    pub(crate) fn aux_draft(&self) -> Option<(SelectionScope, Arc<LocalClient>)> {
+        let state = self.state.lock().ok()?;
+        let active = state.snapshot.active.as_ref()?;
+        let client = state.art_client.as_ref()?;
+        if client.instance != active.instance || !client.alive() {
+            return None;
+        }
+        Some((active.companions.aux?, Arc::clone(client)))
+    }
+
+    pub(crate) fn selection_ended(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.manually_disconnected
+                || state.snapshot.active.as_ref().is_some_and(|active| {
+                    active.phase != "ChampSelect"
+                        || active.session["gameData"]["queue"]["gameMode"]
+                            .as_str()
+                            .is_some_and(|mode| !matches!(mode, "ARAM" | "KIWI"))
+                })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_companion_fixture(
+        &self,
+        app: &AppHandle,
+        session: GameflowSession,
+        selection: Value,
+    ) {
+        const PLAYER: &str = "fixture-player";
+        let client = Arc::new(LocalClient::fixture().expect("retain current fixture process"));
+        let instance = client.instance;
+        let demand = CompanionDemand::from_app(app);
+        let selection = demand
+            .reads_selection(&session, false)
+            .then_some(&selection);
+        let companions = demand.targets(instance, Some(&session), selection, Some(PLAYER), None);
+        self.state.lock().unwrap().apply_snapshot(
+            app,
+            Snapshot {
+                known_clients: vec![instance],
+                active: Some(ActiveClient {
+                    instance,
+                    phase: session.phase.clone(),
+                    session: json!(session),
+                    summoner: json!({"puuid": PLAYER}),
+                    companions,
+                    shard: None,
+                }),
+            },
+            Some(client),
+        );
     }
 
     pub(crate) fn opgg_target(&self) -> Option<OpggTarget> {
@@ -522,8 +678,7 @@ impl ClientRuntime {
     async fn sample(
         &self,
         client: &LocalClient,
-        resg_enabled: bool,
-        opgg_enabled: bool,
+        demand: CompanionDemand,
         previous_chart: Option<ResgTarget>,
         previous_shard: Option<(String, PlayerSearchShard)>,
         automate: bool,
@@ -558,11 +713,9 @@ impl ClientRuntime {
                 .and_then(Result::ok)
             };
         }
-        let should_read = phase == "ChampSelect"
-            && session.as_ref().is_some_and(|game| {
-                ((automate || opgg_enabled) && game.is_aram())
-                    || (resg_enabled && game.is_hextech_aram())
-            });
+        let should_read = session
+            .as_ref()
+            .is_some_and(|game| demand.reads_selection(game, automate));
         let selection = if should_read {
             // The optional reads should leave time to publish connected state.
             tokio::time::timeout(
@@ -575,54 +728,20 @@ impl ClientRuntime {
         } else {
             None
         };
-        let mut resg = None;
-        if let Some(game) = session
-            .as_ref()
-            .filter(|game| resg_enabled && game.is_hextech_aram())
-        {
-            let game_id = game
-                .game_data
-                .as_ref()
-                .and_then(|data| data.game_id)
-                .filter(|&id| id != 0);
-            let chart_selection = if phase == "ChampSelect" {
-                selection.as_ref()
-            } else {
-                Some(&Value::Null)
-            };
-            resg = if let Some(selection) = chart_selection {
-                let puuid = summoner.as_ref().map(|player| player.puuid.as_str());
-                game.resg_champion(selection, puuid)
-                    .map(|champion_id| ResgTarget {
-                        instance: client.instance,
-                        game_id,
-                        champion_id,
-                    })
-            } else {
-                // Keep the current chart during an optional read timeout for the same verified game.
-                previous_chart.filter(|previous| {
-                    game_id.is_some()
-                        && previous.game_id == game_id
-                        && previous.instance == client.instance
-                })
-            };
-        }
-        let opgg = if opgg_enabled && summoner.is_some() {
-            session
-                .as_ref()
-                .zip(selection.as_ref())
-                .and_then(|(flow, select)| OpggTarget::from_sample(client.instance, flow, select))
-        } else {
-            None
-        };
+        let companions = demand.targets(
+            client.instance,
+            session.as_ref(),
+            selection.as_ref(),
+            summoner.as_ref().map(|player| player.puuid.as_str()),
+            previous_chart,
+        );
         Ok(client.alive().then(|| {
             let client = ActiveClient {
                 instance: client.instance,
                 phase,
                 session: json!(session),
                 summoner: json!(summoner),
-                resg,
-                opgg,
+                companions,
                 shard,
             };
             let selection = if automate {
@@ -634,7 +753,7 @@ impl ClientRuntime {
         }))
     }
 
-    async fn refresh(&self, app: &AppHandle, resg_enabled: bool, opgg_enabled: bool) {
+    async fn refresh(&self, app: &AppHandle, demand: CompanionDemand) {
         let (generation, manual, connected, auto_connect, previous_chart, previous_shard, options) = {
             let Ok(state) = self.state.lock() else {
                 return;
@@ -648,7 +767,7 @@ impl ClientRuntime {
                     .snapshot
                     .active
                     .as_ref()
-                    .and_then(|client| client.resg),
+                    .and_then(|client| client.companions.resg),
                 state.snapshot.active.as_ref().and_then(|client| {
                     Some((
                         client.summoner["puuid"].as_str()?.to_owned(),
@@ -680,8 +799,7 @@ impl ClientRuntime {
                 Duration::from_secs(4),
                 self.sample(
                     client,
-                    resg_enabled,
-                    opgg_enabled,
+                    demand,
                     previous_chart,
                     previous_shard.filter(|_| Some(client.instance) == connected),
                     options.is_some(),
@@ -717,26 +835,8 @@ impl ClientRuntime {
             {
                 state.manual_client = None;
             }
-            if state.snapshot != snapshot {
-                state.revision += 1;
-                publish_changes(app, &state.snapshot, &snapshot, state.revision);
-                state.snapshot = snapshot;
-            }
+            state.apply_snapshot(app, snapshot, candidate.cloned());
             state.refresh_game_data(app);
-            state.art_client = candidate
-                .filter(|candidate| {
-                    state
-                        .snapshot
-                        .active
-                        .as_ref()
-                        .is_some_and(|active| active.instance == candidate.instance)
-                })
-                .cloned();
-            state.opgg_checked_at = state
-                .snapshot
-                .active
-                .as_ref()
-                .and_then(|active| active.opgg.map(|_| Instant::now()));
             if state
                 .snapshot
                 .active
@@ -892,14 +992,19 @@ async fn load_game_data(app: AppHandle, instance: ClientInstance, ticket: u64) {
     }
 }
 
+pub(crate) fn reconcile_companions(app: &AppHandle) {
+    let _ = app.state::<AuxWindow>().reconcile(app);
+    let _ = app
+        .state::<ResgWindow>()
+        .reconcile(app, ResgAction::Synchronize);
+    let _ = app.state::<OpggWindow>().reconcile(app);
+}
+
 pub(crate) async fn monitor(app: AppHandle) {
     let runtime = app.state::<ClientRuntime>();
-    let resg = app.state::<ResgWindow>();
-    let opgg = app.state::<OpggWindow>();
     loop {
-        runtime.refresh(&app, resg.enabled(), opgg.enabled()).await;
-        let _ = resg.reconcile(&app, ResgAction::Synchronize);
-        let _ = opgg.reconcile(&app);
+        runtime.refresh(&app, CompanionDemand::from_app(&app)).await;
+        reconcile_companions(&app);
         let interval = runtime
             .state
             .lock()
@@ -938,6 +1043,37 @@ fn publish_property(
     for label in ["main", "aux", "opgg"] {
         if let Some(window) = app.get_webview_window(label) {
             let _ = emit(&window, "mobx-utils-main", &event, args.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod companion_tests {
+    use super::*;
+
+    #[test]
+    fn aux_alone_reads_selection_only_for_aram_drafts() {
+        let demand = CompanionDemand {
+            aux: true,
+            ..CompanionDemand::default()
+        };
+        for (phase, mode, expected) in [
+            ("ChampSelect", "ARAM", true),
+            ("ChampSelect", "KIWI", true),
+            ("ChampSelect", "CLASSIC", false),
+            ("Lobby", "ARAM", false),
+            ("InProgress", "KIWI", false),
+        ] {
+            let game: GameflowSession = serde_json::from_value(json!({
+                "phase": phase,
+                "gameData": {"queue": {"gameMode": mode}}
+            }))
+            .unwrap();
+            assert_eq!(
+                demand.reads_selection(&game, false),
+                expected,
+                "{phase} / {mode}"
+            );
         }
     }
 }

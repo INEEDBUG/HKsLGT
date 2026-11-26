@@ -92,6 +92,8 @@ fn serve_fixture<T>(response: Vec<u8>, receive: impl FnOnce(&str) -> T) -> T {
                 Err(error) => panic!("fixture did not receive a connection: {error}"),
             }
         };
+        // Winsock's accepted stream inherits the listener's nonblocking mode.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(CONNECT_TIMEOUT)).unwrap();
         stream.set_write_timeout(Some(CONNECT_TIMEOUT)).unwrap();
         let mut request = [0; 4096];

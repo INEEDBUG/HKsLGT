@@ -4,7 +4,8 @@ param(
   [Parameter(Mandatory)][string]$SourceDir,
   [Parameter(Mandatory)][string]$OutputDir,
   [string]$PredecessorCatalog,
-  [string]$WebView2Bootstrapper
+  [string]$WebView2Bootstrapper,
+  [switch]$VerifyCompanionWindows
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,6 +68,10 @@ try {
   $desktopManifest = Join-Path $desktop 'Cargo.toml'
   cargo test @cargoArgs --manifest-path (Join-Path $root 'rust/Cargo.toml') -p maxgamestudio-league-core
   cargo test @cargoArgs --manifest-path $desktopManifest -- --test-threads=1
+  if ($VerifyCompanionWindows) {
+    $companionTest = 'desktop::companion_window_smoke::champ_select_opens_real_windows'
+    cargo test @cargoArgs --manifest-path $desktopManifest $companionTest -- --ignored --exact --nocapture
+  }
   cargo build @cargoArgs --manifest-path $desktopManifest
 
   $release = Join-Path $cargoTarget "$target/release"

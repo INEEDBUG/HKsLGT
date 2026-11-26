@@ -9,7 +9,10 @@ use maxgamestudio_league_core::resg::{
     is_resg_content, is_resg_page, resg_champion_url, RESG_NAMESPACE,
 };
 use serde_json::{json, Value};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tauri::{
     webview::{NewWindowResponse, PageLoadEvent},
     AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -18,6 +21,7 @@ use tauri::{
 pub(crate) const LABEL: &str = "resg";
 const TITLE: &str = "RESG · 海克斯大乱斗";
 const CHART_WAIT: Duration = Duration::from_secs(15);
+const OPEN_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResgAction {
@@ -39,6 +43,7 @@ struct ViewState {
     preferences: Value,
     target: Option<ResgTarget>,
     auto_shown: bool,
+    retry_after: Option<Instant>,
     loaded: bool,
     display: Option<bool>,
     display_fallback: bool,
@@ -91,6 +96,35 @@ impl ViewState {
         self.display_fallback = false;
         self.status = Status::Waiting;
     }
+
+    fn automatic_open_due(&mut self, now: Instant) -> bool {
+        if self.auto_shown || self.preferences["autoShow"] != true {
+            return false;
+        }
+        if self.retry_after.is_some_and(|retry_at| now < retry_at) {
+            return false;
+        }
+        self.retry_after = None;
+        true
+    }
+
+    fn record_open_failure(&mut self, now: Instant) {
+        if self.preferences["autoShow"] == true {
+            self.auto_shown = false;
+            self.retry_after = Some(now + OPEN_RETRY_DELAY);
+        } else {
+            self.retry_after = None;
+        }
+    }
+
+    fn record_open_success(&mut self) {
+        self.auto_shown = true;
+        self.retry_after = None;
+    }
+
+    fn should_open(&self, window_exists: bool, manual: bool, automatic: bool) -> bool {
+        (!window_exists && manual) || (!self.auto_shown && automatic)
+    }
 }
 
 pub(crate) struct ResgWindow(Mutex<ViewState>);
@@ -101,6 +135,7 @@ impl ResgWindow {
             preferences,
             target: None,
             auto_shown: false,
+            retry_after: None,
             loaded: false,
             display: None,
             display_fallback: false,
@@ -129,6 +164,7 @@ impl ResgWindow {
         let mut window = app.get_webview_window(LABEL);
         let Some(target) = state.target else {
             state.auto_shown = false;
+            state.retry_after = None;
             if window.is_some() || previous.is_some() {
                 state.invalidate_navigation();
             }
@@ -144,9 +180,10 @@ impl ResgWindow {
         });
         if new_match {
             state.auto_shown = false;
+            state.retry_after = None;
         }
         if action == ResgAction::Close {
-            state.auto_shown = true;
+            state.record_open_success();
             state.invalidate_navigation();
             if let Some(window) = window {
                 window.destroy().map_err(|error| error.to_string())?;
@@ -155,9 +192,10 @@ impl ResgWindow {
         }
 
         let manual = matches!(action, ResgAction::Show | ResgAction::Retry);
-        let automatic = !state.auto_shown && state.preferences["autoShow"] == true;
+        let automatic = state.automatic_open_due(Instant::now());
         let pinned = state.preferences["alwaysOnTop"] == true;
-        let opening = window.is_none() && (manual || automatic);
+        // Keep a failed first creation eligible even if Tauri left a partial window registered.
+        let opening = state.should_open(window.is_some(), manual, automatic);
         let navigate = opening
             || (window.is_some()
                 && (new_match
@@ -169,7 +207,9 @@ impl ResgWindow {
                 resg_champion_url(target.champion_id).ok_or("无效的 RESG 英雄编号。")?;
             state.invalidate_navigation();
             state.status = Status::Loading;
-            state.auto_shown = true;
+            if !opening {
+                state.auto_shown = true;
+            }
             let started = if let Some(active) = window.as_ref() {
                 let _ = active.set_title(TITLE);
                 active.navigate(destination).map(|_| active.clone())
@@ -178,6 +218,9 @@ impl ResgWindow {
             };
             match started {
                 Ok(active) => {
+                    if opening {
+                        state.record_open_success();
+                    }
                     tauri::async_runtime::spawn(watch_chart(
                         active.clone(),
                         target.champion_id,
@@ -185,7 +228,12 @@ impl ResgWindow {
                     ));
                     window = Some(active);
                 }
-                Err(_) => state.status = Status::Error("page-unavailable"),
+                Err(_) => {
+                    state.status = Status::Error("page-unavailable");
+                    if opening {
+                        state.record_open_failure(Instant::now());
+                    }
+                }
             }
         } else if window.is_none() && state.status != Status::Error("page-unavailable") {
             state.invalidate_navigation();
@@ -411,4 +459,49 @@ fn finish(
     }
     apply_display(window, &mut state);
     state.publish(window.app_handle());
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn state() -> ViewState {
+        ViewState {
+            preferences: json!({"enabled": true, "autoShow": true}),
+            target: None,
+            auto_shown: false,
+            retry_after: None,
+            loaded: false,
+            display: None,
+            display_fallback: false,
+            status: Status::Waiting,
+            navigation: 0,
+            published: Value::Null,
+        }
+    }
+
+    #[test]
+    fn failed_automatic_creation_retries_after_cooldown_and_success_stops_retrying() {
+        let now = Instant::now();
+        let mut state = state();
+        assert!(state.automatic_open_due(now));
+        state.record_open_failure(now);
+        assert!(!state.auto_shown);
+        assert!(!state.automatic_open_due(now + Duration::from_secs(1)));
+        assert!(state.automatic_open_due(now + Duration::from_secs(2)));
+        state.record_open_success();
+        assert!(state.auto_shown);
+        assert!(!state.automatic_open_due(now + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn explicit_close_suppresses_pending_automatic_retry() {
+        let now = Instant::now();
+        let mut state = state();
+        state.record_open_failure(now);
+        state.record_open_success();
+        assert!(!state.automatic_open_due(now + Duration::from_secs(3)));
+        assert!(state.should_open(false, true, false));
+    }
 }
