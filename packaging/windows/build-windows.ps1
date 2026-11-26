@@ -23,6 +23,7 @@ $revision = (git -C $root rev-parse HEAD).Trim()
 if ($env:GITHUB_SHA -and $revision -cne $env:GITHUB_SHA) { throw 'Unexpected workflow checkout.' }
 
 $known = [ordered]@{
+  'trusted-1.0.0-beta.16-preview.json' = 'dc5d1b5b204c7115d21fda8d6b9203f95d2cc4ac04f1bf6f080b8536876bc08c'
   'trusted-1.0.0-beta.5.json' = '85c33b257b4bcb4faa77ea8bbe947cd69deadbffdda0618711e0cc5177d50bc9'
   'trusted-1.0.0-beta.8.json' = '358d78e5417cadeff0153539e2f99cbe8b0be5a6123c0b58e1182005334aac7b'
 }

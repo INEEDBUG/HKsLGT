@@ -5,13 +5,14 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { resgDisplayProgram } from '../../league-resg/resg-display.ts'
 import { artworkModule, logoComponents, useMitIconImports } from './artwork.mjs'
+import { MINI_ACTIVITY_MODULE, patchNativeMini } from './mini-renderer.mjs'
 
 const IPC_MODULE = 'virtual:mgs-league-native-ipc'
 const IPC_SOURCE = fileURLToPath(new URL('./tauri-ipc.ts', import.meta.url))
 const GAME_SHORTCUT_MODULE = 'virtual:mgs-league-game-shortcut'
 const GAME_SHORTCUT_COMPONENT = new URL('./NativeGameShortcut.vue', import.meta.url)
 const OPGG_COMPANION = new URL('./NativeOpggCompanion.vue', import.meta.url)
-const AUX_ACTIVITY = new URL('./NativeAuxActivity.vue', import.meta.url)
+const MINI_ACTIVITY = new URL('./native-aux-activity.ts', import.meta.url)
 const TOOLBOX_ICON = new URL('./artwork/toolbox.ico', import.meta.url)
 const GAME_ART_ORIGIN = 'http://league-art.localhost'
 const WINDOW_ENTRIES = {
@@ -265,6 +266,44 @@ function nativeRendererPlugin(sourceRoot) {
   const updateButton = join(sourceRoot, 'src/renderer/src-main-window/views/league-overview/LeagueUpdateButton.vue')
   transforms.set(updateButton.replaceAll('\\', '/'), UPDATE_BUTTON_TRANSFORMS)
   const resources = join(sourceRoot, 'src/renderer-shared/providers/game-resource/akari.ts')
+  const imageComponent = join(sourceRoot, 'src/renderer-shared/components/LcuImage.vue')
+  transforms.set(imageComponent.replaceAll('\\', '/'), [
+    ['class="lcu-image" @error="handleError"', 'class="lcu-image" referrerpolicy="no-referrer" @error="handleError"'],
+    ["import { ref, watchEffect } from 'vue'", `import { computed, ref, watch } from 'vue'
+import { useLeagueClientStore } from '@renderer-shared/shards/league-client/store'
+import { championPortraitFallback } from 'virtual:hkslgt-champion-portrait'`],
+    [`const url = ref<string | null>(null)
+const resources = useGameResourceProvider()
+
+watchEffect(() => {
+  if (!props.src) {
+    url.value = null
+    return
+  }
+
+  url.value = resources.assets.resolve(props.src)
+})
+
+const handleError = () => {
+  url.value = null
+}`, `const resources = useGameResourceProvider()
+const client = useLeagueClientStore()
+const local = computed(() => props.src ? resources.assets.resolve(props.src) : null)
+const failedLocal = ref(false)
+const failedRemote = ref<string | null>(null)
+watch(local, () => { failedLocal.value = false; failedRemote.value = null }, { flush: 'sync' })
+const url = computed(() => {
+  if (!failedLocal.value) return local.value
+  const remote = championPortraitFallback(local.value, client.gameData.champions)
+  return remote !== failedRemote.value ? remote : null
+})
+const handleError = (event: Event) => {
+  const failed = (event.currentTarget as HTMLImageElement).currentSrc
+  if (failed !== new URL(url.value || '', document.baseURI).href) return
+  if (!failedLocal.value) failedLocal.value = true
+  else failedRemote.value = failed
+}`]
+  ])
   const resolveFromPath = 'akari://league-client${normalizeLcuPath(normalizedSource)}'
   const resolveFromUrl = 'akari://league-client${normalizeLcuPath(`${url.pathname}${url.search}${url.hash}`)}'
   transforms.set(resources.replaceAll('\\', '/'), [
@@ -419,7 +458,8 @@ async function saveGameHotkey(shortcut: string | null) {
   ])
   const opggRoot = join(sourceRoot, 'src/renderer/src-opgg-window').replaceAll('\\', '/')
   const opggView = `${opggRoot}/opgg/OpggView.vue`
-  const auxView = join(sourceRoot, 'src/renderer/src-aux-window/views/Indicator.vue').replaceAll('\\', '/')
+  const rendererRoot = join(sourceRoot, 'src/renderer')
+  const miniActivity = join(rendererRoot, 'src-aux-window/native-aux-activity.ts').replaceAll('\\', '/')
   const opggHtml = join(sourceRoot, 'src/renderer', WINDOW_ENTRIES.opgg).replaceAll('\\', '/')
   transforms.set(`${opggRoot}/App.vue`, [
     ["import { provideOpgg } from './opgg/context'\n", ''],
@@ -449,11 +489,14 @@ const startNativeDrag = () => nativeWindowIpc.call('window-manager-main/${label}
     name: 'mgs-league-native-renderer',
     enforce: 'pre',
     resolveId(id) {
+      if (id === 'virtual:hkslgt-champion-portrait') return fileURLToPath(new URL('./champion-portrait.mjs', import.meta.url))
       if (id === IPC_MODULE) return IPC_SOURCE
       if (id === GAME_SHORTCUT_MODULE) return gameShortcut
+      if (id === MINI_ACTIVITY_MODULE) return miniActivity
     },
     load(id) {
       if (id === gameShortcut) return readFileSync(GAME_SHORTCUT_COMPONENT, 'utf8')
+      if (id === miniActivity) return readFileSync(MINI_ACTIVITY, 'utf8')
       const file = id.split('?', 1)[0].replaceAll('\\', '/')
       if (file.startsWith(stagedSourcePrefix)) return artworkModule(file.slice(stagedSourcePrefix.length))
     },
@@ -463,12 +506,6 @@ const startNativeDrag = () => nativeWindowIpc.call('window-manager-main/${label}
         const logo = logoComponents.get(normalized.slice(stagedSourcePrefix.length))
         if (logo) return { code: `<template>${logo}</template>`, map: null }
       }
-      if (normalized === auxView) {
-        if (!source.includes("currentPage === 'lounge'") || !source.includes("currentPage === 'champ-select'")) {
-          throw new Error(`Unexpected auxiliary view in ${id}`)
-        }
-        return { code: readFileSync(AUX_ACTIVITY, 'utf8'), map: null }
-      }
       if (normalized === opggView) {
         if (!source.includes('const { currentTab } = useOpgg()')) {
           throw new Error(`Unexpected OP.GG view in ${id}`)
@@ -477,6 +514,7 @@ const startNativeDrag = () => nativeWindowIpc.call('window-manager-main/${label}
       }
       const patches = transforms.get(normalized)
       let code = normalized.startsWith(`${stagedSourcePrefix}src/`) ? useMitIconImports(source) : source
+      code = patchNativeMini(code, normalized, rendererRoot, replaceOnce)
       if (patches) {
         code = code.replaceAll('\r\n', '\n')
         for (const [anchor, replacement] of patches) {

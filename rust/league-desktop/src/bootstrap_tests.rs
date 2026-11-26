@@ -134,6 +134,51 @@ fn restores_renderer_and_companion_preferences_from_existing_keys() {
 }
 
 #[test]
+fn room_controls_reopen_legacy_sqlite_settings_and_reject_invalid_numbers() {
+    use std::time::Duration;
+    let profile = ProfileFixture::new();
+    {
+        let db = profile.open();
+        let defaults = room_options(&db).unwrap();
+        assert!(!defaults.accept && !defaults.search);
+        assert_eq!(defaults.search_delay, Duration::from_secs(5));
+        for (name, value) in [
+            ("autoAcceptEnabled", json!(true)),
+            ("autoMatchmakingEnabled", json!(true)),
+            ("autoAcceptDelaySeconds", json!(1.5)),
+            ("autoMatchmakingMinimumMembers", json!(99)),
+            ("autoMatchmakingWaitForInvitees", json!(false)),
+        ] {
+            backend_pref(crate::room_flow::NAMESPACE, name)
+                .unwrap()
+                .write(&db, &value)
+                .unwrap();
+        }
+        assert!(
+            backend_pref(crate::room_flow::NAMESPACE, "autoMatchmakingDelaySeconds")
+                .unwrap()
+                .write(&db, &json!(-0.1))
+                .is_err()
+        );
+        assert!(
+            backend_pref(crate::room_flow::NAMESPACE, "autoMatchmakingMinimumMembers")
+                .unwrap()
+                .write(&db, &json!(100))
+                .is_err()
+        );
+    }
+    let db = profile.open();
+    let restored = room_options(&db).unwrap();
+    assert!(restored.accept && restored.search && !restored.wait_for_invitees);
+    assert_eq!(restored.accept_delay, Duration::from_millis(1500));
+    assert_eq!(restored.minimum_members, 99);
+    assert_eq!(
+        db.setting("auto-gameflow-main/autoAcceptEnabled").unwrap(),
+        Some(json!(true))
+    );
+}
+
+#[test]
 fn aram_partial_updates_replace_champion_order_and_keep_other_groups() {
     let profile = ProfileFixture::new();
     let db = profile.open();

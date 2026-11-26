@@ -67,6 +67,11 @@ pub(crate) struct LocalClient {
 impl LocalClient {
     #[cfg(test)]
     pub(crate) fn fixture() -> Option<Self> {
+        Self::fixture_at(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_at(port: u16) -> Option<Self> {
         let executable = std::env::current_exe().ok()?;
         let pid = std::process::id();
         let (process, image, created_at) =
@@ -75,8 +80,8 @@ impl LocalClient {
             process,
             instance: ClientInstance { pid, created_at },
             install_directory: image.parent()?.to_owned(),
-            port: 0,
-            token: String::new(),
+            port,
+            token: "fixture-only".into(),
         })
     }
 

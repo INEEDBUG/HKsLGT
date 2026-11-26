@@ -12,11 +12,17 @@ use crate::{
     resg_window::{ResgAction, ResgWindow},
 };
 use maxgamestudio_league_core::profile_database::LeagueProfileDatabase;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{fs, panic::AssertUnwindSafe, sync::Mutex, time::Duration};
 use tauri::{AppHandle, Manager, RunEvent, WebviewWindow};
 use tokio::time::Instant;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindowVisible};
+
+#[path = "mini_client_fixture.rs"]
+mod mini_client_fixture;
+use mini_client_fixture::MiniClient;
+#[path = "mini_optional_actions_smoke.rs"]
+mod mini_optional_actions_smoke;
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(200);
@@ -31,6 +37,10 @@ fn champ_select_opens_real_windows() {
     let directory = temp.path().join("profile");
     fs::create_dir(&directory).expect("create fixture profile directory");
     let db = LeagueProfileDatabase::open(&directory).expect("open fixture database");
+    bootstrap::backend_pref(AUX_WINDOW, "showSkinSelector")
+        .unwrap()
+        .write(&db, &json!(true))
+        .unwrap();
     for namespace in [AUX_WINDOW, OPGG_WINDOW, RESG_NAMESPACE] {
         bootstrap::backend_pref(namespace, "enabled")
             .unwrap()
@@ -47,12 +57,15 @@ fn champ_select_opens_real_windows() {
         database: Mutex::new(db),
         system_locale: "en",
     };
-    let runtime =
+    let mut runtime =
         ClientRuntime::new(false, Default::default()).expect("disconnected fixture runtime");
+    let mini_client = MiniClient::start();
+    runtime.use_fixture_transport(mini_client.root.clone());
     let app = tauri::Builder::default()
         .any_thread()
         .manage(profile)
         .manage(runtime)
+        .manage(mini_client)
         .manage(AuxWindow::new(false, true))
         .manage(OpggWindow::new(OpggPreferences {
             enabled: false,
@@ -250,122 +263,215 @@ async fn exercise(app: &AppHandle) {
 }
 
 async fn check_aux_room_and_selection(app: &AppHandle) {
-    let runtime = app.state::<ClientRuntime>();
-    let lobby = json!({
-        "gameConfig": { "queueId": 450, "gameMode": "ARAM", "isCustom": false },
-        "members": [{"puuid": "fixture-player"}, {"puuid": "fixture-teammate"}],
+    let server = app.state::<MiniClient>();
+    let client = std::sync::Arc::new(
+        crate::client_discovery::LocalClient::fixture_at(server.port)
+            .expect("own the live test listener"),
+    );
+    // Use the production reader against a real TLS socket. Only discovery and the CA are test inputs.
+    let monitor = tauri::async_runtime::spawn({
+        let app = app.clone();
+        let client = std::sync::Arc::clone(&client);
+        async move {
+            loop {
+                app.state::<ClientRuntime>()
+                    .sample_fixture(&app, &client)
+                    .await;
+                reconcile_companions(&app);
+                tokio::time::sleep(POLL).await;
+            }
+        }
     });
-    let search = json!({
-        "queueId": 450,
-        "timeInQueue": 27.9,
-        "estimatedQueueTime": 54.25,
-        "readyCheck": { "playerResponse": "Accepted" },
-    });
-    let room_phase = |phase, search| {
-        runtime.apply_companion_fixture(
-            app,
-            flow("ARAM", phase, 0),
-            Value::Null,
-            Some(lobby.clone()),
-            search,
-        );
-    };
-    let room = || room_phase("Lobby", None);
-    let aux = wait_for_popup(app, "aux", room).await;
+    let aux = wait_for_popup(app, "aux", || {}).await;
     check_renderer(
         &aux,
         r#"document.querySelector('.aux-activity[data-phase="Lobby"]') != null &&
-            document.querySelector('.party-size')?.textContent.trim() === '2'"#,
-        "aux ARAM lobby and its two players",
-        room,
+                     document.querySelector('[data-setting=autoMatchmakingEnabled]') != null"#,
+        "original ARAM lounge with the auto-matchmaking switch",
+        || {},
     )
     .await;
-
-    let searching = || room_phase("Matchmaking", Some(search.clone()));
+    let no_writes = server.scene.lock().unwrap().writes.len();
+    assert_eq!(
+        no_writes, 0,
+        "opening the mini window must not submit manual actions"
+    );
+    click(&aux, "[data-setting='autoMatchmakingEnabled']").await;
     check_renderer(
         &aux,
         r#"document.querySelector('.aux-activity[data-phase="Matchmaking"]') != null &&
-            document.querySelector('.queue-time')?.textContent.includes('27')"#,
-        "aux live queue time",
-        searching,
+                     document.querySelector('.queue-time')?.textContent.includes('27.9 s / 54.3 s')"#,
+        "server-read queue time after clicking Start",
+        || {},
     )
     .await;
-
-    let ready = || room_phase("ReadyCheck", Some(search.clone()));
+    click(&aux, "[data-action='cancel-matchmaking']").await;
     check_renderer(
         &aux,
-        r#"document.querySelector('.aux-activity[data-phase="ReadyCheck"]') != null &&
-            document.querySelector('.ready-response')?.textContent.trim() === 'Accepted'"#,
-        "aux accepted ready check",
-        ready,
+        "document.querySelector('[data-phase=Lobby]') != null",
+        "return to lobby after cancel",
+        || {},
     )
     .await;
-    aux.close()
-        .expect("dismiss the auxiliary panel in the room stage");
-    wait_for_close(app, "aux", ready).await;
-    let until = Instant::now() + Duration::from_millis(2500);
-    while Instant::now() < until {
-        ready();
-        reconcile_companions(app);
-        assert_hidden(
-            app,
-            "aux",
-            "dismissed auxiliary panel must stay closed in the room stage",
+    server.scene.lock().unwrap().phase = "ReadyCheck";
+    check_renderer(
+        &aux,
+        "document.querySelector('[data-action=decline-ready-check]') != null",
+        "original ready check buttons",
+        || {},
+    )
+    .await;
+    server.scene.lock().unwrap().reject_next = true;
+    click(&aux, "[data-action='accept-ready-check']").await;
+    check_renderer(&aux, "document.querySelector('.n-message--warning-type, .n-message--error-type, [role=alert]') != null",
+        "a rejected ready check displays a recoverable error", || {}).await;
+    assert_eq!(server.scene.lock().unwrap().response, "None");
+    click(&aux, "[data-action='decline-ready-check']").await;
+    check_renderer(&aux, "document.querySelector('[data-phase=ReadyCheck]')?.textContent.toLowerCase().includes('declined') === true", "declined state from the server", || {}).await;
+    click(&aux, "[data-action='accept-ready-check']").await;
+    check_renderer(
+        &aux,
+        "document.querySelector('.ready-response')?.textContent.includes('ccepted') === true",
+        "accepted state from the server",
+        || {},
+    )
+    .await;
+    aux.close().expect("dismiss the room stage");
+    wait_for_close(app, "aux", || {}).await;
+    tokio::time::sleep(Duration::from_millis(2400)).await;
+    assert_hidden(
+        app,
+        "aux",
+        "explicit dismissal remains effective during ready check",
+    );
+
+    {
+        let mut scene = server.scene.lock().unwrap();
+        scene.phase = "ChampSelect";
+        scene.choosing = true;
+        scene.champion = 0;
+    }
+    let aux = wait_for_popup(app, "aux", || {}).await;
+    let choose_ashe = ".bench [data-champion-id='22']";
+    check_renderer(&aux, r#"document.querySelector('.bench [data-champion-id="22"]')?.getAttribute('aria-disabled') === 'false'"#, "local pick action in the client subset", || {}).await;
+    aux.eval(format!("document.querySelector({}).dispatchEvent(new MouseEvent('contextmenu', {{bubbles:true,button:2}}))", json!(choose_ashe))).unwrap();
+    let until = Instant::now() + OPEN_TIMEOUT;
+    while server.scene.lock().unwrap().intent != 22 {
+        assert!(
+            Instant::now() < until,
+            "right-click did not preview the champion"
         );
         tokio::time::sleep(POLL).await;
     }
-
-    let select = |champion, bench| {
-        let selection = json!({
-            "queueId": 450,
-            "gameId": 0,
-            "isCustomGame": false,
-            "isSpectating": false,
-            "localPlayerCellId": 2,
-            "myTeam": [{ "cellId": 1, "championId": 55 }, { "cellId": 2, "championId": champion }],
-            "benchChampions": [{ "championId": bench }],
-            "timer": { "adjustedTimeLeftInPhase": 17810 },
-        });
-        runtime.apply_companion_fixture(app, flow("ARAM", "ChampSelect", 0), selection, None, None);
-    };
-    let initial = || select(22, 103);
-    let aux = wait_for_popup(app, "aux", initial).await;
+    assert!(
+        server.scene.lock().unwrap().choosing,
+        "preview must leave selection open"
+    );
+    click(&aux, choose_ashe).await;
+    check_renderer(&aux, r#"document.querySelector('.current-champion[data-champion-id="22"] img')?.naturalWidth > 0 &&
+                document.querySelector('.bench [data-champion-id="103"] img')?.naturalWidth > 0"#,
+        "the selected and available bench champion portraits decoded in the WebView", || {}).await;
+    assert_color_portrait(&aux, ".bench [data-champion-id='103'] img").await;
+    click(&aux, ".bench [data-champion-id='103']").await;
+    check_renderer(&aux, r#"document.querySelector('.current-champion[data-champion-id="103"] img')?.naturalWidth > 0 &&
+                    document.querySelector('.bench [data-champion-id="22"] img')?.naturalWidth > 0"#,
+        "clicking the bench really swaps the current champion and updates the bench", || {}).await;
+    {
+        let state = server.scene.lock().unwrap();
+        assert_eq!((state.champion, state.bench), (103, 22));
+        let observed: Vec<_> = state
+            .writes
+            .iter()
+            .map(|(method, path)| (method.as_str(), path.as_str()))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                ("POST", "/lol-lobby/v2/lobby/matchmaking/search"),
+                ("DELETE", "/lol-lobby/v2/lobby/matchmaking/search"),
+                ("POST", "/lol-matchmaking/v1/ready-check/accept"),
+                ("POST", "/lol-matchmaking/v1/ready-check/decline"),
+                ("POST", "/lol-matchmaking/v1/ready-check/accept"),
+                ("PATCH", "/lol-champ-select/v1/session/actions/17"),
+                ("PATCH", "/lol-champ-select/v1/session/actions/17"),
+                ("POST", "/lol-champ-select/v1/session/bench/swap/103"),
+            ]
+        );
+    }
+    mini_optional_actions_smoke::check_optional_actions(&aux, &server).await;
+    assert_hidden(app, "opgg", "aux is independent of OP.GG");
+    assert_hidden(app, "resg", "aux is independent of RESG");
+    monitor.abort();
+    let _ = monitor.await;
+    let writes = server.scene.lock().unwrap().writes.len();
+    server.scene.lock().unwrap().phase = "InProgress";
+    click(&aux, ".bench [data-champion-id='22']").await;
     check_renderer(
         &aux,
-        r#"document.querySelector('.aux-activity[data-phase="ChampSelect"]') != null &&
-            document.querySelector('.current-champion[data-champion-id="22"]') != null &&
-            document.querySelector('.bench li[data-champion-id="103"]') != null &&
-            document.querySelector('.remaining-time')?.textContent.includes('18')"#,
-        "aux early selection with current champion, bench, and 18-second timer",
-        initial,
+        "document.body.innerText.includes('英雄选择阶段已经结束')",
+        "a last-frame bench click reports that champion select already ended",
+        || {},
     )
     .await;
-
-    let swapped = || select(103, 22);
-    check_renderer(
-        &aux,
-        r#"document.querySelector('.current-champion[data-champion-id="103"]') != null &&
-            document.querySelector('.bench li[data-champion-id="22"]') != null"#,
-        "aux live update after a champion swap",
-        swapped,
-    )
-    .await;
-    assert_hidden(
-        app,
-        "opgg",
-        "OP.GG stays disabled in the independent aux scene",
+    assert_eq!(
+        server.scene.lock().unwrap().writes.len(),
+        writes,
+        "a stale mini window must not send a game action"
     );
-    assert_hidden(
-        app,
-        "resg",
-        "RESG stays disabled in the independent aux scene",
-    );
-
-    let started = || sample(app, "ARAM", "InProgress", 7105, 103);
-    started();
+    app.state::<ClientRuntime>()
+        .sample_fixture(app, &client)
+        .await;
     reconcile_companions(app);
-    wait_for_close(app, "aux", started).await;
-    println!("Aux opened from a synthetic ARAM lobby with live party, queue, and ready-check state; dismissing it in the room allowed a new popup in early selection with a live champion swap");
+    wait_for_close(app, "aux", || {}).await;
+    println!("Win32/WebView2 original mini: start/cancel, rejected and retried ready check, decline/accept and champion swap reached the TLS fixture exactly once per click; checked decoded colored portraits and state readback.");
+}
+
+async fn click(window: &WebviewWindow, selector: &str) {
+    let condition = format!("(() => {{ const el = document.querySelector({}); return !!el && !el.disabled && el.getAttribute('aria-disabled') !== 'true' }})()", json!(selector));
+    check_renderer(window, &condition, selector, || {}).await;
+    // Execute exactly once. Polling a click can hide duplicate submissions and false successes.
+    window
+        .eval(format!(
+            "document.querySelector({}).click()",
+            json!(selector)
+        ))
+        .expect("click fixture control");
+}
+
+async fn assert_color_portrait(window: &WebviewWindow, selector: &str) {
+    let script = format!(
+        r#"
+        (async () => {{
+            const icon = document.querySelector({});
+            const copy = new Image();
+            copy.crossOrigin = 'anonymous';
+            copy.src = icon.currentSrc;
+            await copy.decode();
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d', {{ willReadFrequently: true }});
+            ctx.drawImage(copy, 0, 0, 16, 16);
+            const pixels = ctx.getImageData(0,0,16,16).data;
+            const colored = Array.from({{length:256}}, (_,i) => i * 4).filter(i =>
+                pixels[i + 3] > 120 && Math.max(...pixels.slice(i,i+3)) - Math.min(...pixels.slice(i,i+3)) > 18
+            ).length;
+            let visibleColor = true;
+            for (let node = icon; node; node = node.parentElement) {{
+                for (const gray of getComputedStyle(node).filter.matchAll(/grayscale\(([\d.]+)%?\)/g)) {{
+                    if (Number(gray[1]) > 0) visibleColor = false;
+                }}
+            }}
+            document.documentElement.dataset.smokeColored = colored > 5 && visibleColor ? 'yes' : 'no';
+        }})().catch(() => document.documentElement.dataset.smokeColored = 'decode-error');"#,
+        json!(selector)
+    );
+    window.eval(script).unwrap();
+    check_renderer(
+        window,
+        "document.documentElement.dataset.smokeColored === 'yes'",
+        "visible non-gray pixels in the enabled champion portrait",
+        || {},
+    )
+    .await;
 }
 
 fn queue_id(mode: &str) -> u32 {
@@ -529,10 +635,16 @@ async fn check_renderer(window: &WebviewWindow, script: &str, expected: &str, re
                 return;
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "bundled WebView2 did not render {expected}"
-        );
+        if Instant::now() >= deadline {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let tx = Mutex::new(Some(tx));
+            window.eval_with_callback(
+                "JSON.stringify({text:document.body.innerText.slice(0,500),phase:document.querySelector('[data-phase]')?.dataset.phase,actions:[...document.querySelectorAll('[data-action]')].map(n=>n.dataset.action),color:document.documentElement.dataset.smokeColored})",
+                move |value| { if let Some(tx) = tx.lock().unwrap().take() { let _ = tx.send(value); } },
+            ).expect("inspect synthetic fixture UI");
+            let detail = tokio::time::timeout(Duration::from_secs(2), rx).await;
+            panic!("bundled WebView2 did not render {expected}: {detail:?}")
+        }
         tokio::time::sleep(POLL).await;
     }
 }

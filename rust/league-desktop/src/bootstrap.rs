@@ -33,10 +33,7 @@ pub(super) fn initial_state(
         ("akari-api-main", "state") => {
             json!({"featureGates":null,"notice":null,"contactChannels":null})
         }
-        ("auto-gameflow-main", "state") => json!({
-            "willAcceptAt":-1,"willSearchMatch":false,"willSearchMatchAt":-1,
-            "activityStartStatus":"unavailable","friendsToBeInvited":[],
-        }),
+        (crate::room_flow::NAMESPACE, "state") => crate::room_flow::RoomFlow::default().fields(),
         (AUTO_SELECT, "state") => json!({
             "groups":[{
                 "groupId":"aram","name":{"zh-CN":"大乱斗类","en":"ARAM-like"},
@@ -240,6 +237,12 @@ pub(super) struct Preference<'a> {
 }
 
 impl Preference<'_> {
+    fn valid(&self, value: &Value) -> bool {
+        valid_setting(&self.default, value)
+            && (self.namespace != crate::room_flow::NAMESPACE
+                || crate::room_flow::valid_number(self.key, value))
+    }
+
     pub(super) fn read(&self, db: &LeagueProfileDatabase) -> Result<Value, ProfileDatabaseError> {
         Ok(self.saved(db)?.unwrap_or_else(|| self.default.clone()))
     }
@@ -250,7 +253,7 @@ impl Preference<'_> {
     ) -> Result<Option<Value>, ProfileDatabaseError> {
         Ok(db
             .setting(&self.storage_key())?
-            .filter(|value| valid_setting(&self.default, value)))
+            .filter(|value| self.valid(value)))
     }
 
     pub(super) fn write(
@@ -258,7 +261,7 @@ impl Preference<'_> {
         db: &LeagueProfileDatabase,
         value: &Value,
     ) -> Result<(), ProfileDatabaseError> {
-        if !valid_setting(&self.default, value) {
+        if !self.valid(value) {
             return Err(invalid_setting("设置值无效。"));
         }
         if self.key == "displayMode" && !matches!(value.as_str(), Some("all" | "compact")) {
@@ -281,6 +284,13 @@ fn valid_setting(default: &Value, value: &Value) -> bool {
 
 pub(super) fn resg_preferences(db: &LeagueProfileDatabase) -> Result<Value, ProfileDatabaseError> {
     Ok(settings(db, RESG_NAMESPACE)?.expect("known RESG settings"))
+}
+
+pub(super) fn room_options(
+    db: &LeagueProfileDatabase,
+) -> Result<crate::room_flow::RoomOptions, ProfileDatabaseError> {
+    let values = settings(db, crate::room_flow::NAMESPACE)?.expect("known gameflow settings");
+    Ok(crate::room_flow::RoomOptions::from_settings(&values))
 }
 
 fn aram_defaults(key: &str) -> Option<Value> {

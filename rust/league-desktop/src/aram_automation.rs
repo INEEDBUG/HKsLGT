@@ -9,10 +9,10 @@ use maxgamestudio_league_core::auto_select::{
     ChampSelectPhase, ChampionAction, ChampionGridEntry, ChampionPreferences, PhaseTiming,
     PickPreferences, SelectStrategy,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Default)]
@@ -174,10 +174,80 @@ pub(crate) enum ScheduledStep {
 pub(crate) struct ScheduledAction {
     pub(crate) scope: SelectionScope,
     pub(crate) step: ScheduledStep,
+    started: Instant,
+    start_at: u64,
     due: Instant,
 }
 
 impl ScheduledAction {
+    fn schedule(
+        scope: SelectionScope,
+        step: ScheduledStep,
+        now: Instant,
+        due: Instant,
+        previous: Option<Self>,
+    ) -> Self {
+        if let Some(previous) = previous.filter(|p| p.scope == scope && p.step == step) {
+            return Self {
+                due: previous.due.min(due),
+                ..previous
+            };
+        }
+        let start_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            scope,
+            step,
+            started: now,
+            start_at,
+            due,
+        }
+    }
+
+    fn delayed_field(&self) -> (&'static str, Value) {
+        let (key, mut value) = match self.step {
+            ScheduledStep::Draft {
+                action: AutoSelectAction::Intent { .. },
+                champion,
+            } => (
+                "delayedPick",
+                json!({"championId":champion,"isPickIntent":true,"completed":false}),
+            ),
+            ScheduledStep::Draft {
+                action: AutoSelectAction::Pick { completed, .. },
+                champion,
+            } => (
+                "delayedPick",
+                json!({"championId":champion,"isPickIntent":false,"completed":completed}),
+            ),
+            ScheduledStep::Draft {
+                action: AutoSelectAction::Ban { completed, .. },
+                champion,
+            } => (
+                "delayedBan",
+                json!({"championId":champion,"isPickIntent":false,"completed":completed}),
+            ),
+            ScheduledStep::Draft {
+                action: AutoSelectAction::BenchSwap,
+                champion,
+            } => ("delayedBenchSwap", json!({"championId":champion})),
+            ScheduledStep::Trade { offer, accept, .. } => (
+                "delayedChampionSwap",
+                json!({
+                    "requesterChampionId":offer.champion, "tradeId":offer.id, "action":if accept {"accept"} else {"decline"}
+                }),
+            ),
+        };
+        let delay = u64::try_from(self.due.saturating_duration_since(self.started).as_millis())
+            .unwrap_or(u64::MAX);
+        value["startAt"] = json!(self.start_at);
+        value["finishAt"] = json!(self.start_at.saturating_add(delay));
+        value["delayMs"] = json!(delay);
+        (key, value)
+    }
+
     pub(crate) fn still_applies(self, before: &Value, select: &Value, subset: &Value) -> bool {
         if before["timer"]["phase"] != select["timer"]["phase"] {
             return false;
@@ -261,6 +331,15 @@ pub(crate) struct AramSchedule {
 }
 
 impl AramSchedule {
+    pub(crate) fn delayed_fields(&self) -> Value {
+        let mut fields = json!({"delayedPick":null,"delayedBan":null,"delayedBenchSwap":null,"delayedChampionSwap":null});
+        for plan in [self.pending, self.pending_trade].into_iter().flatten() {
+            let (key, field) = plan.delayed_field();
+            fields[key] = field;
+        }
+        fields
+    }
+
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
@@ -409,11 +488,13 @@ impl AramSchedule {
                         action,
                         champion: champion_id,
                     };
-                    let due = self
-                        .pending
-                        .filter(|pending| pending.step == step)
-                        .map_or(due, |pending| pending.due.min(due));
-                    self.pending = Some(ScheduledAction { scope, step, due });
+                    self.pending = Some(ScheduledAction::schedule(
+                        scope,
+                        step,
+                        now,
+                        due,
+                        self.pending,
+                    ));
                 }
             }
         }
@@ -451,11 +532,13 @@ impl AramSchedule {
         let elapsed_ms = now.saturating_duration_since(seen_at).as_secs_f64() * 1000.0;
         let delay_ms = (pick.choice.delay_ms - elapsed_ms).max(0.0).min(left);
         let due = now.checked_add(Duration::try_from_secs_f64(delay_ms / 1000.0).ok()?)?;
-        let due = self
-            .pending_trade
-            .filter(|pending| pending.step == step)
-            .map_or(due, |pending| pending.due.min(due));
-        Some(ScheduledAction { scope, step, due })
+        Some(ScheduledAction::schedule(
+            scope,
+            step,
+            now,
+            due,
+            self.pending_trade,
+        ))
     }
 
     pub(crate) fn mark_attempted(&mut self, action: ScheduledAction) -> bool {
@@ -532,6 +615,24 @@ mod tests {
             .observe(scope, &flow, &selection, &available, &options, now)
             .is_none());
         let due = now + Duration::from_secs(1);
+        let plan = scheduler.delayed_fields();
+        let pick = &plan["delayedPick"];
+        assert_eq!(pick["championId"], 63);
+        // The League timer has already consumed 300 ms of the configured one second.
+        assert_eq!(
+            pick["finishAt"].as_i64().unwrap() - pick["startAt"].as_i64().unwrap(),
+            700
+        );
+        assert_eq!(plan["delayedBenchSwap"], Value::Null);
+        scheduler.observe(
+            scope,
+            &flow,
+            &selection,
+            &available,
+            &options,
+            now + Duration::from_millis(200),
+        );
+        assert_eq!(scheduler.delayed_fields(), plan);
         let action = scheduler
             .observe(scope, &flow, &selection, &available, &options, due)
             .unwrap();
@@ -553,6 +654,7 @@ mod tests {
         changed["actions"][0][0]["championId"] = json!(29);
         assert!(!action.still_applies(&selection, &changed, &Value::Null));
         assert!(scheduler.mark_attempted(action));
+        assert_eq!(scheduler.delayed_fields()["delayedPick"], Value::Null);
         assert!(!scheduler.mark_attempted(action));
         assert!(scheduler
             .observe(scope, &flow, &selection, &available, &options, due)
@@ -592,6 +694,63 @@ mod tests {
             flow,
             select,
         )
+    }
+
+    #[test]
+    fn mini_plan_shows_the_existing_draft_and_trade_concurrently_and_clears_after_cancel() {
+        let (scope, _, _) = exchange_sample();
+        let now = Instant::now();
+        let due = now + Duration::from_secs(2);
+        let mut scheduler = AramSchedule::default();
+        let offer = IncomingChampionTrade {
+            id: 12,
+            champion: 22,
+        };
+        scheduler.pending_trade = Some(ScheduledAction::schedule(
+            scope,
+            ScheduledStep::Trade {
+                offer,
+                held: 63,
+                accept: false,
+            },
+            now,
+            due,
+            None,
+        ));
+        for (action, field) in [
+            (
+                AutoSelectAction::Ban {
+                    action_id: 0,
+                    completed: true,
+                },
+                "delayedBan",
+            ),
+            (AutoSelectAction::BenchSwap, "delayedBenchSwap"),
+        ] {
+            scheduler.pending = Some(ScheduledAction::schedule(
+                scope,
+                ScheduledStep::Draft {
+                    action,
+                    champion: 57,
+                },
+                now,
+                due,
+                None,
+            ));
+            let fields = scheduler.delayed_fields();
+            assert_eq!(fields[field]["championId"], 57);
+            assert_eq!(fields[field]["delayMs"], 2000);
+            assert_eq!(fields["delayedChampionSwap"]["requesterChampionId"], 22);
+            assert_eq!(fields["delayedChampionSwap"]["action"], "decline");
+            assert_eq!(fields["delayedChampionSwap"]["tradeId"], 12);
+        }
+        scheduler.cancel();
+        assert!(scheduler
+            .delayed_fields()
+            .as_object()
+            .unwrap()
+            .values()
+            .all(Value::is_null));
     }
 
     fn exchange_options(enabled: bool, upgrade: bool) -> AramOptions {

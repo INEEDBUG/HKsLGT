@@ -490,6 +490,16 @@ async fn league_call(
         }
         return Ok(response(update_call(&window, &method, &args).await));
     }
+    if namespace == crate::lcu::aux_activity::NAMESPACE {
+        if window.label() != "aux" {
+            return Err("大乱斗面板操作只能从辅助窗执行。".into());
+        }
+        return Ok(response(
+            client
+                .aux_action(&window.app_handle(), &method, &args)
+                .await,
+        ));
+    }
     if namespace == "player-search-main" && method == "lookup" && window.label() == "main" {
         let [shard, input] = args.as_slice() else {
             return Err("缺少玩家查询条件。".into());
@@ -599,6 +609,17 @@ async fn league_call(
                 client.select(window.app_handle(), selection)?;
                 Ok(Value::Null)
             }
+            (crate::room_flow::NAMESPACE, "cancelAutoAccept" | "cancelAutoMatchmaking")
+                if matches!(window.label(), "main" | "aux") && args.is_empty() =>
+            {
+                let action = if method == "cancelAutoAccept" {
+                    crate::lcu::RoomAction::AcceptReadyCheck
+                } else {
+                    crate::lcu::RoomAction::StartMatchmaking
+                };
+                client.cancel_room_timer(app, action)?;
+                Ok(Value::Null)
+            }
             ("ongoing-game-main", "getAll") => Ok(bootstrap::ongoing_game_data()),
             ("renderer-debug-main", "setSendAllNativeLcuEvents")
                 if args.first() == Some(&json!(false)) =>
@@ -620,6 +641,7 @@ async fn league_call(
                 let value = bootstrap::set_aram_config(&db, key, group, patch)
                     .map_err(|error| error.to_string())?;
                 client.replace_aram_options(
+                    app,
                     bootstrap::aram_options(&db).map_err(io::Error::other)?,
                 )?;
                 let revision = revision.next();
@@ -738,8 +760,13 @@ async fn league_call(
                                 .map_err(|error| error.to_string())?;
                         }
                         if (namespace, name) == (AUTO_SELECT, "state") {
-                            let (revision, paused) = client.aram_paused()?;
-                            state["temporarilyDisabled"] = json!(paused);
+                            let (revision, fields) = client.aram_state()?;
+                            if let Value::Object(fields) = fields {
+                                state
+                                    .as_object_mut()
+                                    .expect("auto-select state fields")
+                                    .extend(fields);
+                            }
                             return Ok(state_fields(state, Some(revision)));
                         }
                         Ok(state_fields(
@@ -802,9 +829,20 @@ async fn league_call(
                             .read(&db)
                             .map_err(|error| error.to_string().into());
                     };
+                    let room = namespace == crate::room_flow::NAMESPACE
+                        && crate::room_flow::is_room_setting(key);
+                    if room && !matches!(window.label(), "main" | "aux") {
+                        return Err("只能从主窗或小型辅助面板更改房间设置。".into());
+                    }
                     preference
                         .write(&db, value)
                         .map_err(|error| error.to_string())?;
+                    if room {
+                        client.replace_room_options(
+                            app,
+                            bootstrap::room_options(&db).map_err(io::Error::other)?,
+                        )?;
+                    }
                 }
                 let value = value.expect("settings reads have returned");
                 let revision = revision.next();
@@ -904,6 +942,7 @@ pub(crate) fn run() -> tauri::Result<()> {
                 auto_connect,
                 resg_preferences,
                 aram_options,
+                room_options,
                 aux,
                 opgg_preferences,
                 game_shortcut,
@@ -927,6 +966,7 @@ pub(crate) fn run() -> tauri::Result<()> {
                     auto_connect,
                     bootstrap::resg_preferences(&db).map_err(io::Error::other)?,
                     bootstrap::aram_options(&db).map_err(io::Error::other)?,
+                    bootstrap::room_options(&db).map_err(io::Error::other)?,
                     AuxWindow::new(aux["enabled"] == true, aux["autoShow"] == true),
                     OpggPreferences {
                         enabled: opgg["enabled"] == true,
@@ -938,7 +978,11 @@ pub(crate) fn run() -> tauri::Result<()> {
                 )
             };
             app.manage(profile);
-            app.manage(ClientRuntime::new(auto_connect, aram_options)?);
+            let client = ClientRuntime::new(auto_connect, aram_options)?;
+            client
+                .replace_room_options(app.handle(), room_options)
+                .map_err(io::Error::other)?;
+            app.manage(client);
             app.manage(ResgWindow::new(resg_preferences));
             app.manage(aux);
             app.manage(OpggWindow::new(opgg_preferences));

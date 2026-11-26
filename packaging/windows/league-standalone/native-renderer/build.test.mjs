@@ -5,9 +5,22 @@ import { join, resolve } from 'node:path'
 import test from 'node:test'
 
 import { createNativeRendererConfig } from './build.mjs'
+import { MINI_ACTIVITY_MODULE } from './mini-renderer.mjs'
 
 const stagedSource = resolve('staged-league-fixture')
 const outDir = resolve('native-webview-dist')
+
+test('a missing local champion portrait can use its official color image without forwarding a client path', async () => {
+  const { championPortraitFallback } = await import('./champion-portrait.mjs')
+  const path = 'http://league-art.localhost/lol-game-data/assets/v1/champion-icons/136.png'
+  const champions = { 136: { alias: 'AurelionSol' } }
+  assert.equal(championPortraitFallback(path, champions), 'https://game.gtimg.cn/images/lol/act/img/champion/AurelionSol.png')
+  for (const invalid of [null, path + '?auth=example', path.replace('136.png', '-1.png'), path.replace('champion-icons', 'profile-icons'), path.replace('league-art.localhost', 'other.invalid')]) {
+    assert.equal(championPortraitFallback(invalid, champions), null)
+  }
+  assert.equal(championPortraitFallback(path, {}), null)
+  assert.equal(championPortraitFallback(path, {136: { alias: '../other' }}), null)
+})
 
 test('the native renderer substitutes local vector artwork for bundled brand and game images', () => {
   const plugin = createNativeRendererConfig({}, stagedSource, outDir).plugins[0]
@@ -93,6 +106,148 @@ test('native OP.GG keeps the local shell and opens the official guide only throu
   assert.match(html, /default-src 'self' data: blob:;/)
   assert.match(html, /connect-src ipc: http:\/\/ipc\.localhost 'self';/)
   assert.doesNotMatch(html, /https:|ws:/)
+})
+
+test('the native Mini keeps the original lounge and champion-selection components', () => {
+  const config = createNativeRendererConfig({}, stagedSource, outDir)
+  const indicator = join(config.root, 'src-aux-window/views/Indicator.vue')
+  const source = `<template>
+  <KeepAlive>
+    <ChampSelect v-if="currentPage === 'champ-select'" />
+    <Lounge v-else-if="currentPage === 'lounge'" />
+    <Placeholder v-else />
+  </KeepAlive>
+</template>
+
+<script setup lang="ts">
+import { useLeagueClientStore } from '@renderer-shared/shards/league-client/store'
+import { computed } from 'vue'
+
+import ChampSelect from './ChampSelect.vue'
+import Lounge from './Lounge.vue'
+import Placeholder from './Placeholder.vue'
+
+const lcs = useLeagueClientStore()
+
+const currentPage = computed(() => {
+  switch (lcs.gameflow.phase) {
+    case 'Lobby':
+      return 'lounge'
+  }
+  return 'placeholder'
+})
+</script>`
+  const native = config.plugins[0].transform(source, indicator)?.code ?? source
+  assert.match(native, /<ChampSelect v-if="currentPage === 'champ-select'"/)
+  assert.match(native, /<Lounge v-else-if="currentPage === 'lounge'"/)
+  assert.match(native, /provideNativeAuxActivity/)
+  assert.doesNotMatch(native, /syncError|Champion bench/)
+})
+
+test('Mini actions wait for current activity, send scoped payloads once and surface rejections', async () => {
+  const renderer = createNativeRendererConfig({}, stagedSource, outDir).plugins[0]
+  const modulePath = renderer.resolveId(MINI_ACTIVITY_MODULE)
+  const source = renderer.load(modulePath).replace(/^import .*$/gm, '').replace(/^export /gm, '')
+  const script = stripTypeScriptTypes(source, { mode: 'transform' })
+  let mounted
+  let resolveCall
+  let fail = false
+  const calls = []
+  const warnings = []
+  const IPC = Symbol('IPC')
+  const sync = {
+    async sync(namespace, name, state) {
+      assert.equal(namespace, 'aux-activity-main')
+      assert.equal(name, 'state')
+      state.view = { phase: 'ChampSelect' }
+    }
+  }
+  const ipc = {
+    call(...args) {
+      calls.push(args)
+      if (fail) return Promise.reject({ message: 'The selected champion is no longer available.' })
+      return new Promise((resolve) => { resolveCall = resolve })
+    }
+  }
+  const createActivity = new Function(
+    'useInstance', 'AkariIpcRenderer', 'PiniaMobxUtilsRenderer', 'useAppCommonStore', 'useMessage',
+    'shallowReactive', 'computed', 'ref', 'onMounted', 'provide', `${script}\nreturn provideNativeAuxActivity()`
+  )
+  const activity = createActivity(
+    (type) => type === IPC ? ipc : sync, IPC, Symbol('sync'),
+    () => ({ settings: { locale: 'en' } }), () => ({ warning: (message) => warnings.push(message) }),
+    (object) => object, (getter) => ({ get value() { return getter() } }), (value) => ({ value }),
+    (callback) => { mounted = callback }, () => {}
+  )
+  assert.equal(await activity.run('leaveGame'), false)
+  await mounted()
+  const pick = activity.run('chooseChampion', 22, false)
+  assert.equal(activity.pending.value, true)
+  assert.equal(await activity.run('swapBenchChampion', 103), false)
+  resolveCall(null)
+  assert.equal(await pick, true)
+  assert.equal(activity.pending.value, false)
+  fail = true
+  assert.equal(await activity.run('selectSkin', 22001), false)
+  fail = false
+  const charity = activity.run('charityReroll')
+  resolveCall({ rerolled: true, grabbedBack: false, swapReason: 'The bench changed.' })
+  assert.equal(await charity, true)
+  assert.deepEqual(calls, [
+    ['aux-activity-main', 'chooseChampion', 22, false],
+    ['aux-activity-main', 'selectSkin', 22001],
+    ['aux-activity-main', 'charityReroll']
+  ])
+  assert.deepEqual(warnings, [
+    'The selected champion is no longer available.',
+    'Rerolled. The original champion was not recovered. The bench changed.'
+  ])
+})
+
+test('the Mini requests genuine OP.GG balance data once in standard ARAM selection only', async () => {
+  const renderer = createNativeRendererConfig({}, stagedSource, outDir).plugins[0]
+  const modulePath = renderer.resolveId(MINI_ACTIVITY_MODULE)
+  const source = renderer.load(modulePath).replace(/^import .*$/gm, '').replace(/^export /gm, '')
+  const script = stripTypeScriptTypes(source, { mode: 'transform' })
+  const row = {
+    champion_id: 22, attack_speed: 100, damage_dealt: 105, damage_taken: 100,
+    cooldown_reduction: 0, healing: 100, tenacity: 0, shield_amount: 100, energy_regen: 100,
+    area_of_effect_damage: 100, default: false
+  }
+  const create = new Function('inject', 'useExtraAssetsStore', 'watch', 'fetch', `${script}\nreturn useNativeAramBalance()`)
+  const mount = (fetch) => {
+    const view = { value: null }
+    const opgg = { aramBalance: null }
+    let change
+    create(() => ({ view }), () => ({ opgg }), (get, callback) => { change = () => callback(get()) }, fetch)
+    return { opgg, show(phase, gameMode) { view.value = { phase, gameMode }; change() } }
+  }
+  const calls = []
+  const mini = mount(async (url, options) => {
+    calls.push({ url, options })
+    return { ok: true, json: async () => ({ data: [row, { ...row, champion_id: 55, damage_dealt: '105' }] }) }
+  })
+  mini.show('Lobby', 'ARAM')
+  mini.show('ChampSelect', 'KIWI')
+  assert.deepEqual(calls, [])
+  mini.show('ChampSelect', 'ARAM')
+  await new Promise(setImmediate)
+  assert.deepEqual(mini.opgg.aramBalance, [row])
+  mini.show('Lobby', 'ARAM')
+  mini.show('ChampSelect', 'ARAM')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, 'https://lol-api-champion.op.gg/api/contents/aram-balance')
+  assert.equal(calls[0].options.credentials, 'omit')
+  assert.equal(calls[0].options.referrerPolicy, 'no-referrer')
+  assert.equal(calls[0].options.redirect, 'error')
+
+  let attempts = 0
+  const offline = mount(async () => { attempts++; throw new Error('offline') })
+  offline.show('ChampSelect', 'ARAM')
+  await new Promise(setImmediate)
+  offline.show('ChampSelect', 'ARAM')
+  assert.equal(offline.opgg.aramBalance, null)
+  assert.equal(attempts, 1)
 })
 
 test('League startup skips the unused upstream logo preference and still loads app state', () => {

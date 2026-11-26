@@ -8,22 +8,23 @@ use crate::{
         emit,
     },
     lcu::{
-        aux_activity::{self, AuxActivity, AuxPhase},
+        aux_activity::{self, AuxActivity, AuxPhase, AuxSelectionExtras, AuxView},
         game_art::{GameArt, GameArtPath},
         player_search::PlayerSearchShard,
         player_tab_read::PlayerTabRead,
-        GameflowSession, LcuError, LcuTarget, LcuTransport,
+        AuxChampSelectAction, GameflowSession, LcuError, LcuTarget, LcuTransport, RoomAction,
     },
     opgg_window::{self, OpggTarget, OpggWindow},
     resg_window::{ResgAction, ResgWindow},
+    room_flow::{self, RoomFlow, RoomOptions, RoomSample},
 };
-use futures_util::future::{join, join3};
+use futures_util::future::join3;
 pub(crate) use maxgamestudio_league_core::shell_preferences::LEAGUE_CLIENT as CLIENT;
 use serde_json::{json, Map, Value};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 
@@ -44,6 +45,8 @@ struct ActiveClient {
     summoner: Value,
     companions: CompanionTargets,
     aux_activity: AuxActivity,
+    room: Option<RoomSample>,
+    room_unconfirmed: bool,
     shard: Option<PlayerSearchShard>,
 }
 
@@ -147,6 +150,53 @@ struct Sample {
     selection: Option<(GameflowSession, Value)>,
 }
 
+struct FreshAuxSelection {
+    client: Arc<LocalClient>,
+    generation: u64,
+    original: AuxView,
+    current: AuxView,
+    flow: GameflowSession,
+    selection: Value,
+    extras: AuxSelectionExtras,
+}
+
+#[derive(Default)]
+struct RoomReads {
+    lobby: Option<Value>,
+    search: Option<Value>,
+    search_read: bool,
+}
+
+impl RoomReads {
+    fn sample(
+        &self,
+        client: ClientInstance,
+        player: Option<&str>,
+        activity: &AuxActivity,
+    ) -> Option<RoomSample> {
+        let phase = activity.view()?.phase;
+        if phase == AuxPhase::ChampSelect {
+            return None;
+        }
+        Some(RoomSample::new(
+            client,
+            phase,
+            player.filter(|p| !p.is_empty())?,
+            self.lobby.as_ref(),
+            self.search.as_ref(),
+            self.search_read,
+        ))
+    }
+}
+
+fn epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 async fn optional_lcu<T>(
     read: impl std::future::Future<Output = Result<T, LcuError>>,
 ) -> Option<T> {
@@ -181,6 +231,47 @@ pub(crate) fn client_from_view(value: &Value) -> Option<ClientInstance> {
 }
 
 impl Snapshot {
+    fn observe_room(&self, flow: &mut RoomFlow) -> Option<crate::lcu::RoomAction> {
+        let active = self.active.as_ref();
+        let sample = active.and_then(|client| client.room.as_ref());
+        let same_stage_unconfirmed = match active {
+            Some(client) => {
+                sample.is_none()
+                    && client.room_unconfirmed
+                    && flow.tracks_stage(
+                        client.instance,
+                        &client.phase,
+                        client.summoner["puuid"].as_str(),
+                    )
+            }
+            None => flow
+                .tracked_client()
+                .is_some_and(|instance| self.known_clients.contains(&instance)),
+        };
+        if same_stage_unconfirmed {
+            flow.suspend();
+            None
+        } else {
+            flow.observe(sample, Instant::now(), epoch_millis())
+        }
+    }
+
+    fn left_draft(&self, next: &Self) -> bool {
+        let Some(before) = self.active.as_ref().filter(|a| a.phase == "ChampSelect") else {
+            return false;
+        };
+        let game = |a: &ActiveClient| {
+            a.session["gameData"]["gameId"]
+                .as_u64()
+                .filter(|id| *id > 0)
+        };
+        next.active.as_ref().is_none_or(|after| {
+            after.phase != "ChampSelect"
+                || before.instance != after.instance
+                || game(before).zip(game(after)).is_some_and(|(a, b)| a != b)
+        })
+    }
+
     fn fields(&self, namespace: &str, name: &str) -> Option<Value> {
         let active = self.active.as_ref();
         let shard = active.and_then(|client| client.shard.as_ref());
@@ -243,6 +334,9 @@ struct RuntimeState {
     aram_options: AramOptions,
     aram_paused: bool,
     aram: AramSchedule,
+    room_flow: RoomFlow,
+    published_room: Value,
+    published_draft: Value,
     data_client: Option<ClientInstance>,
     data_ticket: u64,
     data_task: Option<tauri::async_runtime::JoinHandle<()>>,
@@ -273,6 +367,32 @@ pub(crate) fn empty_game_data() -> Value {
 }
 
 impl RuntimeState {
+    fn publish_room(&mut self, app: &AppHandle) {
+        publish_live_fields(
+            app,
+            room_flow::NAMESPACE,
+            self.room_flow.fields(),
+            &mut self.published_room,
+            &mut self.revision,
+        );
+    }
+
+    fn draft_fields(&self) -> Value {
+        let mut fields = self.aram.delayed_fields();
+        fields["temporarilyDisabled"] = json!(self.aram_paused);
+        fields
+    }
+
+    fn publish_draft(&mut self, app: &AppHandle) {
+        publish_live_fields(
+            app,
+            "auto-select-main",
+            self.draft_fields(),
+            &mut self.published_draft,
+            &mut self.revision,
+        );
+    }
+
     fn history_session(&self) -> Option<HistorySession> {
         let active = self.snapshot.active.as_ref()?;
         Some(HistorySession {
@@ -281,6 +401,32 @@ impl RuntimeState {
             player: active.summoner["puuid"].as_str()?.to_owned(),
             shard: active.shard.clone()?,
         })
+    }
+
+    fn scheduled_selection_generation_is_current(&self, generation: u64) -> bool {
+        self.generation == generation && !self.aram_paused
+    }
+
+    fn claim_manual_aux_selection(
+        &mut self,
+        generation: u64,
+        instance: ClientInstance,
+        expected: &AuxView,
+    ) -> Option<u64> {
+        let active_matches = self.snapshot.active.as_ref().is_some_and(|active| {
+            active.instance == instance
+                && active.aux_activity.view().is_some_and(|view| {
+                    view.phase == expected.phase
+                        && view.game_mode == expected.game_mode
+                        && (expected.game_id.is_none() || view.game_id == expected.game_id)
+                })
+        });
+        if self.generation != generation || !active_matches {
+            return None;
+        }
+        self.aram.cancel();
+        self.generation = self.generation.wrapping_add(1);
+        Some(self.generation)
     }
 
     fn verified_opgg_target(&self) -> Option<OpggTarget> {
@@ -298,7 +444,14 @@ impl RuntimeState {
         app: &AppHandle,
         snapshot: Snapshot,
         client: Option<Arc<LocalClient>>,
-    ) {
+    ) -> Option<crate::lcu::RoomAction> {
+        let due = snapshot.observe_room(&mut self.room_flow);
+        if self.aram_paused && self.snapshot.left_draft(&snapshot) {
+            self.aram_paused = false;
+            self.aram.reset();
+            self.publish_draft(app);
+        }
+        self.publish_room(app);
         if self.snapshot != snapshot {
             self.revision += 1;
             publish_changes(app, &self.snapshot, &snapshot, self.revision);
@@ -309,6 +462,7 @@ impl RuntimeState {
             client.filter(|client| active.is_some_and(|active| active.instance == client.instance));
         self.opgg_checked_at =
             active.and_then(|active| active.companions.opgg.map(|_| Instant::now()));
+        due
     }
 
     fn refresh_game_data(&mut self, app: &AppHandle) {
@@ -347,6 +501,8 @@ pub(crate) struct ClientRuntime {
     state: Mutex<RuntimeState>,
     wake: tokio::sync::Notify,
     art_reads: tokio::sync::Semaphore,
+    room_writes: tokio::sync::Mutex<()>,
+    selection_writes: tokio::sync::Mutex<()>,
 }
 
 impl ClientRuntime {
@@ -360,6 +516,8 @@ impl ClientRuntime {
             }),
             wake: tokio::sync::Notify::new(),
             art_reads: tokio::sync::Semaphore::new(4),
+            room_writes: tokio::sync::Mutex::new(()),
+            selection_writes: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -369,6 +527,9 @@ impl ClientRuntime {
         name: &str,
     ) -> Result<Option<(u64, Value)>, &'static str> {
         let state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+        if (namespace, name) == (room_flow::NAMESPACE, "state") {
+            return Ok(Some((state.revision, state.room_flow.fields())));
+        }
         if (namespace, name) == (CLIENT, "gameData") {
             let mut fields = empty_game_data();
             fields
@@ -430,6 +591,40 @@ impl ClientRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn use_fixture_transport(
+        &mut self,
+        root: rustls::pki_types::CertificateDer<'static>,
+    ) {
+        self.transport = LcuTransport::with_root(root).expect("fixture TLS root");
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn sample_fixture(&self, app: &AppHandle, client: &Arc<LocalClient>) {
+        let sample = self
+            .sample(client, CompanionDemand::from_app(app), None, None, false)
+            .await
+            .expect("sample loopback League fixture")
+            .expect("fixture is active");
+        let (due, generation) = {
+            let mut state = self.state.lock().unwrap();
+            let due = state.apply_snapshot(
+                app,
+                Snapshot {
+                    known_clients: vec![client.instance],
+                    active: Some(sample.client),
+                },
+                Some(Arc::clone(client)),
+            );
+            state.refresh_game_data(app);
+            (due, state.generation)
+        };
+        if let Some(action) = due {
+            self.dispatch_due_room(app, client, generation, action)
+                .await;
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_companion_fixture(
         &self,
         app: &AppHandle,
@@ -453,6 +648,13 @@ impl ClientRuntime {
             search.as_ref(),
             selection,
         );
+        let room = RoomReads {
+            lobby,
+            search,
+            search_read: true,
+        }
+        .sample(instance, Some(PLAYER), &aux_activity);
+        let room_unconfirmed = matches!(aux_activity, AuxActivity::Unconfirmed);
         self.state.lock().unwrap().apply_snapshot(
             app,
             Snapshot {
@@ -464,6 +666,8 @@ impl ClientRuntime {
                     summoner: json!({"puuid": PLAYER}),
                     companions,
                     aux_activity,
+                    room,
+                    room_unconfirmed,
                     shard: None,
                 }),
             },
@@ -515,6 +719,322 @@ impl ClientRuntime {
         let active = state.snapshot.active.as_ref()?;
         let client = state.art_client.as_ref()?;
         (client.instance == active.instance && client.alive()).then(|| Arc::clone(client))
+    }
+
+    fn aux_snapshot(&self) -> Result<(Arc<LocalClient>, u64, AuxView), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "客户端状态不可用。".to_owned())?;
+        let active = state
+            .snapshot
+            .active
+            .as_ref()
+            .ok_or("请先连接英雄联盟客户端。")?;
+        let view = active
+            .aux_activity
+            .view()
+            .cloned()
+            .ok_or("当前客户端没有可操作的大乱斗状态。")?;
+        let client = state
+            .art_client
+            .as_ref()
+            .filter(|client| client.instance == active.instance && client.alive())
+            .cloned()
+            .ok_or("客户端已断开，请重新连接。")?;
+        Ok((client, state.generation, view))
+    }
+
+    fn aux_snapshot_is_current(
+        &self,
+        client: &LocalClient,
+        generation: u64,
+        expected: &AuxView,
+    ) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.generation == generation
+                && state
+                    .art_client
+                    .as_ref()
+                    .is_some_and(|current| current.instance == client.instance && current.alive())
+                && state.snapshot.active.as_ref().is_some_and(|active| {
+                    active.instance == client.instance
+                        && active.aux_activity.view().is_some_and(|view| {
+                            view.phase == expected.phase
+                                && view.game_mode == expected.game_mode
+                                && (expected.game_id.is_none() || view.game_id == expected.game_id)
+                        })
+                })
+        })
+    }
+
+    async fn fresh_aux_selection(
+        &self,
+        client: Arc<LocalClient>,
+        generation: u64,
+        original: AuxView,
+    ) -> Result<FreshAuxSelection, String> {
+        if original.phase != AuxPhase::ChampSelect {
+            return Err("当前不在大乱斗英雄选择阶段。".into());
+        }
+        let target = client.target().map_err(|_| "客户端已断开，请重新连接。")?;
+        let phase =
+            tokio::time::timeout(Duration::from_secs(2), self.transport.read_phase(&target))
+                .await
+                .map_err(|_| "读取当前游戏阶段超时，请重试。")?
+                .map_err(|_| "无法读取当前游戏阶段，请重试。")?;
+        if phase.as_deref() != Some("ChampSelect") {
+            return Err("英雄选择阶段已经结束，请重新查看状态。".into());
+        }
+        let (flow, selection) = futures_util::future::join(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                self.transport.read_gameflow_session(&target),
+            ),
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                self.transport.read_champ_select(&target),
+            ),
+        )
+        .await;
+        let flow = flow
+            .map_err(|_| "读取当前大乱斗会话超时，请重试。")?
+            .map_err(|_| "无法读取当前大乱斗会话，请重试。")?
+            .ok_or("无法确认当前大乱斗会话，请重试。")?;
+        let selection = selection
+            .map_err(|_| "读取英雄选择状态超时，请重试。")?
+            .map_err(|_| "无法读取英雄选择状态，请重试。")?;
+        if flow.phase != "ChampSelect" {
+            return Err("英雄选择阶段已经结束，请重新查看状态。".into());
+        }
+        if flow
+            .game_data
+            .as_ref()
+            .is_some_and(|data| data.is_custom_game == Some(true))
+            || selection["isCustomGame"] == true
+        {
+            return Err("自定义对局不支持此操作。".into());
+        }
+        let extras = self
+            .transport
+            .read_aux_selection_extras(&target, &selection)
+            .await
+            .unwrap_or_default();
+        let activity = AuxActivity::project_with_extras(
+            "ChampSelect",
+            Some(&flow),
+            None,
+            None,
+            Some(&selection),
+            Some(&extras),
+        );
+        let current = activity
+            .view()
+            .cloned()
+            .ok_or("当前大乱斗英雄选择状态不可确认，请重试。")?;
+        if current.game_mode != original.game_mode
+            || (original.game_id.is_some() && current.game_id != original.game_id)
+        {
+            return Err("当前对局已变化，请重新查看状态。".into());
+        }
+        if !self.aux_snapshot_is_current(&client, generation, &original) {
+            return Err("当前连接或对局状态已变化，请重新查看。".into());
+        }
+        Ok(FreshAuxSelection {
+            client,
+            generation,
+            original,
+            current,
+            flow,
+            selection,
+            extras,
+        })
+    }
+
+    async fn aux_room_action(
+        &self,
+        action: RoomAction,
+        expected_phase: AuxPhase,
+    ) -> Result<(), String> {
+        let (client, generation, view) = self.aux_snapshot()?;
+        if view.phase != expected_phase {
+            return Err("房间或准备确认状态已经变化，请重新查看。".into());
+        }
+        self.guarded_room_write(&client, action, generation).await
+    }
+
+    pub(crate) async fn aux_action(
+        &self,
+        app: &AppHandle,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value, String> {
+        match method {
+            "cancelMatchmaking" if args.is_empty() => {
+                self.aux_room_action(RoomAction::CancelMatchmaking, AuxPhase::Matchmaking)
+                    .await?;
+            }
+            "acceptReadyCheck" if args.is_empty() => {
+                self.aux_room_action(RoomAction::AcceptReadyCheck, AuxPhase::ReadyCheck)
+                    .await?;
+            }
+            "declineReadyCheck" if args.is_empty() => {
+                self.aux_room_action(RoomAction::DeclineReadyCheck, AuxPhase::ReadyCheck)
+                    .await?;
+            }
+            "pauseAutoSelect" if args.len() == 1 => {
+                let paused = args[0].as_bool().ok_or("无效的自动选禁暂停状态。")?;
+                let (client, generation, original) = self.aux_snapshot()?;
+                let fresh = self
+                    .fresh_aux_selection(client, generation, original)
+                    .await?;
+                if !self.aux_snapshot_is_current(&fresh.client, fresh.generation, &fresh.original) {
+                    return Err("当前连接或对局状态已变化，请重新查看。".into());
+                }
+                self.pause_aram(app, paused)
+                    .map_err(|error| error.to_owned())?;
+                return Ok(Value::Null);
+            }
+            "chooseChampion" if args.len() == 2 => {
+                let champion_id = aux_champion_arg(&args[0])?;
+                let complete = args[1].as_bool().ok_or("无效的选人操作。")?;
+                let (client, generation, original) = self.aux_snapshot()?;
+                let fresh = self
+                    .fresh_aux_selection(client, generation, original)
+                    .await?;
+                let action = validate_choose_champion(&fresh, champion_id, complete)?;
+                self.apply_aux_selection_action(&fresh, action).await?;
+            }
+            "swapBenchChampion" if args.len() == 1 => {
+                let champion_id = aux_champion_arg(&args[0])?;
+                let (client, generation, original) = self.aux_snapshot()?;
+                let fresh = self
+                    .fresh_aux_selection(client, generation, original)
+                    .await?;
+                let action = validate_bench_swap(&fresh, champion_id)?;
+                self.apply_aux_selection_action(&fresh, action).await?;
+            }
+            "reroll" if args.is_empty() => {
+                let (client, generation, original) = self.aux_snapshot()?;
+                let fresh = self
+                    .fresh_aux_selection(client, generation, original)
+                    .await?;
+                validate_reroll(&fresh.current)?;
+                self.apply_aux_selection_action(&fresh, AuxChampSelectAction::Reroll)
+                    .await?;
+            }
+            "charityReroll" if args.is_empty() => {
+                return self.aux_charity_reroll().await;
+            }
+            "selectSkin" if args.len() == 1 => {
+                let skin_id = aux_skin_arg(&args[0])?;
+                let (client, generation, original) = self.aux_snapshot()?;
+                let fresh = self
+                    .fresh_aux_selection(client, generation, original)
+                    .await?;
+                validate_skin(&fresh, skin_id)?;
+                self.apply_aux_selection_action(
+                    &fresh,
+                    AuxChampSelectAction::SelectSkin { skin_id },
+                )
+                .await?;
+            }
+            "leaveGame" if args.is_empty() => {
+                let (client, generation, original) = self.aux_snapshot()?;
+                let fresh = self
+                    .fresh_aux_selection(client, generation, original)
+                    .await?;
+                if fresh
+                    .flow
+                    .game_data
+                    .as_ref()
+                    .and_then(|data| data.is_custom_game)
+                    != Some(false)
+                {
+                    return Err("无法确认这是普通大乱斗对局，已阻止离开操作。".into());
+                }
+                self.apply_aux_selection_action(&fresh, AuxChampSelectAction::Leave)
+                    .await?;
+            }
+            _ => return Err("此大乱斗操作不可用或参数无效。".into()),
+        }
+        Ok(Value::Null)
+    }
+
+    async fn apply_aux_selection_action(
+        &self,
+        fresh: &FreshAuxSelection,
+        action: AuxChampSelectAction,
+    ) -> Result<u64, String> {
+        let _writer = self.selection_writes.lock().await;
+        let generation =
+            {
+                let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+                if state.art_client.as_ref().is_none_or(|client| {
+                    client.instance != fresh.client.instance || !client.alive()
+                }) {
+                    return Err("当前连接或对局状态已变化，请重新查看。".into());
+                }
+                state
+                    .claim_manual_aux_selection(
+                        fresh.generation,
+                        fresh.client.instance,
+                        &fresh.original,
+                    )
+                    .ok_or("当前连接或对局状态已变化，请重新查看。")?
+            };
+        let target = fresh
+            .client
+            .target()
+            .map_err(|_| "客户端已断开，请重新连接。")?;
+        self.transport
+            .apply_aux_champ_select_action(&target, action)
+            .await
+            .map_err(|error| format!("客户端操作失败：{error}"))?;
+        self.refresh_soon();
+        Ok(generation)
+    }
+
+    async fn aux_charity_reroll(&self) -> Result<Value, String> {
+        let (client, generation, original) = self.aux_snapshot()?;
+        let fresh = self
+            .fresh_aux_selection(client, generation, original)
+            .await?;
+        validate_reroll(&fresh.current)?;
+        let held_champion = fresh
+            .current
+            .champion_id
+            .ok_or("当前没有已选择的英雄，无法执行慈善重随。")?;
+        let generation = self
+            .apply_aux_selection_action(&fresh, AuxChampSelectAction::Reroll)
+            .await?;
+
+        let result = match self
+            .fresh_aux_selection(
+                Arc::clone(&fresh.client),
+                generation,
+                fresh.original.clone(),
+            )
+            .await
+        {
+            Ok(after) => match validate_return_swap(&after, held_champion) {
+                Ok(()) => match self
+                    .apply_aux_selection_action(
+                        &after,
+                        AuxChampSelectAction::BenchSwap {
+                            champion_id: held_champion,
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => json!({"rerolled":true,"grabbedBack":true}),
+                    Err(error) => json!({"rerolled":true,"grabbedBack":false,"swapReason":error}),
+                },
+                Err(error) => json!({"rerolled":true,"grabbedBack":false,"swapReason":error}),
+            },
+            Err(error) => json!({"rerolled":true,"grabbedBack":false,"swapReason":error}),
+        };
+        Ok(result)
     }
 
     pub(crate) async fn resize_client_window(&self, width: u32, height: u32) -> Result<(), String> {
@@ -609,18 +1129,52 @@ impl ClientRuntime {
         Ok(data)
     }
 
-    pub(crate) fn replace_aram_options(&self, options: AramOptions) -> Result<(), &'static str> {
+    pub(crate) fn replace_room_options(
+        &self,
+        app: &AppHandle,
+        options: RoomOptions,
+    ) -> Result<(), &'static str> {
+        let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+        if state.room_flow.options != options {
+            state.room_flow.options = options;
+            let state = &mut *state;
+            state.snapshot.observe_room(&mut state.room_flow);
+            state.publish_room(app);
+            state.generation += 1;
+            self.refresh_soon();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_room_timer(
+        &self,
+        app: &AppHandle,
+        action: crate::lcu::RoomAction,
+    ) -> Result<(), &'static str> {
+        let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+        state.room_flow.cancel(action);
+        state.publish_room(app);
+        self.refresh_soon();
+        Ok(())
+    }
+
+    pub(crate) fn replace_aram_options(
+        &self,
+        app: &AppHandle,
+        options: AramOptions,
+    ) -> Result<(), &'static str> {
         let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
         state.aram_options = options;
         state.aram.cancel();
+        state.publish_draft(app);
         state.generation += 1;
         self.refresh_soon();
         Ok(())
     }
 
-    pub(crate) fn aram_paused(&self) -> Result<(u64, bool), &'static str> {
+    pub(crate) fn aram_state(&self) -> Result<(u64, Value), &'static str> {
         let state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
-        Ok((state.revision, state.aram_paused))
+        Ok((state.revision, state.draft_fields()))
     }
 
     pub(crate) fn pause_aram(&self, app: &AppHandle, paused: bool) -> Result<(), &'static str> {
@@ -629,15 +1183,7 @@ impl ClientRuntime {
             state.aram_paused = paused;
             state.aram.cancel();
             state.generation += 1;
-            state.revision += 1;
-            if let Some(main) = app.get_webview_window("main") {
-                let _ = emit(
-                    &main,
-                    "mobx-utils-main",
-                    "update-state-prop/auto-select-main:state",
-                    json!(["temporarilyDisabled", paused, {"action":"update","raw":false,"revision":state.revision}]),
-                );
-            }
+            state.publish_draft(app);
             self.refresh_soon();
         }
         Ok(())
@@ -723,7 +1269,13 @@ impl ClientRuntime {
         state.manually_disconnected = selection.is_none();
         state.art_client = None;
         state.history_access = None;
+        state.aram_paused = false;
         state.aram.reset();
+        state.publish_draft(app);
+        state
+            .room_flow
+            .observe(None, Instant::now(), epoch_millis());
+        state.publish_room(app);
         let previous = Snapshot {
             active: state.snapshot.active.take(),
             known_clients: state.snapshot.known_clients.clone(),
@@ -735,29 +1287,46 @@ impl ClientRuntime {
         Ok(())
     }
 
-    async fn read_aux_room(
-        &self,
-        target: &LcuTarget<'_>,
-        phase: &str,
-        enabled: bool,
-    ) -> (Option<Value>, Option<Value>) {
+    async fn read_aux_room(&self, target: &LcuTarget<'_>, phase: &str, enabled: bool) -> RoomReads {
         if !enabled || !matches!(phase, "Lobby" | "Matchmaking" | "ReadyCheck") {
-            return (None, None);
+            return RoomReads::default();
         }
-        let matchmaking = async {
-            if phase == "Lobby" {
+        let direct_ready = async {
+            if phase != "ReadyCheck" {
                 return None;
             }
-            optional_lcu(self.transport.read_aux_matchmaking(target))
+            optional_lcu(self.transport.read_aux_ready_check(target))
                 .await
                 .flatten()
         };
-        let (lobby, search) = join(
+        let (lobby, search_result, direct_ready) = join3(
             optional_lcu(self.transport.read_aux_lobby(target)),
-            matchmaking,
+            optional_lcu(self.transport.read_aux_matchmaking(target)),
+            direct_ready,
         )
         .await;
-        (lobby.flatten(), search)
+        let search_read = search_result.is_some();
+        let mut search = search_result.flatten();
+        if let Some(ready) = direct_ready.filter(Value::is_object) {
+            let from_search = search
+                .as_ref()
+                .and_then(|s| s["readyCheck"]["playerResponse"].as_str());
+            let from_ready = ready["playerResponse"].as_str();
+            // The dedicated ready-check is authoritative for a confirmed change of answer.
+            // A still-pending response must not replace an accepted/declined search event.
+            if matches!(from_ready, Some("Accepted" | "Declined"))
+                || (!matches!(from_search, Some("Accepted" | "Declined"))
+                    && (from_search != Some("None")
+                        || matches!(ready["state"].as_str(), Some("Invalid" | "EveryoneReady"))))
+            {
+                search.get_or_insert_with(|| json!({}))["readyCheck"] = ready;
+            }
+        }
+        RoomReads {
+            lobby: lobby.flatten(),
+            search,
+            search_read,
+        }
     }
 
     async fn sample(
@@ -775,10 +1344,14 @@ impl ClientRuntime {
         let Some(phase) = self.transport.read_phase(&target).await? else {
             return Ok(None);
         };
-        let (summoner, session, (lobby, search)) = join3(
+        let room_enabled = self
+            .state
+            .lock()
+            .is_ok_and(|s| s.room_flow.options.search || s.room_flow.options.accept);
+        let (summoner, session, reads) = join3(
             self.transport.read_current_summoner(&target),
             optional_lcu(self.transport.read_gameflow_session(&target)),
-            self.read_aux_room(&target, &phase, demand.aux),
+            self.read_aux_room(&target, &phase, demand.aux || room_enabled),
         )
         .await;
         let summoner = summoner?;
@@ -815,13 +1388,41 @@ impl ClientRuntime {
             summoner.as_ref().map(|player| player.puuid.as_str()),
             previous_chart,
         );
-        let aux_activity = demand.aux_activity(
+        let extras = if demand.aux && phase == "ChampSelect" {
+            if let Some(select) = selection.as_ref().filter(|select| select.is_object()) {
+                self.transport
+                    .read_aux_selection_extras(&target, select)
+                    .await
+                    .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let activity = AuxActivity::project_with_extras(
             &phase,
             flow_snapshot.as_ref(),
-            lobby.as_ref(),
-            search.as_ref(),
+            reads.lobby.as_ref(),
+            reads.search.as_ref(),
             selection.as_ref(),
+            extras.as_ref(),
         );
+        let room = reads.sample(
+            client.instance,
+            summoner.as_ref().map(|s| s.puuid.as_str()),
+            &activity,
+        );
+        let room_unconfirmed = matches!(activity, AuxActivity::Unconfirmed)
+            || (room.is_none()
+                && activity
+                    .view()
+                    .is_some_and(|view| view.phase != AuxPhase::ChampSelect));
+        let aux_activity = if demand.aux {
+            activity
+        } else {
+            AuxActivity::Inactive
+        };
         let gameflow_view = json!(session);
         let use_for_automation = automate && session.is_some();
         Ok(client.alive().then(|| {
@@ -832,6 +1433,8 @@ impl ClientRuntime {
                 summoner: json!(summoner),
                 companions,
                 aux_activity,
+                room,
+                room_unconfirmed,
                 shard,
             };
             let selection = if use_for_automation {
@@ -911,7 +1514,7 @@ impl ClientRuntime {
             known_clients,
             active,
         };
-        {
+        let due = {
             let Ok(mut state) = self.state.lock() else {
                 return;
             };
@@ -925,7 +1528,7 @@ impl ClientRuntime {
             {
                 state.manual_client = None;
             }
-            state.apply_snapshot(app, snapshot, candidate.cloned());
+            let due = state.apply_snapshot(app, snapshot, candidate.cloned());
             state.refresh_game_data(app);
             if state
                 .snapshot
@@ -937,12 +1540,137 @@ impl ClientRuntime {
             } else if selection.is_none() {
                 state.aram.cancel();
             }
+            due
+        };
+        if let (Some(action), Some(client)) = (due, candidate) {
+            self.dispatch_due_room(app, client, generation, action)
+                .await;
         }
         if let (Some(client), Some(options), Some((flow, select))) = (candidate, options, selection)
         {
             self.automate_aram(generation, client, &flow, &select, &options)
                 .await;
         }
+        if let Ok(mut state) = self.state.lock() {
+            state.publish_draft(app);
+        }
+    }
+
+    async fn dispatch_due_room(
+        &self,
+        app: &AppHandle,
+        client: &LocalClient,
+        generation: u64,
+        action: crate::lcu::RoomAction,
+    ) {
+        if let Err(error) = self.write_room(client, action, generation, true).await {
+            let event = if action == crate::lcu::RoomAction::AcceptReadyCheck {
+                "error-accept-match"
+            } else {
+                "error-matchmaking"
+            };
+            for label in ["main", "aux"] {
+                if let Some(window) = app.get_webview_window(label) {
+                    let _ = emit(&window, room_flow::NAMESPACE, event, json!([error]));
+                }
+            }
+        }
+        if let Ok(mut state) = self.state.lock() {
+            if state.generation == generation {
+                state.room_flow.cancel(action);
+            }
+            state.publish_room(app);
+        }
+    }
+
+    pub(crate) async fn guarded_room_write(
+        &self,
+        client: &LocalClient,
+        action: crate::lcu::RoomAction,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.write_room(client, action, generation, false).await
+    }
+
+    async fn write_room(
+        &self,
+        client: &LocalClient,
+        action: crate::lcu::RoomAction,
+        generation: u64,
+        automatic: bool,
+    ) -> Result<(), String> {
+        let _writer = self.room_writes.lock().await;
+        let same_client = |state: &RuntimeState| {
+            state.generation == generation
+                && state.art_client.as_ref().is_some_and(|verified| {
+                    verified.instance == client.instance && verified.alive()
+                })
+        };
+        let expected = {
+            let state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+            state
+                .snapshot
+                .active
+                .as_ref()
+                .filter(|_| same_client(&state))
+                .and_then(|a| a.room.clone())
+        };
+        let stale = || {
+            if automatic {
+                Ok(())
+            } else {
+                Err("房间或准备确认状态已改变，请重新查看。".to_string())
+            }
+        };
+        let Some(expected) = expected else {
+            return stale();
+        };
+        let target = client.target().map_err(|e| e.to_string())?;
+        let phase = self
+            .transport
+            .read_phase(&target)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(phase) = phase else {
+            return stale();
+        };
+        let (summoner, flow, reads) = join3(
+            self.transport.read_current_summoner(&target),
+            optional_lcu(self.transport.read_gameflow_session(&target)),
+            self.read_aux_room(&target, &phase, true),
+        )
+        .await;
+        let summoner = summoner.map_err(|e| e.to_string())?;
+        let activity = AuxActivity::project(
+            &phase,
+            flow.flatten().as_ref(),
+            reads.lobby.as_ref(),
+            reads.search.as_ref(),
+            None,
+        );
+        let fresh = reads.sample(
+            client.instance,
+            summoner.as_ref().map(|s| s.puuid.as_str()),
+            &activity,
+        );
+        let Some(fresh) = fresh.filter(|s| expected.same_room(s) && s.allows(action)) else {
+            return stale();
+        };
+        {
+            let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+            if !same_client(&state) || !state.room_flow.current(&fresh, action, automatic) {
+                return stale();
+            }
+            state.room_flow.mark_sent(action);
+        }
+        let result = self.transport.apply_room_action(&target, action).await;
+        if result.is_err() {
+            if let Ok(mut state) = self.state.lock() {
+                state.room_flow.manual_retry_after_error(&fresh, action);
+            }
+        }
+        self.refresh_soon();
+        result.map_err(|e| e.to_string())
     }
 
     async fn automate_aram(
@@ -1042,8 +1770,10 @@ impl ClientRuntime {
         let Ok(target) = client.target() else {
             return cancel(None);
         };
+        let _writer = self.selection_writes.lock().await;
         let authorized = self.state.lock().is_ok_and(|mut state| {
-            state.generation == generation && !state.aram_paused && state.aram.mark_attempted(due)
+            state.scheduled_selection_generation_is_current(generation)
+                && state.aram.mark_attempted(due)
         });
         if authorized {
             let _ = self.transport.apply_selection(&target, due.step).await;
@@ -1082,6 +1812,147 @@ async fn load_game_data(app: AppHandle, instance: ClientInstance, ticket: u64) {
     }
 }
 
+fn aux_champion_arg(value: &Value) -> Result<u32, String> {
+    let id = value
+        .as_u64()
+        .and_then(|id| u32::try_from(id).ok())
+        .filter(|&id| (1..100_000).contains(&id))
+        .ok_or("无效的英雄 ID。")?;
+    Ok(id)
+}
+
+fn aux_skin_arg(value: &Value) -> Result<u32, String> {
+    value
+        .as_u64()
+        .and_then(|id| u32::try_from(id).ok())
+        .filter(|&id| (1..1_000_000).contains(&id))
+        .ok_or_else(|| "无效的皮肤 ID。".to_owned())
+}
+
+fn require_pickable(fresh: &FreshAuxSelection, champion_id: u32) -> Result<(), String> {
+    if !fresh
+        .extras
+        .pickable_champion_ids
+        .as_ref()
+        .is_some_and(|ids| ids.contains(&champion_id))
+    {
+        return Err("无法确认该英雄当前可选，或该英雄已经被占用。".into());
+    }
+    if fresh.current.allow_subset_champion_picks
+        && fresh.current.timer_phase.as_deref() == Some("BAN_PICK")
+        && !fresh
+            .extras
+            .subset_champion_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&champion_id))
+    {
+        return Err("该英雄不在当前可选英雄子集内。".into());
+    }
+    Ok(())
+}
+
+fn validate_choose_champion(
+    fresh: &FreshAuxSelection,
+    champion_id: u32,
+    complete: bool,
+) -> Result<AuxChampSelectAction, String> {
+    if fresh.current.champion_id.is_some() {
+        return validate_bench_swap(fresh, champion_id);
+    }
+    if !fresh.current.bench_enabled || fresh.current.timer_phase.as_deref() != Some("BAN_PICK") {
+        return Err("当前阶段没有可进行的英雄选择操作。".into());
+    }
+    require_pickable(fresh, champion_id)?;
+    if !fresh.current.allow_subset_champion_picks && !fresh.current.bench.contains(&champion_id) {
+        return Err("该英雄不属于当前备战席。".into());
+    }
+    let cell = fresh
+        .current
+        .local_player_cell_id
+        .ok_or("无法确认当前玩家的选人位置。")?;
+    let action_id = first_local_pick_action(&fresh.selection, cell)
+        .ok_or("当前没有可操作的英雄选择动作，请稍后重试。")?;
+    Ok(AuxChampSelectAction::Pick {
+        action_id,
+        champion_id,
+        complete,
+    })
+}
+
+fn first_local_pick_action(selection: &Value, cell: i64) -> Option<u64> {
+    let groups = selection["actions"].as_array()?;
+    let current_group = groups.iter().filter_map(Value::as_array).find(|group| {
+        group
+            .iter()
+            .filter(|action| action.is_object())
+            .any(|action| action["completed"] != true)
+    })?;
+    current_group
+        .iter()
+        .find(|action| {
+            action["actorCellId"].as_i64() == Some(cell)
+                && action["type"] == "pick"
+                && action["completed"] != true
+        })?
+        .get("id")?
+        .as_u64()
+}
+
+fn validate_bench_swap(
+    fresh: &FreshAuxSelection,
+    champion_id: u32,
+) -> Result<AuxChampSelectAction, String> {
+    let phase = fresh.current.timer_phase.as_deref();
+    let phase_allows_swap = phase == Some("FINALIZATION")
+        || (phase == Some("BAN_PICK") && fresh.current.allow_subset_champion_picks);
+    if !fresh.current.bench_enabled || !phase_allows_swap {
+        return Err("当前阶段不允许从备战席换取英雄。".into());
+    }
+    if fresh.current.champion_id == Some(champion_id) {
+        return Err("该英雄已经是当前选择。".into());
+    }
+    require_pickable(fresh, champion_id)?;
+    let in_bench = fresh.current.bench.contains(&champion_id);
+    let in_subset = phase == Some("BAN_PICK")
+        && fresh.current.allow_subset_champion_picks
+        && fresh
+            .extras
+            .subset_champion_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&champion_id));
+    if !in_bench && !in_subset {
+        return Err("该英雄不在当前备战席或可选英雄子集中。".into());
+    }
+    Ok(AuxChampSelectAction::BenchSwap { champion_id })
+}
+
+fn validate_reroll(view: &AuxView) -> Result<(), String> {
+    if !view.allow_rerolling || view.rerolls_remaining == 0 {
+        return Err("客户端当前未明确支持重随或没有剩余次数。".into());
+    }
+    Ok(())
+}
+
+fn validate_skin(fresh: &FreshAuxSelection, skin_id: u32) -> Result<(), String> {
+    if !fresh.current.skin_selector_available || fresh.current.skin_selection_disabled {
+        return Err("当前英雄或阶段不可切换皮肤。".into());
+    }
+    let champion_id = fresh.current.champion_id.ok_or("请先选择当前英雄。")?;
+    if fresh.extras.selected_skin_champion_id != Some(champion_id)
+        || !fresh.extras.skins.iter().any(|skin| skin.id == skin_id)
+    {
+        return Err("该皮肤当前不可用，或不属于当前已选择英雄。".into());
+    }
+    Ok(())
+}
+
+fn validate_return_swap(fresh: &FreshAuxSelection, champion_id: u32) -> Result<(), String> {
+    if !fresh.current.bench.contains(&champion_id) {
+        return Err("原英雄没有进入重随后的备战席。".into());
+    }
+    validate_bench_swap(fresh, champion_id).map(|_| ())
+}
+
 pub(crate) fn reconcile_companions(app: &AppHandle) {
     let _ = app.state::<AuxWindow>().reconcile(app);
     // Opening the external RESG page can outlast OP.GG's fresh draft sample.
@@ -1102,7 +1973,13 @@ pub(crate) async fn monitor(app: AppHandle) {
         let interval = runtime
             .state
             .lock()
-            .map_or(Duration::from_secs(2), |state| state.aram.next_poll());
+            .map_or(Duration::from_secs(2), |state| {
+                let interval = state.aram.next_poll();
+                state
+                    .room_flow
+                    .next_poll(Instant::now())
+                    .map_or(interval, |room| interval.min(room))
+            });
         let _ = tokio::time::timeout(interval, runtime.wake.notified()).await;
     }
 }
@@ -1122,6 +1999,25 @@ fn publish_changes(app: &AppHandle, before: &Snapshot, after: &Snapshot, revisio
             publish_property(app, namespace, name, &key, &value, revision);
         }
     }
+}
+
+fn publish_live_fields(
+    app: &AppHandle,
+    namespace: &str,
+    fields: Value,
+    last: &mut Value,
+    revision: &mut u64,
+) {
+    if fields == *last {
+        return;
+    }
+    *revision += 1;
+    for (key, value) in fields.as_object().expect("native state properties") {
+        if last.get(key) != Some(value) {
+            publish_property(app, namespace, "state", key, value, *revision);
+        }
+    }
+    *last = fields;
 }
 
 fn publish_property(
@@ -1144,6 +2040,31 @@ fn publish_property(
 #[cfg(test)]
 mod companion_tests {
     use super::*;
+
+    #[test]
+    fn draft_pause_ends_on_exit_or_new_game_but_survives_the_initial_game_id() {
+        let snapshot = |phase: &str, id: u64| Snapshot {
+            known_clients: vec![],
+            active: Some(ActiveClient {
+                instance: ClientInstance {
+                    pid: 42,
+                    created_at: 1,
+                },
+                phase: phase.to_owned(),
+                session: json!({"gameData":{"gameId":id}}),
+                summoner: Value::Null,
+                companions: CompanionTargets::default(),
+                aux_activity: AuxActivity::Inactive,
+                room: None,
+                room_unconfirmed: false,
+                shard: None,
+            }),
+        };
+        assert!(!snapshot("ChampSelect", 0).left_draft(&snapshot("ChampSelect", 25)));
+        assert!(snapshot("ChampSelect", 25).left_draft(&snapshot("Lobby", 0)));
+        assert!(snapshot("ChampSelect", 25).left_draft(&snapshot("ChampSelect", 26)));
+        assert!(snapshot("ChampSelect", 25).left_draft(&Snapshot::default()));
+    }
 
     #[test]
     fn aux_alone_reads_selection_only_for_aram_drafts() {
@@ -1169,5 +2090,91 @@ mod companion_tests {
                 "{phase} / {mode}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod aux_action_tests {
+    use super::*;
+
+    #[test]
+    fn manual_pick_resolves_only_the_current_local_unfinished_pick_and_keeps_zero_based_ids() {
+        let current = json!({"actions":[
+            [{"id":8,"actorCellId":1,"type":"pick","completed":false}],
+            [{"id":0,"actorCellId":0,"type":"pick","completed":false}]
+        ]});
+        assert_eq!(first_local_pick_action(&current, 1), Some(8));
+        assert_eq!(first_local_pick_action(&current, 0), None);
+
+        let local_turn = json!({"actions":[
+            [{"id":0,"actorCellId":0,"type":"pick","completed":false}],
+            [{"id":1,"actorCellId":0,"type":"pick","completed":false}]
+        ]});
+        assert_eq!(first_local_pick_action(&local_turn, 0), Some(0));
+        let completed = json!({"actions":[[
+            {"id":0,"actorCellId":0,"type":"pick","completed":true}
+        ]]});
+        assert_eq!(first_local_pick_action(&completed, 0), None);
+    }
+
+    #[test]
+    fn aux_action_ids_are_typed_and_bounded_before_route_construction() {
+        assert_eq!(aux_champion_arg(&json!(57)).unwrap(), 57);
+        for value in [json!(0), json!(-1), json!(100_000), json!("57")] {
+            assert!(aux_champion_arg(&value).is_err());
+        }
+        assert_eq!(aux_skin_arg(&json!(1001)).unwrap(), 1001);
+        for value in [json!(0), json!(-1), json!(1_000_000), json!("1001")] {
+            assert!(aux_skin_arg(&value).is_err());
+        }
+    }
+
+    #[test]
+    fn manual_selection_claim_invalidates_a_queued_automatic_write() {
+        let client = Arc::new(LocalClient::fixture().expect("test process handle"));
+        let instance = client.instance;
+        let flow: GameflowSession = serde_json::from_value(json!({
+            "phase":"ChampSelect",
+            "gameData":{"queue":{"id":450,"gameMode":"ARAM"}}
+        }))
+        .unwrap();
+        let selection = json!({
+            "queueId":450,"gameId":0,"localPlayerCellId":0,
+            "myTeam":[{"cellId":0,"championId":22}]
+        });
+        let activity =
+            AuxActivity::project("ChampSelect", Some(&flow), None, None, Some(&selection));
+        let expected = activity.view().cloned().expect("projected ARAM draft");
+        let mut state = RuntimeState {
+            generation: 7,
+            snapshot: Snapshot {
+                active: Some(ActiveClient {
+                    instance,
+                    phase: "ChampSelect".into(),
+                    session: Value::Null,
+                    summoner: Value::Null,
+                    companions: CompanionTargets::default(),
+                    aux_activity: activity,
+                    room: None,
+                    room_unconfirmed: false,
+                    shard: None,
+                }),
+                ..Snapshot::default()
+            },
+            art_client: Some(client),
+            ..RuntimeState::default()
+        };
+
+        assert!(state.scheduled_selection_generation_is_current(7));
+        assert_eq!(
+            state.claim_manual_aux_selection(7, instance, &expected),
+            Some(8)
+        );
+        assert!(!state.scheduled_selection_generation_is_current(7));
+        assert!(state.scheduled_selection_generation_is_current(8));
+        assert_eq!(
+            state.claim_manual_aux_selection(7, instance, &expected),
+            None
+        );
     }
 }

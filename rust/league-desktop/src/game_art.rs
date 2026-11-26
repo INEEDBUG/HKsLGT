@@ -147,6 +147,34 @@ fn supports_bitmap(relative: &str, format: BitmapFormat) -> bool {
     if let Some(file) = relative.strip_prefix("v1/profile-icons/") {
         return format == BitmapFormat::Jpeg && numeric_icon(file, false);
     }
+    if let Some(rest) = relative.strip_prefix("ASSETS/Characters/") {
+        let mut parts = rest.split('/');
+        let (Some(_champion), Some("Skins"), Some(skin)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        if skin != "Base"
+            && !skin
+                .strip_prefix("Skin")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+        {
+            return false;
+        }
+        return match (parts.next(), parts.next(), parts.next()) {
+            (Some("Images"), Some(file), None) => {
+                format == BitmapFormat::Jpeg && file.to_ascii_lowercase().contains("_splash_")
+            }
+            (Some(file), None, None) => {
+                format == BitmapFormat::Png
+                    && file.to_ascii_lowercase().starts_with("chromapreview.")
+            }
+            _ => false,
+        };
+    }
+    if relative == "content/src/LeagueClient/GameModeAssets/KIWI/img/game-select-icon-hover.png" {
+        return true;
+    }
     relative == ARAM_BADGE
         || BITMAP_FAMILIES
             .iter()

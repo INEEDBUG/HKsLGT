@@ -7,7 +7,7 @@ use rustls::pki_types::{pem::PemObject, CertificateDer};
 use rustls::{client::Resumption, crypto::ring, ClientConfig, RootCertStore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{fmt, num::NonZeroU16, sync::Arc, time::Duration};
+use std::{fmt, future::Future, num::NonZeroU16, sync::Arc, time::Duration};
 
 // Byte-for-byte match to the CA bundled by League Akari and Riot's League Director.
 // https://github.com/RiotGames/leaguedirector/blob/main/resources/riotgames.pem
@@ -40,6 +40,7 @@ XWehWA==
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const AUX_SELECTION_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[path = "player_search.rs"]
 pub(crate) mod player_search;
@@ -132,6 +133,8 @@ pub(crate) struct GameflowSession {
 #[serde(rename_all = "camelCase")]
 struct GameflowMap {
     game_mode: Option<String>,
+    name: Option<String>,
+    assets: Option<Value>,
 }
 
 impl GameflowSession {
@@ -152,6 +155,32 @@ impl GameflowSession {
 
     pub(crate) fn queue(&self) -> Option<&GameflowQueue> {
         self.game_data.as_ref()?.queue.as_ref()
+    }
+
+    pub(crate) fn aux_queue_name(&self) -> Option<&str> {
+        self.queue()?
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+    }
+
+    pub(crate) fn aux_map_name(&self) -> Option<&str> {
+        self.map
+            .as_ref()?
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+    }
+
+    pub(crate) fn aux_mode_icon_path(&self) -> Option<String> {
+        let path = self
+            .map
+            .as_ref()?
+            .assets
+            .as_ref()?
+            .get("game-select-icon-hover")?
+            .as_str()?;
+        game_art::GameArtPath::parse(path).map(|path| path.path().to_owned())
     }
 
     fn game_mode(&self) -> Option<&str> {
@@ -190,6 +219,8 @@ pub(crate) struct GameflowGameData {
 pub(crate) struct GameflowQueue {
     pub(crate) id: Option<i32>,
     pub(crate) game_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
     #[serde(rename = "type")]
     pub(crate) queue_type: Option<String>,
 }
@@ -198,6 +229,31 @@ pub(crate) struct GameflowQueue {
 pub(crate) struct IncomingChampionTrade {
     pub(crate) id: u32,
     pub(crate) champion: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoomAction {
+    StartMatchmaking,
+    CancelMatchmaking,
+    AcceptReadyCheck,
+    DeclineReadyCheck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuxChampSelectAction {
+    Pick {
+        action_id: u64,
+        champion_id: u32,
+        complete: bool,
+    },
+    BenchSwap {
+        champion_id: u32,
+    },
+    Reroll,
+    SelectSkin {
+        skin_id: u32,
+    },
+    Leave,
 }
 
 fn incoming_champion_trade(value: &Value) -> Option<IncomingChampionTrade> {
@@ -222,11 +278,14 @@ enum ReadEndpoint {
     ChampSelect,
     AuxLobby,
     AuxMatchmaking,
+    AuxReadyCheck,
     IncomingChampionTrade,
     ChampionGrid,
     Pickable,
     Bannable,
     Subset,
+    SkinSelectorInfo,
+    SkinCarouselSkins,
     GameData(game_data::GameDataEndpoint),
 }
 
@@ -239,11 +298,14 @@ impl ReadEndpoint {
             Self::ChampSelect => "/lol-champ-select/v1/session",
             Self::AuxLobby => "/lol-lobby/v2/lobby",
             Self::AuxMatchmaking => "/lol-matchmaking/v1/search",
+            Self::AuxReadyCheck => "/lol-matchmaking/v1/ready-check",
             Self::IncomingChampionTrade => "/lol-champ-select/v1/ongoing-champion-swap",
             Self::ChampionGrid => "/lol-champ-select/v1/all-grid-champions",
             Self::Pickable => "/lol-champ-select/v1/pickable-champion-ids",
             Self::Bannable => "/lol-champ-select/v1/bannable-champion-ids",
             Self::Subset => "/lol-lobby-team-builder/champ-select/v1/subset-champion-list",
+            Self::SkinSelectorInfo => "/lol-champ-select/v1/skin-selector-info",
+            Self::SkinCarouselSkins => "/lol-champ-select/v1/skin-carousel-skins",
             Self::GameData(endpoint) => endpoint.path(),
         }
     }
@@ -255,12 +317,86 @@ impl ReadEndpoint {
             Self::GameflowSession | Self::ChampSelect => 256 * 1024,
             Self::AuxLobby => 128 * 1024,
             Self::AuxMatchmaking => 32 * 1024,
+            Self::AuxReadyCheck => 8 * 1024,
             Self::IncomingChampionTrade => 8 * 1024,
             Self::ChampionGrid => 512 * 1024,
             Self::Pickable | Self::Bannable | Self::Subset => 16 * 1024,
+            Self::SkinSelectorInfo => 8 * 1024,
+            Self::SkinCarouselSkins => 64 * 1024,
             Self::GameData(endpoint) => endpoint.body_limit(),
         }
     }
+}
+
+fn positive_u32(value: &Value) -> Option<u32> {
+    u32::try_from(value.as_u64()?).ok().filter(|&id| id > 0)
+}
+
+fn valid_ids(value: Vec<u32>) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for id in value.into_iter().filter(|&id| (1..100_000).contains(&id)) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() == 200 {
+            break;
+        }
+    }
+    ids
+}
+
+fn skin_options(rows: &Value) -> Vec<aux_activity::AuxSkin> {
+    let mut result = Vec::new();
+    let Some(rows) = rows.as_array() else {
+        return result;
+    };
+    for row in rows {
+        push_skin_option(&mut result, row, false);
+        if let Some(children) = row["childSkins"].as_array() {
+            for child in children {
+                push_skin_option(&mut result, child, true);
+                if result.len() >= 100 {
+                    return result;
+                }
+            }
+        }
+        if result.len() >= 100 {
+            break;
+        }
+    }
+    result
+}
+
+fn push_skin_option(result: &mut Vec<aux_activity::AuxSkin>, row: &Value, chroma: bool) {
+    if row["unlocked"] != true || row["disabled"] == true {
+        return;
+    }
+    let Some(id) = positive_u32(&row["id"]) else {
+        return;
+    };
+    if result.iter().any(|skin| skin.id == id) {
+        return;
+    }
+    let name = row["name"]
+        .as_str()
+        .filter(|name| !name.is_empty() && name.len() <= 160)
+        .map(str::to_owned)
+        .unwrap_or_else(|| id.to_string());
+    let preview_path = if chroma {
+        row["chromaPreviewPath"]
+            .as_str()
+            .or_else(|| row["splashPath"].as_str())
+    } else {
+        row["splashPath"].as_str()
+    }
+    .and_then(game_art::GameArtPath::parse)
+    .map(|path| path.path().to_owned());
+    result.push(aux_activity::AuxSkin {
+        id,
+        name,
+        is_chroma: chroma,
+        preview_path,
+    });
 }
 
 pub(crate) struct LcuTransport {
@@ -271,6 +407,10 @@ impl LcuTransport {
     pub(crate) fn new() -> Result<Self, LcuError> {
         let root = CertificateDer::from_pem_slice(RIOT_ROOT_CA_PEM)
             .map_err(|_| LcuError::ClientConfiguration)?;
+        Self::with_root(root)
+    }
+
+    pub(super) fn with_root(root: CertificateDer<'static>) -> Result<Self, LcuError> {
         let mut roots = RootCertStore::empty();
         roots.add(root).map_err(|_| LcuError::ClientConfiguration)?;
         let mut tls = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
@@ -352,6 +492,13 @@ impl LcuTransport {
         self.read(target, ReadEndpoint::AuxMatchmaking).await
     }
 
+    pub(crate) async fn read_aux_ready_check(
+        &self,
+        target: &LcuTarget<'_>,
+    ) -> Result<Option<Value>, LcuError> {
+        self.read(target, ReadEndpoint::AuxReadyCheck).await
+    }
+
     pub(crate) async fn read_champion_trade(
         &self,
         target: &LcuTarget<'_>,
@@ -397,6 +544,31 @@ impl LcuTransport {
         Ok(lists)
     }
 
+    pub(crate) async fn read_aux_selection_extras(
+        &self,
+        target: &LcuTarget<'_>,
+        selection: &Value,
+    ) -> Result<aux_activity::AuxSelectionExtras, LcuError> {
+        let pickable = self.read(target, ReadEndpoint::Pickable);
+        let subset = async {
+            if selection["allowSubsetChampionPicks"] == true {
+                self.read(target, ReadEndpoint::Subset).await
+            } else {
+                Ok(None)
+            }
+        };
+        let skin_info = self.read::<Value>(target, ReadEndpoint::SkinSelectorInfo);
+        let skin_rows = self.read::<Value>(target, ReadEndpoint::SkinCarouselSkins);
+        Ok(collect_aux_selection_extras(
+            pickable,
+            subset,
+            skin_info,
+            skin_rows,
+            AUX_SELECTION_READ_TIMEOUT,
+        )
+        .await)
+    }
+
     pub(crate) async fn apply_selection(
         &self,
         target: &LcuTarget<'_>,
@@ -407,6 +579,109 @@ impl LcuTransport {
             .send()
             .await
             .map_err(request_error)?;
+        if !response.status().is_success() {
+            return Err(LcuError::UnexpectedStatus(response.status().as_u16()));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_room_action(
+        &self,
+        target: &LcuTarget<'_>,
+        action: RoomAction,
+    ) -> Result<(), LcuError> {
+        self.send_action(self.room_action_request(target, action))
+            .await
+    }
+
+    fn room_action_request(&self, target: &LcuTarget<'_>, action: RoomAction) -> RequestBuilder {
+        let address = format!("https://127.0.0.1:{}", target.port);
+        let request = match action {
+            RoomAction::StartMatchmaking => self
+                .client
+                .post(format!("{address}/lol-lobby/v2/lobby/matchmaking/search")),
+            RoomAction::CancelMatchmaking => self
+                .client
+                .delete(format!("{address}/lol-lobby/v2/lobby/matchmaking/search")),
+            RoomAction::AcceptReadyCheck => self
+                .client
+                .post(format!("{address}/lol-matchmaking/v1/ready-check/accept")),
+            RoomAction::DeclineReadyCheck => self
+                .client
+                .post(format!("{address}/lol-matchmaking/v1/ready-check/decline")),
+        }
+        .basic_auth("riot", Some(target.token))
+        .timeout(Duration::from_secs(1));
+        request
+    }
+
+    pub(crate) async fn apply_aux_champ_select_action(
+        &self,
+        target: &LcuTarget<'_>,
+        action: AuxChampSelectAction,
+    ) -> Result<(), LcuError> {
+        self.send_action(self.aux_champ_select_request(target, action))
+            .await
+    }
+
+    fn aux_champ_select_request(
+        &self,
+        target: &LcuTarget<'_>,
+        action: AuxChampSelectAction,
+    ) -> RequestBuilder {
+        let address = format!("https://127.0.0.1:{}", target.port);
+        let patch_action = |action_id, body: Value| {
+            self.client
+                .patch(format!(
+                    "{address}/lol-champ-select/v1/session/actions/{action_id}"
+                ))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+        };
+        let request = match action {
+            AuxChampSelectAction::Pick {
+                action_id,
+                champion_id,
+                complete,
+            } => {
+                let body =
+                    json!({"championId": champion_id, "type": "pick", "completed": complete});
+                patch_action(action_id, body)
+            }
+            AuxChampSelectAction::BenchSwap { champion_id } => self.client.post(format!(
+                "{address}/lol-champ-select/v1/session/bench/swap/{champion_id}"
+            )),
+            AuxChampSelectAction::Reroll => self.client.post(format!(
+                "{address}/lol-champ-select/v1/session/my-selection/reroll"
+            )),
+            AuxChampSelectAction::SelectSkin { skin_id } => self
+                .client
+                .patch(format!(
+                    "{address}/lol-champ-select/v1/session/my-selection"
+                ))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(json!({"selectedSkinId":skin_id}).to_string()),
+            AuxChampSelectAction::Leave => {
+                let mut url =
+                    reqwest::Url::parse(&format!("{address}/lol-login/v1/session/invoke"))
+                        .expect("constructed from a validated loopback port");
+                url.query_pairs_mut()
+                    .append_pair("destination", "lcdsServiceProxy")
+                    .append_pair("method", "call")
+                    .append_pair("args", r#"["", "teambuilder-draft", "quitV2", ""]"#);
+                self.client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(json!({"data":["", "teambuilder-draft", "quitV2", ""]}).to_string())
+            }
+        };
+        request
+            .basic_auth("riot", Some(target.token))
+            .timeout(Duration::from_secs(1))
+    }
+
+    async fn send_action(&self, request: RequestBuilder) -> Result<(), LcuError> {
+        let response = request.send().await.map_err(request_error)?;
         if !response.status().is_success() {
             return Err(LcuError::UnexpectedStatus(response.status().as_u16()));
         }
@@ -497,6 +772,47 @@ impl LcuTransport {
     }
 }
 
+async fn optional_aux_read<F, T>(future: F, timeout: Duration) -> Option<T>
+where
+    F: Future<Output = Result<Option<T>, LcuError>>,
+{
+    tokio::time::timeout(timeout, future).await.ok()?.ok()?
+}
+
+async fn collect_aux_selection_extras<P, S, I, R>(
+    pickable: P,
+    subset: S,
+    skin_info: I,
+    skin_rows: R,
+    timeout: Duration,
+) -> aux_activity::AuxSelectionExtras
+where
+    P: Future<Output = Result<Option<Vec<u32>>, LcuError>>,
+    S: Future<Output = Result<Option<Vec<u32>>, LcuError>>,
+    I: Future<Output = Result<Option<Value>, LcuError>>,
+    R: Future<Output = Result<Option<Value>, LcuError>>,
+{
+    let (pickable, subset, skin_info, skin_rows) = futures_util::future::join4(
+        optional_aux_read(pickable, timeout),
+        optional_aux_read(subset, timeout),
+        optional_aux_read(skin_info, timeout),
+        optional_aux_read(skin_rows, timeout),
+    )
+    .await;
+    let info = skin_info.unwrap_or(Value::Null);
+    let rows = skin_rows.unwrap_or(Value::Null);
+    aux_activity::AuxSelectionExtras {
+        pickable_champion_ids: pickable.map(valid_ids),
+        subset_champion_ids: subset.map(valid_ids),
+        selected_skin_id: positive_u32(&info["selectedSkinId"]),
+        selected_skin_champion_id: positive_u32(&info["selectedChampionId"]),
+        skin_selector_available: info["showSkinSelector"] != false
+            && rows.as_array().is_some_and(|rows| !rows.is_empty()),
+        skin_selection_disabled: info["skinSelectionDisabled"] == true,
+        skins: skin_options(&rows),
+    }
+}
+
 fn request_error(error: reqwest::Error) -> LcuError {
     if error.is_timeout() {
         LcuError::Timeout
@@ -560,6 +876,18 @@ mod tests {
             (ReadEndpoint::AuxLobby, "/lol-lobby/v2/lobby"),
             (ReadEndpoint::AuxMatchmaking, "/lol-matchmaking/v1/search"),
             (
+                ReadEndpoint::AuxReadyCheck,
+                "/lol-matchmaking/v1/ready-check",
+            ),
+            (
+                ReadEndpoint::SkinSelectorInfo,
+                "/lol-champ-select/v1/skin-selector-info",
+            ),
+            (
+                ReadEndpoint::SkinCarouselSkins,
+                "/lol-champ-select/v1/skin-carousel-skins",
+            ),
+            (
                 ReadEndpoint::IncomingChampionTrade,
                 "/lol-champ-select/v1/ongoing-champion-swap",
             ),
@@ -574,6 +902,141 @@ mod tests {
             assert!(request.url().password().is_none());
             assert!(request.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
         }
+    }
+
+    #[test]
+    fn manual_aux_actions_are_fixed_to_the_known_lcu_routes_and_payloads() {
+        let transport = LcuTransport::new().unwrap();
+        let target = LcuTarget::new(31111, "fixture-only").unwrap();
+        for (action, method, path) in [
+            (
+                RoomAction::StartMatchmaking,
+                reqwest::Method::POST,
+                "/lol-lobby/v2/lobby/matchmaking/search",
+            ),
+            (
+                RoomAction::CancelMatchmaking,
+                reqwest::Method::DELETE,
+                "/lol-lobby/v2/lobby/matchmaking/search",
+            ),
+            (
+                RoomAction::AcceptReadyCheck,
+                reqwest::Method::POST,
+                "/lol-matchmaking/v1/ready-check/accept",
+            ),
+            (
+                RoomAction::DeclineReadyCheck,
+                reqwest::Method::POST,
+                "/lol-matchmaking/v1/ready-check/decline",
+            ),
+        ] {
+            let request = transport
+                .room_action_request(&target, action)
+                .build()
+                .unwrap();
+            assert_eq!(*request.method(), method);
+            assert_eq!(request.url().path(), path);
+            assert!(request.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+            assert!(request.body().is_none());
+        }
+
+        let pick = transport
+            .aux_champ_select_request(
+                &target,
+                AuxChampSelectAction::Pick {
+                    action_id: 41,
+                    champion_id: 57,
+                    complete: true,
+                },
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            pick.body().and_then(|body| body.as_bytes()),
+            Some(&br#"{"championId":57,"completed":true,"type":"pick"}"#[..])
+        );
+
+        for (action, method, path) in [
+            (
+                AuxChampSelectAction::BenchSwap { champion_id: 57 },
+                reqwest::Method::POST,
+                "/lol-champ-select/v1/session/bench/swap/57",
+            ),
+            (
+                AuxChampSelectAction::Reroll,
+                reqwest::Method::POST,
+                "/lol-champ-select/v1/session/my-selection/reroll",
+            ),
+            (
+                AuxChampSelectAction::SelectSkin { skin_id: 1001 },
+                reqwest::Method::PATCH,
+                "/lol-champ-select/v1/session/my-selection",
+            ),
+        ] {
+            let request = transport
+                .aux_champ_select_request(&target, action)
+                .build()
+                .unwrap();
+            assert_eq!(*request.method(), method);
+            assert_eq!(request.url().path(), path);
+            assert!(request.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+            if matches!(action, AuxChampSelectAction::SelectSkin { .. }) {
+                assert_eq!(
+                    request.body().and_then(|body| body.as_bytes()),
+                    Some(&br#"{"selectedSkinId":1001}"#[..])
+                );
+            } else {
+                assert!(request.body().is_none());
+            }
+        }
+
+        let leave = transport
+            .aux_champ_select_request(&target, AuxChampSelectAction::Leave)
+            .build()
+            .unwrap();
+        assert_eq!(*leave.method(), reqwest::Method::POST);
+        assert_eq!(leave.url().path(), "/lol-login/v1/session/invoke");
+        let query = leave
+            .url()
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            query.get("destination").map(|v| v.as_ref()),
+            Some("lcdsServiceProxy")
+        );
+        assert_eq!(query.get("method").map(|v| v.as_ref()), Some("call"));
+        assert_eq!(
+            query.get("args").map(|v| v.as_ref()),
+            Some(r#"["", "teambuilder-draft", "quitV2", ""]"#)
+        );
+        assert_eq!(
+            leave.body().and_then(|body| body.as_bytes()),
+            Some(&br#"{"data":["","teambuilder-draft","quitV2",""]}"#[..])
+        );
+    }
+
+    #[test]
+    fn projection_skin_options_keep_only_owned_enabled_rows_and_children() {
+        let rows = json!([
+            {"id": 1001, "name":"Unlocked", "unlocked":true, "disabled":false,
+             "splashPath":"/lol-game-data/assets/ASSETS/Characters/Ashe/Skins/Base/Images/ashe_splash_centered_0.jpg",
+             "childSkins":[
+                {"id":1002,"name":"Owned chroma","unlocked":true,"disabled":false,
+                 "chromaPreviewPath":"/lol-game-data/assets/ASSETS/Characters/Ashe/Skins/Skin62/ChromaPreview.ChromaAssetMigration.png"},
+                {"id":1003,"name":"Locked chroma","unlocked":false,"disabled":false}
+             ]},
+            {"id": 1004, "name":"Disabled", "unlocked":true, "disabled":true},
+            {"id": 1005, "name":"Locked", "unlocked":false, "disabled":false}
+        ]);
+        assert_eq!(
+            skin_options(&rows),
+            vec![
+                aux_activity::AuxSkin { id: 1001, name: "Unlocked".into(), is_chroma: false,
+                    preview_path: Some("/lol-game-data/assets/ASSETS/Characters/Ashe/Skins/Base/Images/ashe_splash_centered_0.jpg".into()) },
+                aux_activity::AuxSkin { id: 1002, name: "Owned chroma".into(), is_chroma: true,
+                    preview_path: Some("/lol-game-data/assets/ASSETS/Characters/Ashe/Skins/Skin62/ChromaPreview.ChromaAssetMigration.png".into()) },
+            ]
+        );
     }
 
     #[test]
@@ -686,6 +1149,32 @@ mod tests {
             response_has_body(StatusCode::TEMPORARY_REDIRECT),
             Err(LcuError::UnexpectedStatus(307))
         );
+    }
+
+    #[test]
+    fn optional_skin_failures_do_not_discard_pickable_ids() {
+        let extras = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(750),
+                collect_aux_selection_extras(
+                    async { Ok::<_, LcuError>(Some(vec![22, 103])) },
+                    async { Ok::<_, LcuError>(Some(vec![22, 103])) },
+                    async { Err::<Option<Value>, _>(LcuError::Transport) },
+                    async {
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        Ok::<_, LcuError>(Some(json!([])))
+                    },
+                    AUX_SELECTION_READ_TIMEOUT,
+                ),
+            )
+            .await
+            .expect("sample's 750ms read budget is sufficient")
+        });
+
+        assert_eq!(extras.pickable_champion_ids, Some(vec![22, 103]));
+        assert_eq!(extras.subset_champion_ids, Some(vec![22, 103]));
+        assert!(extras.skins.is_empty());
+        assert!(!extras.skin_selector_available);
     }
 
     #[test]

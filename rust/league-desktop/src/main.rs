@@ -28,6 +28,9 @@ mod opgg_window;
 mod aram_automation;
 
 #[cfg(windows)]
+mod room_flow;
+
+#[cfg(windows)]
 mod windows_tools;
 
 #[cfg(windows)]

@@ -5,7 +5,8 @@ param(
   [Parameter(Mandatory)][ValidatePattern('^[a-fA-F0-9]{64}$')][string]$ExecutableSha256,
   [ValidateSet('MaxGameStudio','HKsLGT')][string]$BaselineRepository = 'MaxGameStudio',
   [ValidatePattern('^\d+\.\d+\.\d+-beta\.\d+$')][string]$BaselineVersion = '1.0.0-beta.5',
-  [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$BaselineSha256 = 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4'
+  [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$BaselineSha256 = 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4',
+  [string]$SameVersionBaseline
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,43 +98,58 @@ with sqlite3.connect(sys.argv[1]) as db:
 python -c $seed $database
 Assert-Profile
 
-Run-Installer $installer $installArgs
-Assert-Install $Version
-Assert-Profile
-if ((Get-FileHash -LiteralPath $executable).Hash -ine $ExecutableSha256 -or
-    (Test-Path -LiteralPath (Join-Path $program 'resources/app.asar'))) {
-  throw 'The new binary did not match, or the old Electron payload was left behind.'
-}
-
-$stderr = Join-Path $scratch 'startup-stderr.txt'
-$process = Start-Process -FilePath $executable -WorkingDirectory $program -PassThru -RedirectStandardError $stderr
-try {
-  $until = [DateTime]::UtcNow.AddSeconds(30)
-  do {
-    if ($process.HasExited) {
-      Get-Content -LiteralPath $stderr -Tail 10 -ErrorAction SilentlyContinue | ForEach-Object {
-        $_ -replace '[A-Za-z]:\\[^"\r\n]+', '<runner-path>'
-      }
-      throw "Installed League exited with $($process.ExitCode)."
-    }
-    $process.Refresh()
-    $rendered = (Test-Path -LiteralPath (Join-Path $profile 'WebView2/EBWebView') -PathType Container) -and
-      $process.MainWindowHandle -ne [IntPtr]::Zero
-    if ($rendered) { break }
-    Start-Sleep -Milliseconds 350
-  } while ([DateTime]::UtcNow -lt $until)
-  if (!$rendered) { throw 'The upgraded desktop window and WebView2 profile were not observed.' }
+function Test-CandidateOverlay([string]$FromVersion) {
+  Run-Installer $installer $installArgs
+  Assert-Install $Version
   Assert-Profile
-} finally {
-  if (!$process.HasExited) {
-    $process.Kill()
-    if (!$process.WaitForExit(8000)) { throw 'The owned fixture process did not exit.' }
+  if ((Get-FileHash -LiteralPath $executable).Hash -ine $ExecutableSha256 -or
+      (Test-Path -LiteralPath (Join-Path $program 'resources/app.asar'))) {
+    throw 'The new binary did not match, or the old Electron payload was left behind.'
   }
+
+  $stderr = Join-Path $scratch 'startup-stderr.txt'
+  $process = Start-Process -FilePath $executable -WorkingDirectory $program -PassThru -RedirectStandardError $stderr
+  try {
+    $until = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+      if ($process.HasExited) {
+        Get-Content -LiteralPath $stderr -Tail 10 -ErrorAction SilentlyContinue | ForEach-Object {
+          $_ -replace '[A-Za-z]:\\[^"\r\n]+', '<runner-path>'
+        }
+        throw "Installed League exited with $($process.ExitCode)."
+      }
+      $process.Refresh()
+      $rendered = (Test-Path -LiteralPath (Join-Path $profile 'WebView2/EBWebView') -PathType Container) -and
+        $process.MainWindowHandle -ne [IntPtr]::Zero
+      if ($rendered) { break }
+      Start-Sleep -Milliseconds 350
+    } while ([DateTime]::UtcNow -lt $until)
+    if (!$rendered) { throw 'The upgraded desktop window and WebView2 profile were not observed.' }
+    Assert-Profile
+    $programBytes = (Get-ChildItem -LiteralPath $program -File -Recurse | Measure-Object -Property Length -Sum).Sum
+    Write-Host "HKSLGT_STARTUP_SAMPLE: installedBytes=$programBytes mainProcessWorkingSetBytes=$($process.WorkingSet64)"
+  } finally {
+    if (!$process.HasExited) {
+      $process.Kill()
+      if (!$process.WaitForExit(8000)) { throw 'The owned fixture process did not exit.' }
+    }
+  }
+
+  Run-Installer $uninstaller '/S /currentuser'
+  Assert-Profile
+  if ((Test-Path -LiteralPath $installKey) -or (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $executable)) {
+    throw 'Uninstall did not remove the upgraded program and registration.'
+  }
+  Write-Host "HKSLGT_OVERLAY_VERIFIED: $FromVersion -> $Version, custom program and data paths, settings and SQLite data preserved, startup and uninstall verified."
 }
 
-Run-Installer $uninstaller '/S /currentuser'
-Assert-Profile
-if ((Test-Path -LiteralPath $installKey) -or (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $executable)) {
-  throw 'Uninstall did not remove the upgraded program and registration.'
+Test-CandidateOverlay $baselineVersion
+if ($SameVersionBaseline) {
+  Run-Installer (Get-Item -LiteralPath $SameVersionBaseline).FullName $installArgs
+  Assert-Install $Version
+  Assert-Profile
+  if ((Get-FileHash -LiteralPath $executable).Hash -ieq $ExecutableSha256) {
+    throw 'The earlier same-version installer must contain a different executable.'
+  }
+  Test-CandidateOverlay "$Version (previous candidate)"
 }
-Write-Host "HKSLGT_OVERLAY_VERIFIED: $baselineVersion -> $Version, custom program and data paths, settings and SQLite data preserved, startup and uninstall verified."

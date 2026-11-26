@@ -73,6 +73,33 @@ fn permits_only_known_bitmap_families_and_canonicalizes_percent_escapes() {
 }
 
 #[test]
+fn accepts_local_skin_carousel_previews_without_opening_the_character_asset_tree() {
+    for suffix in [
+        "Ashe/Skins/Base/Images/ashe_splash_centered_0.jpg",
+        "Ashe/Skins/Skin01/Images/ashe_splash_centered_1.jpg",
+        "Ashe/Skins/Skin62/ChromaPreview.ChromaAssetMigration.png",
+    ] {
+        assert!(
+            GameArtPath::parse(&format!("/lol-game-data/assets/ASSETS/Characters/{suffix}"))
+                .is_some(),
+            "{suffix}"
+        );
+    }
+    for suffix in [
+        "Ashe/Config/Base/Images/ashe_splash_centered_0.jpg",
+        "Ashe/Skins/Base/private.png",
+        "Ashe/Skins/foo/ChromaPreview.png",
+        "Ashe/Skins/Skin01/Images/champion.json",
+    ] {
+        assert!(
+            GameArtPath::parse(&format!("/lol-game-data/assets/ASSETS/Characters/{suffix}"))
+                .is_none(),
+            "{suffix}"
+        );
+    }
+}
+
+#[test]
 fn rejects_traversal_other_origins_queries_unknown_formats_and_other_asset_families() {
     for path in [
         "https://127.0.0.1:31111/lol-game-data/assets/v1/champion-icons/22.png",

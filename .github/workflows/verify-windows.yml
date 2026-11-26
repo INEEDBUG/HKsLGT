@@ -8,8 +8,17 @@ on:
         required: true
         default: '1.0.0-beta.16'
         type: string
+      prior_candidate_run:
+        description: Optional workflow run containing an earlier candidate of the same version
+        required: false
+        type: string
+      prior_candidate_sha256:
+        description: Verified SHA-256 of that earlier installer (required with its run)
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -89,6 +98,23 @@ jobs:
           compression-level: 0
           retention-days: 2
 
+      - name: Fetch the earlier same-version installer for the optional overlay check
+        if: inputs.prior_candidate_run != '' || inputs.prior_candidate_sha256 != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_RUN: ${{ inputs.prior_candidate_run }}
+          PREVIOUS_DIGEST: ${{ inputs.prior_candidate_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:PREVIOUS_RUN -cnotmatch '^[1-9][0-9]*$' -or $env:PREVIOUS_DIGEST -cnotmatch '^[a-f0-9]{64}$') { throw 'Supply a run ID and verified installer SHA-256 together.' }
+          $dir = Join-Path $env:RUNNER_TEMP 'previous-candidate'
+          gh run download $env:PREVIOUS_RUN --repo $env:GITHUB_REPOSITORY --name "HKsLGT-$env:LEAGUE_VERSION-windows-x64" --dir $dir
+          $file = Join-Path $dir "MaxGameStudioLeague_$($env:LEAGUE_VERSION)_x64-setup.exe"
+          if ((Get-FileHash -LiteralPath $file).Hash -ine $env:PREVIOUS_DIGEST) { throw 'Previous candidate installer checksum mismatch.' }
+          "HKSLGT_PREVIOUS_INSTALLER=$file" >> $env:GITHUB_ENV
+
       - name: Verify the released League overlay and candidate checksum
         shell: pwsh
         run: |
@@ -102,6 +128,6 @@ jobs:
             $baseline = Get-Content -LiteralPath './packaging/windows/beta-baseline.json' -Raw | ConvertFrom-Json
             $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineVersion=$baseline.version; BaselineSha256=$baseline.installerSha256 }
           }
-          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 @baselineOptions
+          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 -SameVersionBaseline $env:HKSLGT_PREVIOUS_INSTALLER @baselineOptions
           $sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($sha -cne $proof.installerSha256 -or (Get-Content -Raw -LiteralPath "$installer.sha256").Trim() -cne "$sha *$name") { throw 'Installer checksum mismatch.' }
