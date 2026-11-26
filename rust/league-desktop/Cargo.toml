@@ -10,6 +10,7 @@ tauri-build = "=2.6.3"
 
 [dependencies]
 base64 = "=0.22.1"
+futures-util = { version = "=0.3.32", default-features = false }
 hex = "=0.4.3"
 maxgamestudio-league-core = { path = "../league-core" }
 minisign-verify = "=0.2.5"

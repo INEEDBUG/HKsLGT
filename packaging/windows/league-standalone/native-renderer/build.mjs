@@ -11,6 +11,7 @@ const IPC_SOURCE = fileURLToPath(new URL('./tauri-ipc.ts', import.meta.url))
 const GAME_SHORTCUT_MODULE = 'virtual:mgs-league-game-shortcut'
 const GAME_SHORTCUT_COMPONENT = new URL('./NativeGameShortcut.vue', import.meta.url)
 const OPGG_COMPANION = new URL('./NativeOpggCompanion.vue', import.meta.url)
+const AUX_ACTIVITY = new URL('./NativeAuxActivity.vue', import.meta.url)
 const TOOLBOX_ICON = new URL('./artwork/toolbox.ico', import.meta.url)
 const GAME_ART_ORIGIN = 'http://league-art.localhost'
 const WINDOW_ENTRIES = {
@@ -418,6 +419,7 @@ async function saveGameHotkey(shortcut: string | null) {
   ])
   const opggRoot = join(sourceRoot, 'src/renderer/src-opgg-window').replaceAll('\\', '/')
   const opggView = `${opggRoot}/opgg/OpggView.vue`
+  const auxView = join(sourceRoot, 'src/renderer/src-aux-window/views/Indicator.vue').replaceAll('\\', '/')
   const opggHtml = join(sourceRoot, 'src/renderer', WINDOW_ENTRIES.opgg).replaceAll('\\', '/')
   transforms.set(`${opggRoot}/App.vue`, [
     ["import { provideOpgg } from './opgg/context'\n", ''],
@@ -460,6 +462,12 @@ const startNativeDrag = () => nativeWindowIpc.call('window-manager-main/${label}
       if (normalized.startsWith(stagedSourcePrefix)) {
         const logo = logoComponents.get(normalized.slice(stagedSourcePrefix.length))
         if (logo) return { code: `<template>${logo}</template>`, map: null }
+      }
+      if (normalized === auxView) {
+        if (!source.includes("currentPage === 'lounge'") || !source.includes("currentPage === 'champ-select'")) {
+          throw new Error(`Unexpected auxiliary view in ${id}`)
+        }
+        return { code: readFileSync(AUX_ACTIVITY, 'utf8'), map: null }
       }
       if (normalized === opggView) {
         if (!source.includes('const { currentTab } = useOpgg()')) {

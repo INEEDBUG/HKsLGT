@@ -459,11 +459,8 @@ pub(crate) fn show_companion(
     if let Some(scope) = opgg_draft {
         app.state::<OpggWindow>().mark_shown(scope);
     } else if !inactive {
-        let scope = app
-            .state::<ClientRuntime>()
-            .aux_draft()
-            .map(|(scope, _)| scope);
-        app.state::<AuxWindow>().mark_manual_show(scope);
+        let observation = app.state::<ClientRuntime>().aux_observation();
+        app.state::<AuxWindow>().mark_manual_show(observation);
     }
     if !inactive {
         target.unminimize()?;

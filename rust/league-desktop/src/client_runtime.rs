@@ -3,16 +3,21 @@
 use crate::{
     aram_automation::{AramOptions, AramSchedule, ScheduledStep, SelectionScope},
     client_discovery::{discover_clients, ClientInstance, LocalClient},
-    desktop::{aux_window::AuxWindow, emit},
+    desktop::{
+        aux_window::{AuxObservation, AuxStage, AuxWindow},
+        emit,
+    },
     lcu::{
+        aux_activity::{self, AuxActivity, AuxPhase},
         game_art::{GameArt, GameArtPath},
         player_search::PlayerSearchShard,
         player_tab_read::PlayerTabRead,
-        GameflowSession, LcuError, LcuTransport,
+        GameflowSession, LcuError, LcuTarget, LcuTransport,
     },
     opgg_window::{self, OpggTarget, OpggWindow},
     resg_window::{ResgAction, ResgWindow},
 };
+use futures_util::future::{join, join3};
 pub(crate) use maxgamestudio_league_core::shell_preferences::LEAGUE_CLIENT as CLIENT;
 use serde_json::{json, Map, Value};
 use std::{
@@ -38,12 +43,12 @@ struct ActiveClient {
     session: Value,
     summoner: Value,
     companions: CompanionTargets,
+    aux_activity: AuxActivity,
     shard: Option<PlayerSearchShard>,
 }
 
 #[derive(Default, PartialEq)]
 struct CompanionTargets {
-    aux: Option<SelectionScope>,
     opgg: Option<OpggTarget>,
     resg: Option<ResgTarget>,
 }
@@ -58,16 +63,37 @@ struct CompanionDemand {
 impl CompanionDemand {
     fn from_app(app: &AppHandle) -> Self {
         Self {
-            aux: app.state::<AuxWindow>().auto_enabled(),
+            aux: app.state::<AuxWindow>().enabled(),
             opgg: app.state::<OpggWindow>().enabled(),
             resg: app.state::<ResgWindow>().enabled(),
         }
     }
 
-    fn reads_selection(self, game: &GameflowSession, automate: bool) -> bool {
-        game.phase == "ChampSelect"
-            && (((automate || self.aux || self.opgg) && game.is_aram())
-                || (self.resg && game.is_hextech_aram()))
+    fn reads_selection(self, phase: &str, game: Option<&GameflowSession>, automate: bool) -> bool {
+        phase == "ChampSelect"
+            && ((self.aux
+                && game
+                    .and_then(GameflowSession::aux_game_mode)
+                    .is_none_or(|mode| matches!(mode, "ARAM" | "KIWI")))
+                || game.is_some_and(|game| {
+                    ((automate || self.opgg) && game.is_aram())
+                        || (self.resg && game.is_hextech_aram())
+                }))
+    }
+
+    fn aux_activity(
+        self,
+        phase: &str,
+        game: Option<&GameflowSession>,
+        lobby: Option<&Value>,
+        search: Option<&Value>,
+        selection: Option<&Value>,
+    ) -> AuxActivity {
+        if self.aux {
+            AuxActivity::project(phase, game, lobby, search, selection)
+        } else {
+            AuxActivity::Inactive
+        }
     }
 
     fn targets(
@@ -81,9 +107,6 @@ impl CompanionDemand {
         let Some(game) = game else {
             return CompanionTargets::default();
         };
-        let aux = selection
-            .filter(|_| self.aux)
-            .and_then(|select| SelectionScope::from_sample(instance, game, select));
         let opgg = selection
             .filter(|_| self.opgg && puuid.is_some())
             .and_then(|select| OpggTarget::from_sample(instance, game, select));
@@ -115,13 +138,23 @@ impl CompanionDemand {
                 })
             };
         }
-        CompanionTargets { aux, opgg, resg }
+        CompanionTargets { opgg, resg }
     }
 }
 
 struct Sample {
     client: ActiveClient,
     selection: Option<(GameflowSession, Value)>,
+}
+
+async fn optional_lcu<T>(
+    read: impl std::future::Future<Output = Result<T, LcuError>>,
+) -> Option<T> {
+    // The optional reads must leave time to publish connected state and phase.
+    tokio::time::timeout(Duration::from_millis(750), read)
+        .await
+        .ok()
+        .and_then(Result::ok)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -168,6 +201,9 @@ impl Snapshot {
                 "session": active.map(|client| &client.session),
             })),
             (CLIENT, "summoner") => Some(json!({"me": active.map(|client| &client.summoner)})),
+            (aux_activity::NAMESPACE, "state") => Some(json!({
+                "view": active.and_then(|client| client.aux_activity.view()),
+            })),
             (opgg_window::NAMESPACE, "state") => Some(json!({
                 "draft": active.and_then(|client| client.companions.opgg).map(OpggTarget::view),
             })),
@@ -186,12 +222,13 @@ impl Snapshot {
     }
 }
 
-const PUBLIC_STATES: [(&str, &str); 6] = [
+const PUBLIC_STATES: [(&str, &str); 7] = [
     (CLIENT_DISCOVERY, "state"),
     (CLIENT, "state"),
     (CLIENT, "gameflow"),
     (CLIENT, "summoner"),
     (SGP, "state"),
+    (aux_activity::NAMESPACE, "state"),
     (opgg_window::NAMESPACE, "state"),
 ];
 
@@ -357,26 +394,39 @@ impl ClientRuntime {
             .resg
     }
 
-    pub(crate) fn aux_draft(&self) -> Option<(SelectionScope, Arc<LocalClient>)> {
-        let state = self.state.lock().ok()?;
-        let active = state.snapshot.active.as_ref()?;
-        let client = state.art_client.as_ref()?;
-        if client.instance != active.instance || !client.alive() {
-            return None;
+    pub(crate) fn aux_observation(&self) -> AuxObservation {
+        let Ok(state) = self.state.lock() else {
+            return AuxObservation::Unconfirmed;
+        };
+        let Some(active) = state.snapshot.active.as_ref() else {
+            return if state.manually_disconnected {
+                AuxObservation::Inactive
+            } else {
+                AuxObservation::Unconfirmed
+            };
+        };
+        let view = match &active.aux_activity {
+            AuxActivity::Inactive => return AuxObservation::Inactive,
+            AuxActivity::Unconfirmed => return AuxObservation::Unconfirmed,
+            AuxActivity::Active(view) => view,
+        };
+        let Some(client) = state
+            .art_client
+            .as_ref()
+            .filter(|client| client.instance == active.instance && client.alive())
+        else {
+            return AuxObservation::Unconfirmed;
+        };
+        let stage = if view.phase == AuxPhase::ChampSelect {
+            AuxStage::Selection
+        } else {
+            AuxStage::Room
+        };
+        AuxObservation::Active {
+            stage,
+            client: Arc::clone(client),
+            game_id: view.game_id,
         }
-        Some((active.companions.aux?, Arc::clone(client)))
-    }
-
-    pub(crate) fn selection_ended(&self) -> bool {
-        self.state.lock().is_ok_and(|state| {
-            state.manually_disconnected
-                || state.snapshot.active.as_ref().is_some_and(|active| {
-                    active.phase != "ChampSelect"
-                        || active.session["gameData"]["queue"]["gameMode"]
-                            .as_str()
-                            .is_some_and(|mode| !matches!(mode, "ARAM" | "KIWI"))
-                })
-        })
     }
 
     #[cfg(test)]
@@ -385,15 +435,24 @@ impl ClientRuntime {
         app: &AppHandle,
         session: GameflowSession,
         selection: Value,
+        lobby: Option<Value>,
+        search: Option<Value>,
     ) {
         const PLAYER: &str = "fixture-player";
         let client = Arc::new(LocalClient::fixture().expect("retain current fixture process"));
         let instance = client.instance;
         let demand = CompanionDemand::from_app(app);
         let selection = demand
-            .reads_selection(&session, false)
+            .reads_selection(&session.phase, Some(&session), false)
             .then_some(&selection);
         let companions = demand.targets(instance, Some(&session), selection, Some(PLAYER), None);
+        let aux_activity = demand.aux_activity(
+            &session.phase,
+            Some(&session),
+            lobby.as_ref(),
+            search.as_ref(),
+            selection,
+        );
         self.state.lock().unwrap().apply_snapshot(
             app,
             Snapshot {
@@ -404,6 +463,7 @@ impl ClientRuntime {
                     session: json!(session),
                     summoner: json!({"puuid": PLAYER}),
                     companions,
+                    aux_activity,
                     shard: None,
                 }),
             },
@@ -675,6 +735,31 @@ impl ClientRuntime {
         Ok(())
     }
 
+    async fn read_aux_room(
+        &self,
+        target: &LcuTarget<'_>,
+        phase: &str,
+        enabled: bool,
+    ) -> (Option<Value>, Option<Value>) {
+        if !enabled || !matches!(phase, "Lobby" | "Matchmaking" | "ReadyCheck") {
+            return (None, None);
+        }
+        let matchmaking = async {
+            if phase == "Lobby" {
+                return None;
+            }
+            optional_lcu(self.transport.read_aux_matchmaking(target))
+                .await
+                .flatten()
+        };
+        let (lobby, search) = join(
+            optional_lcu(self.transport.read_aux_lobby(target)),
+            matchmaking,
+        )
+        .await;
+        (lobby.flatten(), search)
+    }
+
     async fn sample(
         &self,
         client: &LocalClient,
@@ -690,12 +775,14 @@ impl ClientRuntime {
         let Some(phase) = self.transport.read_phase(&target).await? else {
             return Ok(None);
         };
-        let summoner = self.transport.read_current_summoner(&target).await?;
-        let session = self
-            .transport
-            .read_gameflow_session(&target)
-            .await?
-            .filter(|session| session.phase == phase);
+        let (summoner, session, (lobby, search)) = join3(
+            self.transport.read_current_summoner(&target),
+            optional_lcu(self.transport.read_gameflow_session(&target)),
+            self.read_aux_room(&target, &phase, demand.aux),
+        )
+        .await;
+        let summoner = summoner?;
+        let session = session.flatten().filter(|session| session.phase == phase);
         let mut shard = None;
         if let Some(player) = summoner.as_ref() {
             shard = if let Some((_, shard)) =
@@ -713,18 +800,8 @@ impl ClientRuntime {
                 .and_then(Result::ok)
             };
         }
-        let should_read = session
-            .as_ref()
-            .is_some_and(|game| demand.reads_selection(game, automate));
-        let selection = if should_read {
-            // The optional reads should leave time to publish connected state.
-            tokio::time::timeout(
-                Duration::from_millis(750),
-                self.transport.read_champ_select(&target),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
+        let selection = if demand.reads_selection(&phase, session.as_ref(), automate) {
+            optional_lcu(self.transport.read_champ_select(&target)).await
         } else {
             None
         };
@@ -735,6 +812,13 @@ impl ClientRuntime {
             summoner.as_ref().map(|player| player.puuid.as_str()),
             previous_chart,
         );
+        let aux_activity = demand.aux_activity(
+            &phase,
+            session.as_ref(),
+            lobby.as_ref(),
+            search.as_ref(),
+            selection.as_ref(),
+        );
         Ok(client.alive().then(|| {
             let client = ActiveClient {
                 instance: client.instance,
@@ -742,6 +826,7 @@ impl ClientRuntime {
                 session: json!(session),
                 summoner: json!(summoner),
                 companions,
+                aux_activity,
                 shard,
             };
             let selection = if automate {
@@ -1074,7 +1159,7 @@ mod companion_tests {
             }))
             .unwrap();
             assert_eq!(
-                demand.reads_selection(&game, false),
+                demand.reads_selection(phase, Some(&game), false),
                 expected,
                 "{phase} / {mode}"
             );

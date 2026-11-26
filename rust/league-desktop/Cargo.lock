@@ -2138,6 +2138,7 @@ name = "maxgamestudio-league-desktop"
 version = "1.0.0-beta.8"
 dependencies = [
  "base64 0.22.1",
+ "futures-util",
  "hex",
  "maxgamestudio-league-core",
  "minisign-verify",

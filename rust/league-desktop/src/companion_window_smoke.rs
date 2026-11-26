@@ -12,7 +12,7 @@ use crate::{
     resg_window::{ResgAction, ResgWindow},
 };
 use maxgamestudio_league_core::profile_database::LeagueProfileDatabase;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{fs, panic::AssertUnwindSafe, sync::Mutex, time::Duration};
 use tauri::{AppHandle, Manager, RunEvent, WebviewWindow};
 use tokio::time::Instant;
@@ -115,7 +115,7 @@ async fn exercise(app: &AppHandle) {
         set_preference(app, namespace, "autoShow", true);
     }
 
-    for (mode, phase, game) in [("ARAM", "Lobby", 7101), ("CLASSIC", "ChampSelect", 7102)] {
+    for (mode, phase, game) in [("CLASSIC", "Lobby", 7101), ("CLASSIC", "ChampSelect", 7102)] {
         sample(app, mode, phase, game, 22);
         reconcile_companions(app);
         assert_hidden(app, "aux", "No aux for unrelated phase or queue");
@@ -218,6 +218,8 @@ async fn exercise(app: &AppHandle) {
 
     set_preference(app, OPGG_WINDOW, "enabled", false);
     set_preference(app, RESG_NAMESPACE, "enabled", false);
+    check_aux_room_and_selection(app).await;
+
     let aram = || sample(app, "ARAM", "ChampSelect", 7104, 55);
     check_bundled_aux(&wait_for_popup(app, "aux", aram).await, aram).await;
     assert_hidden(app, "opgg", "aux automatically opens with OP.GG disabled");
@@ -232,37 +234,176 @@ async fn exercise(app: &AppHandle) {
         visible_window(app, "aux").is_some(),
         "automatically opened aux is visible before leaving selection"
     );
-    let lobby = || sample(app, "ARAM", "Lobby", 7104, 55);
-    lobby();
+    let started = || sample(app, "ARAM", "InProgress", 7104, 55);
+    started();
     assert!(
-        runtime.selection_ended(),
+        matches!(
+            runtime.aux_observation(),
+            super::aux_window::AuxObservation::Inactive
+        ),
         "runtime observed a confirmed end of selection"
     );
     reconcile_companions(app);
-    wait_for_close(app, "opgg", lobby).await;
-    wait_for_close(app, "aux", lobby).await;
+    wait_for_close(app, "opgg", started).await;
+    wait_for_close(app, "aux", started).await;
     println!("An ordinary ARAM draft opened its own bundled OP.GG and aux popups and leaving ChampSelect closed them");
 }
 
-fn sample(app: &AppHandle, mode: &str, phase: &str, game: u64, champion: u32) {
-    let flow: GameflowSession = serde_json::from_value(json!({
+async fn check_aux_room_and_selection(app: &AppHandle) {
+    let runtime = app.state::<ClientRuntime>();
+    let lobby = json!({
+        "gameConfig": { "queueId": 450, "gameMode": "ARAM", "isCustom": false },
+        "members": [{"puuid": "fixture-player"}, {"puuid": "fixture-teammate"}],
+    });
+    let search = json!({
+        "queueId": 450,
+        "timeInQueue": 27.9,
+        "estimatedQueueTime": 54.25,
+        "readyCheck": { "playerResponse": "Accepted" },
+    });
+    let room_phase = |phase, search| {
+        runtime.apply_companion_fixture(
+            app,
+            flow("ARAM", phase, 0),
+            Value::Null,
+            Some(lobby.clone()),
+            search,
+        );
+    };
+    let room = || room_phase("Lobby", None);
+    let aux = wait_for_popup(app, "aux", room).await;
+    check_renderer(
+        &aux,
+        r#"document.querySelector('.aux-activity[data-phase="Lobby"]') != null &&
+            document.querySelector('.party-size')?.textContent.trim() === '2'"#,
+        "aux ARAM lobby and its two players",
+        room,
+    )
+    .await;
+
+    let searching = || room_phase("Matchmaking", Some(search.clone()));
+    check_renderer(
+        &aux,
+        r#"document.querySelector('.aux-activity[data-phase="Matchmaking"]') != null &&
+            document.querySelector('.queue-time')?.textContent.includes('27')"#,
+        "aux live queue time",
+        searching,
+    )
+    .await;
+
+    let ready = || room_phase("ReadyCheck", Some(search.clone()));
+    check_renderer(
+        &aux,
+        r#"document.querySelector('.aux-activity[data-phase="ReadyCheck"]') != null &&
+            document.querySelector('.ready-response')?.textContent.trim() === 'Accepted'"#,
+        "aux accepted ready check",
+        ready,
+    )
+    .await;
+    aux.close()
+        .expect("dismiss the auxiliary panel in the room stage");
+    wait_for_close(app, "aux", ready).await;
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        ready();
+        reconcile_companions(app);
+        assert_hidden(
+            app,
+            "aux",
+            "dismissed auxiliary panel must stay closed in the room stage",
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    let select = |champion, bench| {
+        let selection = json!({
+            "queueId": 450,
+            "gameId": 0,
+            "isCustomGame": false,
+            "isSpectating": false,
+            "localPlayerCellId": 2,
+            "myTeam": [{ "cellId": 1, "championId": 55 }, { "cellId": 2, "championId": champion }],
+            "benchChampions": [{ "championId": bench }],
+            "timer": { "adjustedTimeLeftInPhase": 17810 },
+        });
+        runtime.apply_companion_fixture(app, flow("ARAM", "ChampSelect", 0), selection, None, None);
+    };
+    let initial = || select(22, 103);
+    let aux = wait_for_popup(app, "aux", initial).await;
+    check_renderer(
+        &aux,
+        r#"document.querySelector('.aux-activity[data-phase="ChampSelect"]') != null &&
+            document.querySelector('.current-champion[data-champion-id="22"]') != null &&
+            document.querySelector('.bench li[data-champion-id="103"]') != null &&
+            document.querySelector('.remaining-time')?.textContent.includes('18')"#,
+        "aux early selection with current champion, bench, and 18-second timer",
+        initial,
+    )
+    .await;
+
+    let swapped = || select(103, 22);
+    check_renderer(
+        &aux,
+        r#"document.querySelector('.current-champion[data-champion-id="103"]') != null &&
+            document.querySelector('.bench li[data-champion-id="22"]') != null"#,
+        "aux live update after a champion swap",
+        swapped,
+    )
+    .await;
+    assert_hidden(
+        app,
+        "opgg",
+        "OP.GG stays disabled in the independent aux scene",
+    );
+    assert_hidden(
+        app,
+        "resg",
+        "RESG stays disabled in the independent aux scene",
+    );
+
+    let started = || sample(app, "ARAM", "InProgress", 7105, 103);
+    started();
+    reconcile_companions(app);
+    wait_for_close(app, "aux", started).await;
+    println!("Aux opened from a synthetic ARAM lobby with live party, queue, and ready-check state; dismissing it in the room allowed a new popup in early selection with a live champion swap");
+}
+
+fn queue_id(mode: &str) -> u32 {
+    match mode {
+        "ARAM" => 450,
+        "KIWI" => 2400,
+        _ => 420,
+    }
+}
+
+fn flow(mode: &str, phase: &str, game: u64) -> GameflowSession {
+    serde_json::from_value(json!({
         "phase": phase,
         "gameData": {
             "gameId": game,
             "isCustomGame": false,
-            "queue": { "gameMode": mode, "type": "ARAM" }
+            "queue": { "id": queue_id(mode), "gameMode": mode, "type": mode }
         }
     }))
-    .unwrap();
+    .unwrap()
+}
+
+fn sample(app: &AppHandle, mode: &str, phase: &str, game: u64, champion: u32) {
     let selection = json!({
+        "queueId": queue_id(mode),
         "gameId": game,
         "isCustomGame": false,
         "isSpectating": false,
         "localPlayerCellId": 1,
         "myTeam": [{ "cellId": 1, "championId": champion }]
     });
-    app.state::<ClientRuntime>()
-        .apply_companion_fixture(app, flow, selection);
+    app.state::<ClientRuntime>().apply_companion_fixture(
+        app,
+        flow(mode, phase, game),
+        selection,
+        None,
+        None,
+    );
 }
 
 fn set_preference(app: &AppHandle, namespace: &str, key: &str, value: bool) {
@@ -382,7 +523,7 @@ async fn check_renderer(window: &WebviewWindow, script: &str, expected: &str, re
                     let _ = send.send(value);
                 }
             })
-            .expect("evaluate bundled OP.GG renderer in real WebView2");
+            .expect("evaluate bundled companion renderer in real WebView2");
         if let Ok(Ok(result)) = tokio::time::timeout(POLL, receive).await {
             if serde_json::from_str::<bool>(&result).is_ok_and(|shown| shown) {
                 return;

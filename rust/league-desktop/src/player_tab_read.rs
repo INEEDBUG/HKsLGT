@@ -6,20 +6,30 @@ use super::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 const PROFILE: &str = "/lol-summoner/v2/summoners/puuid/";
 const CURRENT_PROFILE: &str = "/lol-summoner/v1/current-summoner";
 const HISTORY: &str = "/lol-match-history/v1/products/lol/";
 const DETAIL: &str = "/lol-match-history/v1/games/";
 const TIMELINE: &str = "/lol-match-history/v1/game-timelines/";
+const RANKED: &str = "/lol-ranked/v1/ranked-stats/";
 const MAX_PAGE_SIZE: u32 = 200;
 const MAX_GAME_ID: u64 = (1 << 53) - 1;
+const MAX_RANKED_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Page {
     beg_index: u32,
     end_index: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RankedStatsShape {
+    queue_map: HashMap<String, Option<Value>>,
+    queues: Vec<Value>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +39,7 @@ pub(crate) struct PlayerTabRead(Read);
 enum Read {
     Profile(Puuid),
     Matches(Puuid, Page),
+    RankedStats(Puuid),
     Detail(u64),
     Timeline(u64),
 }
@@ -47,6 +58,9 @@ impl PlayerTabRead {
                 && page.end_index.checked_sub(page.beg_index)? < MAX_PAGE_SIZE)
                 .then_some(())?;
             return Some(Self(Read::Matches(Puuid::parse(id)?, page)));
+        }
+        if let Some(id) = path.strip_prefix(RANKED).filter(|_| params.is_null()) {
+            return Some(Self(Read::RankedStats(Puuid::parse(id)?)));
         }
         if !params.is_null() {
             return None;
@@ -106,6 +120,27 @@ fn validate_page(
     Ok(reply)
 }
 
+fn validate_ranked_stats(reply: Option<Value>) -> Result<Value, LcuError> {
+    let Some(reply) = reply else {
+        return Ok(Value::Null);
+    };
+    if reply.is_null() {
+        return Ok(Value::Null);
+    }
+    let shape: RankedStatsShape =
+        serde_json::from_value(reply.clone()).map_err(|_| LcuError::InvalidPayload)?;
+    if shape.queues.iter().any(|entry| !entry.is_object())
+        || shape
+            .queue_map
+            .values()
+            .flatten()
+            .any(|entry| !entry.is_object())
+    {
+        return Err(LcuError::InvalidPayload);
+    }
+    Ok(reply)
+}
+
 impl LcuTransport {
     async fn read_tab_profile(
         &self,
@@ -128,6 +163,21 @@ impl LcuTransport {
         Ok(data)
     }
 
+    async fn authorize_tab_player(
+        &self,
+        target: &LcuTarget<'_>,
+        player: &Puuid,
+        own: &Puuid,
+    ) -> Result<(), LcuError> {
+        if player != own {
+            let profile = self.read_tab_profile(target, player, own).await?;
+            if !may_request_history(own, player, profile["privacy"].as_str().unwrap_or("")) {
+                return Err(LcuError::AuthenticationRejected);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn read_player_tab(
         &self,
         target: &LcuTarget<'_>,
@@ -139,13 +189,7 @@ impl LcuTransport {
         match &request.0 {
             Read::Profile(player) => self.read_tab_profile(target, player, &own).await,
             Read::Matches(player, page) => {
-                if player != &own {
-                    let profile = self.read_tab_profile(target, player, &own).await?;
-                    if !may_request_history(&own, player, profile["privacy"].as_str().unwrap_or(""))
-                    {
-                        return Err(LcuError::AuthenticationRejected);
-                    }
-                }
+                self.authorize_tab_player(target, player, &own).await?;
                 let path = format!(
                     "{HISTORY}{}/matches?begIndex={}&endIndex={}",
                     player.0, page.beg_index, page.end_index,
@@ -155,6 +199,13 @@ impl LcuTransport {
                     .await?
                     .ok_or(LcuError::UnexpectedStatus(404))?;
                 validate_page(reply, page, shard)
+            }
+            Read::RankedStats(player) => {
+                self.authorize_tab_player(target, player, &own).await?;
+                let path = format!("{RANKED}{}", player.0);
+                let reply =
+                    Self::read_json(self.local_json_get(target, &path), MAX_RANKED_BYTES).await?;
+                validate_ranked_stats(reply)
             }
             Read::Detail(id) | Read::Timeline(id) => {
                 let timeline = matches!(request.0, Read::Timeline(_));
@@ -213,6 +264,70 @@ mod tests {
             "/lol-gameflow/v1/session",
         ] {
             assert!(PlayerTabRead::parse(invalid, &Value::Null).is_none());
+        }
+    }
+
+    #[test]
+    fn allowlists_pinned_ranked_stats_get_for_a_valid_puuid() {
+        let path = format!("/lol-ranked/v1/ranked-stats/{PLAYER}");
+        assert!(PlayerTabRead::parse(&path, &Value::Null).is_some());
+        assert!(PlayerTabRead::parse(&path, &json!({"puuid": PLAYER})).is_none());
+        assert!(
+            PlayerTabRead::parse("/lol-ranked/v1/current-ranked-stats", &Value::Null).is_none()
+        );
+        assert!(PlayerTabRead::parse(
+            &format!("/lol-ranked/v1/ranked-stats/../current-ranked-stats"),
+            &Value::Null
+        )
+        .is_none());
+    }
+
+    fn ranked_entry(queue_type: &str) -> Value {
+        json!({
+            "queueType": queue_type,
+            "tier": "GOLD",
+            "division": "II",
+            "highestTier": "PLATINUM",
+            "highestDivision": "IV",
+            "previousSeasonEndTier": "SILVER",
+            "previousSeasonEndDivision": "I",
+            "previousSeasonHighestTier": "GOLD",
+            "previousSeasonHighestDivision": "I",
+            "wins": 12,
+            "losses": 8,
+            "leaguePoints": 54
+        })
+    }
+
+    #[test]
+    fn validates_renderer_ranked_stats_shape_and_keeps_the_original_json() {
+        let entry = ranked_entry("RANKED_SOLO_5x5");
+        let reply = json!({
+            "queueMap": {"RANKED_SOLO_5x5": entry.clone()},
+            "queues": [entry],
+            "unconsumedUpstreamField": true
+        });
+        assert_eq!(validate_ranked_stats(Some(reply.clone())), Ok(reply));
+        assert_eq!(validate_ranked_stats(None), Ok(Value::Null));
+        assert_eq!(validate_ranked_stats(Some(Value::Null)), Ok(Value::Null));
+
+        let sparse_entry = json!({"queueType": "RANKED_SOLO_5x5", "tier": "NA"});
+        let sparse = json!({
+            "queueMap": {"RANKED_SOLO_5x5": sparse_entry.clone(), "RANKED_FLEX_SR": null},
+            "queues": [sparse_entry]
+        });
+        assert_eq!(validate_ranked_stats(Some(sparse.clone())), Ok(sparse));
+
+        for invalid in [
+            json!({"queueMap": {}, "queues": "not-an-array"}),
+            json!({"queueMap": "not-an-object", "queues": []}),
+            json!({"queueMap": {}, "queues": [null]}),
+            json!({"queueMap": {"RANKED_SOLO_5x5": "not-an-object"}, "queues": []}),
+        ] {
+            assert_eq!(
+                validate_ranked_stats(Some(invalid)),
+                Err(LcuError::InvalidPayload)
+            );
         }
     }
 

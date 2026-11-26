@@ -50,6 +50,9 @@ pub(crate) mod game_data;
 #[path = "game_art.rs"]
 pub(crate) mod game_art;
 
+#[path = "aux_activity.rs"]
+pub(crate) mod aux_activity;
+
 #[path = "player_tab_read.rs"]
 pub(crate) mod player_tab_read;
 
@@ -121,9 +124,24 @@ pub(crate) struct CurrentSummoner {
 pub(crate) struct GameflowSession {
     pub(crate) phase: String,
     pub(crate) game_data: Option<GameflowGameData>,
+    #[serde(skip_serializing)]
+    map: Option<GameflowMap>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GameflowMap {
+    game_mode: Option<String>,
 }
 
 impl GameflowSession {
+    pub(crate) fn aux_game_mode(&self) -> Option<&str> {
+        self.game_mode()
+            .filter(|mode| !mode.is_empty())
+            .or_else(|| self.map.as_ref()?.game_mode.as_deref())
+            .filter(|mode| !mode.is_empty())
+    }
+
     pub(crate) fn is_aram(&self) -> bool {
         matches!(self.game_mode(), Some("ARAM" | "KIWI"))
     }
@@ -202,6 +220,8 @@ enum ReadEndpoint {
     CurrentSummoner,
     GameflowSession,
     ChampSelect,
+    AuxLobby,
+    AuxMatchmaking,
     IncomingChampionTrade,
     ChampionGrid,
     Pickable,
@@ -217,6 +237,8 @@ impl ReadEndpoint {
             Self::CurrentSummoner => "/lol-summoner/v1/current-summoner",
             Self::GameflowSession => "/lol-gameflow/v1/session",
             Self::ChampSelect => "/lol-champ-select/v1/session",
+            Self::AuxLobby => "/lol-lobby/v2/lobby",
+            Self::AuxMatchmaking => "/lol-matchmaking/v1/search",
             Self::IncomingChampionTrade => "/lol-champ-select/v1/ongoing-champion-swap",
             Self::ChampionGrid => "/lol-champ-select/v1/all-grid-champions",
             Self::Pickable => "/lol-champ-select/v1/pickable-champion-ids",
@@ -231,6 +253,8 @@ impl ReadEndpoint {
             Self::Phase => 1024,
             Self::CurrentSummoner => 16 * 1024,
             Self::GameflowSession | Self::ChampSelect => 256 * 1024,
+            Self::AuxLobby => 128 * 1024,
+            Self::AuxMatchmaking => 32 * 1024,
             Self::IncomingChampionTrade => 8 * 1024,
             Self::ChampionGrid => 512 * 1024,
             Self::Pickable | Self::Bannable | Self::Subset => 16 * 1024,
@@ -312,6 +336,20 @@ impl LcuTransport {
             .read(target, ReadEndpoint::ChampSelect)
             .await?
             .unwrap_or(Value::Null))
+    }
+
+    pub(crate) async fn read_aux_lobby(
+        &self,
+        target: &LcuTarget<'_>,
+    ) -> Result<Option<Value>, LcuError> {
+        self.read(target, ReadEndpoint::AuxLobby).await
+    }
+
+    pub(crate) async fn read_aux_matchmaking(
+        &self,
+        target: &LcuTarget<'_>,
+    ) -> Result<Option<Value>, LcuError> {
+        self.read(target, ReadEndpoint::AuxMatchmaking).await
     }
 
     pub(crate) async fn read_champion_trade(
@@ -519,6 +557,8 @@ mod tests {
             ),
             (ReadEndpoint::GameflowSession, "/lol-gameflow/v1/session"),
             (ReadEndpoint::ChampSelect, "/lol-champ-select/v1/session"),
+            (ReadEndpoint::AuxLobby, "/lol-lobby/v2/lobby"),
+            (ReadEndpoint::AuxMatchmaking, "/lol-matchmaking/v1/search"),
             (
                 ReadEndpoint::IncomingChampionTrade,
                 "/lol-champ-select/v1/ongoing-champion-swap",
