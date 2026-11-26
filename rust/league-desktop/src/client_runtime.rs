@@ -994,10 +994,14 @@ async fn load_game_data(app: AppHandle, instance: ClientInstance, ticket: u64) {
 
 pub(crate) fn reconcile_companions(app: &AppHandle) {
     let _ = app.state::<AuxWindow>().reconcile(app);
+    // Opening the external RESG page can outlast OP.GG's fresh draft sample.
+    if let Err(_error) = app.state::<OpggWindow>().reconcile(app) {
+        #[cfg(test)]
+        eprintln!("OP.GG reconciliation: {_error}");
+    }
     let _ = app
         .state::<ResgWindow>()
         .reconcile(app, ResgAction::Synchronize);
-    let _ = app.state::<OpggWindow>().reconcile(app);
 }
 
 pub(crate) async fn monitor(app: AppHandle) {

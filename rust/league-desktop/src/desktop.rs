@@ -449,8 +449,9 @@ pub(crate) fn show_companion(
             Some(current) if current.scope == expected => {}
             Some(_) => return Err("当前大乱斗选人已变更。".into()),
             None => {
-                let _ = close_opgg_companion(app);
-                return Err("当前大乱斗选人已结束。".into());
+                // Cold WebView2 creation can outlast the snapshot's freshness window.
+                // Keep the new window hidden until the monitor refreshes or closes it.
+                return Err("大乱斗选人数据需要刷新。".into());
             }
         }
     }

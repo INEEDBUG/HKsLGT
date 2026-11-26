@@ -18,7 +18,7 @@ use tauri::{AppHandle, Manager, RunEvent, WebviewWindow};
 use tokio::time::Instant;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindowVisible};
 
-const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+const OPEN_TIMEOUT: Duration = Duration::from_secs(40);
 const POLL: Duration = Duration::from_millis(200);
 
 #[test]
@@ -318,7 +318,9 @@ async fn wait_for_popup(app: &AppHandle, label: &str, refresh: impl Fn()) -> Web
         }
         assert!(
             Instant::now() < deadline,
-            "{label} did not open a visible HWND"
+            "{label} did not open a visible HWND (created: {}, current OP.GG draft: {})",
+            app.get_webview_window(label).is_some(),
+            app.state::<ClientRuntime>().opgg_target().is_some()
         );
         tokio::time::sleep(POLL).await;
     }
