@@ -11,6 +11,12 @@ on:
         description: Beta version to verify
         required: true
         type: string
+      installation_scope:
+        description: Installation scope for both the previous and candidate installers
+        required: true
+        type: choice
+        options: [currentuser, allusers]
+        default: currentuser
 
 permissions:
   actions: read
@@ -23,6 +29,7 @@ jobs:
     env:
       SOURCE_RUN: ${{ inputs.run_id }}
       LEAGUE_VERSION: ${{ inputs.version }}
+      INSTALL_SCOPE: ${{ inputs.installation_scope }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -39,6 +46,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           if ($env:SOURCE_RUN -cnotmatch '^[1-9][0-9]*$' -or $env:LEAGUE_VERSION -cnotmatch '^\d+\.\d+\.\d+-beta\.\d+$') { throw 'Expected a numeric build run and a Beta version.' }
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
           $endpoint = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/runs/$env:SOURCE_RUN"
@@ -47,12 +55,17 @@ jobs:
           $compiled = @($jobs.jobs | ForEach-Object steps | Where-Object {
             $_.name -ceq 'Run locked Rust tests and build the Windows x64 installer' -and $_.conclusion -eq 'success'
           })
-          if ($build.head_branch -cne 'main' -or $compiled.Count -ne 1) { throw 'The requested package did not come from a successful HKsLGT main build step.' }
           $directory = Join-Path $env:RUNNER_TEMP 'hkslgt-candidate'
           $proof = Get-Content -LiteralPath (Join-Path $directory 'provenance.json') -Raw | ConvertFrom-Json
           $name = "MaxGameStudioLeague_$($env:LEAGUE_VERSION)_x64-setup.exe"
           $installer = Join-Path $directory $name
           $sha = (Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant()
+          # This verification branch also tests the already delivered Mini installer by immutable digest.
+          $miniCandidate = $env:INSTALL_SCOPE -ceq 'allusers' -and $env:GITHUB_REF_NAME -ceq 'codex/hkslgt-machine-overlay' -and
+            $env:SOURCE_RUN -ceq '45874646047' -and $build.conclusion -ceq 'success' -and
+            $build.head_sha -ceq '5d9c2015272433f5ced212b9f8ef5fea0bdeb56a' -and
+            $sha -ceq '46e17ca65b51db89ab4e0b4fe804054dc6c0df051bf2d5a9f57e71d514354fe8'
+          if (($build.head_branch -cne 'main' -and !$miniCandidate) -or $compiled.Count -ne 1) { throw 'The requested package has no trusted successful build.' }
           if ($proof.sourceCommit -cne $build.head_sha -or $proof.workflowRunId -ne $env:SOURCE_RUN -or
               $proof.version -cne $env:LEAGUE_VERSION -or $proof.installer -cne $name -or $proof.installerSha256 -cne $sha) {
             throw 'Candidate provenance or SHA-256 did not match the selected build.'
@@ -60,7 +73,16 @@ jobs:
           $baselineOptions = @{}
           if (Test-Path -LiteralPath './packaging/windows/beta-baseline.json') {
             $baseline = Get-Content -LiteralPath './packaging/windows/beta-baseline.json' -Raw | ConvertFrom-Json
-            ./packaging/windows/prepare-beta-baseline.ps1 -Version $baseline.version -InstallerSha256 $baseline.installerSha256 -CatalogPath (Join-Path $env:RUNNER_TEMP 'hkslgt-predecessor-catalog.json')
+            if ($env:INSTALL_SCOPE -eq 'currentuser') {
+              ./packaging/windows/prepare-beta-baseline.ps1 -Version $baseline.version -InstallerSha256 $baseline.installerSha256 -CatalogPath (Join-Path $env:RUNNER_TEMP 'hkslgt-predecessor-catalog.json')
+            }
             $baselineOptions = @{ BaselineRepository='HKsLGT'; BaselineVersion=$baseline.version; BaselineSha256=$baseline.installerSha256 }
           }
-          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 @baselineOptions
+          if ($miniCandidate) {
+            $old = Join-Path $env:RUNNER_TEMP 'previous-private-preview'
+            gh run download 45864067463 --repo $env:GITHUB_REPOSITORY --name "HKsLGT-$env:LEAGUE_VERSION-windows-x64" --dir $old
+            $oldInstaller = Join-Path $old $name
+            if ((Get-FileHash -LiteralPath $oldInstaller).Hash -ine '62217a18d26e24655fe22ba7ecfbfa24fe8628340c2b7d3faaf8cfc3cd5b7492') { throw 'Previous private preview digest mismatch.' }
+            $baselineOptions.SameVersionBaseline = $oldInstaller
+          }
+          ./packaging/windows/tests/verify-hkslgt-overlay.ps1 -Installer $installer -Version $env:LEAGUE_VERSION -ExecutableSha256 $proof.executableSha256 -InstallScope $env:INSTALL_SCOPE @baselineOptions

@@ -6,7 +6,8 @@ param(
   [ValidateSet('MaxGameStudio','HKsLGT')][string]$BaselineRepository = 'MaxGameStudio',
   [ValidatePattern('^\d+\.\d+\.\d+-beta\.\d+$')][string]$BaselineVersion = '1.0.0-beta.5',
   [ValidatePattern('^[a-fA-F0-9]{64}$')][string]$BaselineSha256 = 'd34f181569e03f8079e48d9a080706eadd6943205a08f3669d5f1f802ec1c3d4',
-  [string]$SameVersionBaseline
+  [string]$SameVersionBaseline,
+  [ValidateSet('currentuser','allusers')][string]$InstallScope = 'currentuser'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,18 +50,23 @@ if ((Split-Path -Leaf $installer) -cne "MaxGameStudioLeague_$($Version)_x64-setu
   throw 'Unexpected League installer name.'
 }
 $identity = 'b1d9ab62-895c-574e-a779-36d3f2ee3611'
-$installKey = "HKCU:\Software\$identity"
-$uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity"
+$hive = if ($InstallScope -eq 'allusers') { 'HKLM:' } else { 'HKCU:' }
+$installKey = "$hive\Software\$identity"
+$uninstallKey = "$hive\Software\Microsoft\Windows\CurrentVersion\Uninstall\$identity"
 $control = Join-Path $env:APPDATA 'MaxGameStudioLeague'
 $scratch = Join-Path $env:RUNNER_TEMP ('hkslgt-overlay-' + [Guid]::NewGuid().ToString('n'))
-$program = Join-Path $scratch 'Program'
+$program = if ($InstallScope -eq 'allusers') {
+  Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'MaxGameStudioLeagueToolbox'
+} else {
+  Join-Path $scratch 'Program'
+}
 $profile = Join-Path $scratch 'Profile'
 $executable = Join-Path $program 'MaxGameStudioLeagueToolbox.exe'
 $uninstaller = Join-Path $program 'Uninstall MaxGameStudioLeagueToolbox.exe'
 $locator = Join-Path $control 'data-location.txt'
 $settings = Join-Path $profile 'base-config.json'
 $database = Join-Path $profile 'LeagueAkari.db'
-if (@($installKey, $uninstallKey, $control, $scratch | Where-Object { Test-Path -LiteralPath $_ }).Count) {
+if (@($installKey, $uninstallKey, $control, $scratch, $program | Where-Object { Test-Path -LiteralPath $_ }).Count) {
   throw 'Expected a clean disposable fixture.'
 }
 $null = New-Item -ItemType Directory -Path $scratch, $profile, $control
@@ -72,7 +78,7 @@ if ((Get-FileHash -LiteralPath $baseline).Hash -ine $BaselineSha256) {
   throw 'The released League baseline installer did not match its pinned SHA-256.'
 }
 
-$installArgs = "/S /currentuser /D=$program"
+$installArgs = "/S /$InstallScope /D=$program"
 Run-Installer $baseline $installArgs
 Assert-Install $baselineVersion
 if ($BaselineRepository -eq 'MaxGameStudio' -and !(Test-Path -LiteralPath (Join-Path $program 'resources/app.asar') -PathType Leaf)) {
@@ -135,12 +141,12 @@ function Test-CandidateOverlay([string]$FromVersion) {
     }
   }
 
-  Run-Installer $uninstaller '/S /currentuser'
+  Run-Installer $uninstaller "/S /$InstallScope"
   Assert-Profile
   if ((Test-Path -LiteralPath $installKey) -or (Test-Path -LiteralPath $uninstallKey) -or (Test-Path -LiteralPath $executable)) {
     throw 'Uninstall did not remove the upgraded program and registration.'
   }
-  Write-Host "HKSLGT_OVERLAY_VERIFIED: $FromVersion -> $Version, custom program and data paths, settings and SQLite data preserved, startup and uninstall verified."
+  Write-Host "HKSLGT_OVERLAY_VERIFIED: $FromVersion -> $Version, scope=$InstallScope, registered program location, custom data path, settings and SQLite data preserved, startup and uninstall verified."
 }
 
 Test-CandidateOverlay $baselineVersion
