@@ -171,7 +171,7 @@ const quickSettings = computed(() => [
   },
   {
     id: 'aux', label: english.value ? 'Compact companion window' : '小型辅助面板',
-    description: english.value ? 'Open quick tools in champion select.' : '选人时显示常用操作。',
+    description: english.value ? 'Show ARAM lobby and champion select status.' : '显示大乱斗房间和选人状态。',
     value: aux.settings.enabled,
     apply: (value: boolean) => windows.auxWindow.setEnabled(value)
   }
