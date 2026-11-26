@@ -50,6 +50,9 @@ pub(crate) mod game_data;
 #[path = "game_art.rs"]
 pub(crate) mod game_art;
 
+#[path = "player_tab_read.rs"]
+pub(crate) mod player_tab_read;
+
 /// Borrow the port and token that trusted desktop discovery verified for the same client generation.
 pub(crate) struct LcuTarget<'a> {
     port: NonZeroU16,
@@ -277,6 +280,16 @@ impl LcuTransport {
         self.read(target, ReadEndpoint::Phase).await
     }
 
+    pub(crate) async fn read_window_zoom(&self, target: &LcuTarget<'_>) -> Result<f64, LcuError> {
+        let zoom = Self::read_json(self.local_json_get(target, "/riotclient/zoom-scale"), 64)
+            .await?
+            .unwrap_or(1.0);
+        (0.15..=4.0)
+            .contains(&zoom)
+            .then_some(zoom)
+            .ok_or(LcuError::InvalidPayload)
+    }
+
     pub(crate) async fn read_current_summoner(
         &self,
         target: &LcuTarget<'_>,
@@ -408,8 +421,12 @@ impl LcuTransport {
     }
 
     fn request(&self, target: &LcuTarget<'_>, read: ReadEndpoint) -> RequestBuilder {
+        self.local_json_get(target, read.path())
+    }
+
+    fn local_json_get(&self, target: &LcuTarget<'_>, path: &str) -> RequestBuilder {
         self.client
-            .get(format!("https://127.0.0.1:{}{}", target.port, read.path()))
+            .get(format!("https://127.0.0.1:{}{path}", target.port))
             .header(reqwest::header::ACCEPT, "application/json")
             .basic_auth("riot", Some(target.token))
     }
@@ -419,15 +436,17 @@ impl LcuTransport {
         target: &LcuTarget<'_>,
         read: ReadEndpoint,
     ) -> Result<Option<T>, LcuError> {
-        let mut response = self
-            .request(target, read)
-            .send()
-            .await
-            .map_err(request_error)?;
+        Self::read_json(self.request(target, read), read.body_limit()).await
+    }
+
+    async fn read_json<T: DeserializeOwned>(
+        request: RequestBuilder,
+        limit: usize,
+    ) -> Result<Option<T>, LcuError> {
+        let mut response = request.send().await.map_err(request_error)?;
         if !response_has_body(response.status())? {
             return Ok(None);
         }
-        let limit = read.body_limit();
         let declared_length = response.content_length().unwrap_or_default();
         if declared_length > limit as u64 {
             return Err(LcuError::ResponseTooLarge);

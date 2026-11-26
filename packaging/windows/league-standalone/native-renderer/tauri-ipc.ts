@@ -1,3 +1,5 @@
+import type { AxiosAdapter } from 'axios'
+
 interface LeagueTauriApi {
   core: {
     invoke<T>(
@@ -25,6 +27,17 @@ function getTauriApi() {
 
 export async function invokeLeagueCall<T>(namespace: string, method: string, ...args: unknown[]) {
   return getTauriApi().core.invoke<T>('league_call', { namespace, method, args })
+}
+
+export const leaguePlayerRead: AxiosAdapter = async (config) => {
+  if (config.method !== 'get' || !config.url) {
+    throw new Error('此客户端操作暂不可用。')
+  }
+  const result = await invokeLeagueCall<
+    { success: true; data: unknown } | { success: false; error: { message: string } }
+  >('player-history-main', 'read', config.url, config.params ?? null)
+  if (!result.success) throw new Error(result.error.message)
+  return { data: result.data, status: 200, statusText: 'OK', headers: {}, config }
 }
 
 export async function listenLeagueEvents(

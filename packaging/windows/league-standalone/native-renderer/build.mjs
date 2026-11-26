@@ -8,6 +8,8 @@ import { artworkModule, logoComponents, useMitIconImports } from './artwork.mjs'
 
 const IPC_MODULE = 'virtual:mgs-league-native-ipc'
 const IPC_SOURCE = fileURLToPath(new URL('./tauri-ipc.ts', import.meta.url))
+const GAME_SHORTCUT_MODULE = 'virtual:mgs-league-game-shortcut'
+const GAME_SHORTCUT_COMPONENT = new URL('./NativeGameShortcut.vue', import.meta.url)
 const OPGG_COMPANION = new URL('./NativeOpggCompanion.vue', import.meta.url)
 const TOOLBOX_ICON = new URL('./artwork/toolbox.ico', import.meta.url)
 const GAME_ART_ORIGIN = 'http://league-art.localhost'
@@ -271,7 +273,148 @@ function nativeRendererPlugin(sourceRoot) {
   ])
   const client = join(sourceRoot, 'src/renderer-shared/shards/league-client/index.ts')
   transforms.set(client.replaceAll('\\', '/'), [
+    ["import axios from 'axios'", `import axios from 'axios'\nimport { leaguePlayerRead } from '${IPC_MODULE}'`],
+    ["import axiosRetry from 'axios-retry'\n", ''],
+    ["import { AkariProtocolRenderer } from '../akari-protocol'\n", ''],
+    ["baseURL: 'akari://league-client',\n    adapter: 'fetch',", 'adapter: leaguePlayerRead,'],
+    ['    @Dep(AkariProtocolRenderer) private readonly _akariProtocol: AkariProtocolRenderer,\n', ''],
+    ['    axiosRetry(this.httpClient, {\n      retries: 2\n    })\n    this._akariProtocol.installProxyRequestCancellation(this.httpClient)\n\n', ''],
     ["return new URL(uri, 'akari://league-client').href", `return new URL(uri, '${GAME_ART_ORIGIN}').href`]
+  ])
+  const playerTab = `${stagedSourcePrefix}src/renderer/src-main-window/views/player-tabs/components/player-tab`
+  transforms.set(`${playerTab}/data/match-history.ts`, [
+    ['  page: Ref<MatchHistoryPage | null>\n', '  page: Ref<MatchHistoryPage | null>\n  loadFailed: Ref<boolean>\n'],
+    ['  const page = ref<MatchHistoryPage | null>(null)', '  const page = ref<MatchHistoryPage | null>(null)\n  const loadFailed = ref(false)'],
+    ['    lcuCompleteGameQueue.clear()\n    isLoading.value = true\n\n    params = {', '    lcuCompleteGameQueue.clear()\n    isLoading.value = true\n    loadFailed.value = false\n\n    params = {'],
+    ['    isLoading.value = true\n    const collectPageQueryParams = {', '    isLoading.value = true\n    loadFailed.value = false\n    const collectPageQueryParams = {'],
+    ['      log.error(componentName, error)\n    } finally {\n      isLoading.value = false\n      collectState.value = null', '      loadFailed.value = true\n      log.error(componentName, error)\n    } finally {\n      isLoading.value = false\n      collectState.value = null'],
+    ['        loadReplayMetadata(page.value.games)\n      }\n    } catch (error: any) {', '        void loadReplayMetadata(page.value.games).catch((error) => log.warn(componentName, error))\n      }\n    } catch (error: any) {\n      loadFailed.value = true'],
+    ['            loadReplayMetadata(gamesToAppend)', '            void loadReplayMetadata(gamesToAppend).catch((error) => log.warn(componentName, error))'],
+    ['            loadReplayMetadata(completedGamesToAppend)', '            void loadReplayMetadata(completedGamesToAppend).catch((error) => log.warn(componentName, error))'],
+    ['  provide(MatchHistoryContextKey, {\n    page,', '  provide(MatchHistoryContextKey, {\n    page,\n    loadFailed,'],
+    ['  return {\n    page,\n    filteredGames,', '  return {\n    page,\n    loadFailed,\n    filteredGames,']
+  ])
+  transforms.set(`${playerTab}/widgets/MatchHistoryList.vue`, [
+    ['const {\n  page,\n  isLoading,', 'const {\n  page,\n  loadFailed,\n  isLoading,'],
+    [`          rootHasCombinator
+            ? t('playerTabs.profile.noFilteredMatchHistory')
+            : t('playerTabs.profile.noMatchHistory')`, `          loadFailed
+            ? t('playerTabs.profile.failedToLoadMatchHistoryTitle')
+            : t(rootHasCombinator ? 'playerTabs.profile.noFilteredMatchHistory' : 'playerTabs.profile.noMatchHistory')`],
+    ["        t('playerTabs.profile.noMatchHistory')\n", "        loadFailed ? t('playerTabs.profile.failedToLoadMatchHistoryTitle') : t('playerTabs.profile.noMatchHistory')\n"]
+  ])
+  const clientToolsDirectory = `${stagedSourcePrefix}src/renderer/src-main-window/views/toolkit/client`
+  const clientToolkit = `${clientToolsDirectory}/Client.vue`
+  const gameShortcut = `${clientToolsDirectory}/NativeGameShortcut.vue`
+  transforms.set(clientToolkit, [
+    ["import { resolveNativeInputStatus } from '@renderer-shared/shards/app-common/native-input-status'", "import { AkariIpcRenderer } from '@renderer-shared/shards/ipc'"],
+    ["import { computed, reactive, ref, toRaw, useTemplateRef, watch } from 'vue'", "import { computed, onMounted, reactive, ref, toRaw, useTemplateRef, watch } from 'vue'"],
+    ["import ShortcutSelector from '@main-window/components/ShortcutSelector.vue'", `import NativeGameShortcut from '${GAME_SHORTCUT_MODULE}'`],
+    [`            :label="
+              nativeInputRequiresElevation
+                ? t('toolkit.client.gameClient.terminateGameClientWithShortcut.labelAdminRequired')
+                : t('toolkit.client.gameClient.terminateGameClientWithShortcut.label')
+            "`, `            :label="t('toolkit.client.gameClient.terminateGameClientWithShortcut.label')"`],
+    [`            :label="
+              nativeInputRequiresElevation
+                ? t('toolkit.client.gameClient.terminateShortcut.labelAdminRequired')
+                : t('toolkit.client.gameClient.terminateShortcut.label')
+            "`, `            :label="t('toolkit.client.gameClient.terminateShortcut.label')"`],
+    [`            :label="
+              adjustWindowRequiresElevation
+                ? t('toolkit.client.leagueClientUx.fixWindowMethodAOptions.labelAdminRequired')
+                : t('toolkit.client.leagueClientUx.fixWindowMethodAOptions.label')
+            "`, `            :label="t('toolkit.client.leagueClientUx.fixWindowMethodAOptions.label')"`],
+    [`            <ShortcutSelector
+              :target-id="GameClientRenderer.SHORTCUT_ID_TERMINATE_GAME_CLIENT"
+              :shortcut-id="gcs.settings.terminateShortcut"
+              @update:shortcut-id="(v) => gc.setTerminateShortcut(v)"
+            />`, `            <NativeGameShortcut
+              :shortcut-id="gcs.settings.terminateShortcut"
+              :disabled="!gameHotkeyAvailable"
+              :english="english"
+              :save="saveGameHotkey"
+            />`],
+    [`                {{ t('toolkit.client.gameClient.terminateGameClientWithShortcut.description') }}
+              </div>
+              <div
+                v-if="!as.nativeSupport.nativeInput.available"`, `                {{ t('toolkit.client.gameClient.terminateGameClientWithShortcut.description') }}
+              </div>
+              <div
+                v-if="!as.nativeSupport.nativeInput.available || gameHotkeyError"`],
+    ['@update:value="(v) => gc.setTerminateGameClientWithShortcut(v)"', '@update:value="toggleGameHotkey"'],
+    [`const nativeInputStatus = computed(() =>
+  resolveNativeInputStatus(as.nativeSupport.nativeInput, as.isElevated)
+)
+const nativeInputRequiresElevation = computed(
+  () => nativeInputStatus.value === 'requires-elevation'
+)
+const nativeInputStatusDescription = computed(() => {
+  switch (nativeInputStatus.value) {
+    case 'unsupported-platform':
+      return t('toolkit.client.gameClient.windowsOnlyNativeAddon')
+    case 'requires-elevation':
+      return t('toolkit.client.gameClient.nativeAddonRequiresAdministrator')
+    case 'initialization-failed':
+      return t('toolkit.client.gameClient.nativeAddonInitializationFailed')
+    default:
+      return ''
+  }
+})
+
+const adjustWindowRequirement = computed(() => as.nativeSupport.adjustLeagueClientWindowSize)
+const adjustWindowRequiresElevation = computed(
+  () => adjustWindowRequirement.value.requiresElevation && !as.isElevated
+)
+const adjustLeagueClientWindowSizeSupported = computed(
+  () => adjustWindowRequirement.value.available
+)
+const adjustWindowStatusDescription = computed(() =>
+  adjustWindowRequirement.value.availableOnCurrentPlatform
+    ? t('toolkit.client.leagueClientUx.fixWindowMethodAOptions.requiresAdministrator')
+    : t('toolkit.client.leagueClientUx.fixWindowMethodAOptions.unsupportedCurrentPlatform')
+)`, `const english = computed(() => as.settings.locale !== 'zh-CN')
+const gameHotkeyAvailable = ref(false)
+const gameHotkeyError = ref<string | null>(null)
+const adjustLeagueClientWindowSizeSupported = ref(false)
+const nativeInputStatusDescription = computed(() =>
+  gameHotkeyError.value ||
+    (english.value ? 'The Windows shortcut could not be initialized.' : 'Windows 快捷键未能初始化。')
+)
+const adjustWindowStatusDescription = computed(() =>
+  english.value ? 'Window resize is unavailable.' : '暂时无法调整客户端窗口。'
+)
+const ipc = useInstance(AkariIpcRenderer)
+onMounted(async () => {
+  try {
+    const tools = await ipc.call<{ gameHotkey: boolean; gameHotkeyError?: string; resize: boolean }>('windows-tools-main', 'capabilities')
+    gameHotkeyAvailable.value = tools.gameHotkey
+    gameHotkeyError.value = tools.gameHotkeyError ?? null
+    adjustLeagueClientWindowSizeSupported.value = tools.resize
+  } catch {
+    message.error(english.value ? 'Could not load Windows tools.' : '无法读取 Windows 工具状态。')
+  }
+})
+
+async function toggleGameHotkey(enabled: boolean) {
+  try {
+    await gc.setTerminateGameClientWithShortcut(enabled)
+    gameHotkeyError.value = null
+  } catch (error: any) {
+    message.error(error.message ?? String(error))
+  }
+}
+
+async function saveGameHotkey(shortcut: string | null) {
+  await gc.setTerminateShortcut(shortcut)
+  gameHotkeyError.value = null
+}`],
+    [`        await lc.fixWindowMethodA(toRaw(fixWindowMethodAOptions))
+      } catch (error) {
+        console.error(error)`, `        await lc.fixWindowMethodA(toRaw(fixWindowMethodAOptions))
+        message.success(english.value ? 'Client window resized.' : '已调整客户端窗口。')
+      } catch (error: any) {
+        message.error(error.message ?? String(error))`]
   ])
   const opggRoot = join(sourceRoot, 'src/renderer/src-opgg-window').replaceAll('\\', '/')
   const opggView = `${opggRoot}/opgg/OpggView.vue`
@@ -305,8 +448,10 @@ const startNativeDrag = () => nativeWindowIpc.call('window-manager-main/${label}
     enforce: 'pre',
     resolveId(id) {
       if (id === IPC_MODULE) return IPC_SOURCE
+      if (id === GAME_SHORTCUT_MODULE) return gameShortcut
     },
     load(id) {
+      if (id === gameShortcut) return readFileSync(GAME_SHORTCUT_COMPONENT, 'utf8')
       const file = id.split('?', 1)[0].replaceAll('\\', '/')
       if (file.startsWith(stagedSourcePrefix)) return artworkModule(file.slice(stagedSourcePrefix.length))
     },
@@ -328,6 +473,13 @@ const startNativeDrag = () => nativeWindowIpc.call('window-manager-main/${label}
         code = code.replaceAll('\r\n', '\n')
         for (const [anchor, replacement] of patches) {
           code = replaceOnce(code, anchor, replacement, id)
+        }
+        if (normalized === clientToolkit) {
+          const nativeGate = 'as.nativeSupport.nativeInput.available'
+          if (code.split(nativeGate).length !== 6) {
+            throw new Error(`Unexpected native input gates in ${id}`)
+          }
+          code = code.replaceAll(nativeGate, 'gameHotkeyAvailable')
         }
       }
       if (code !== source) return { code, map: null }

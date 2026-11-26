@@ -1,10 +1,11 @@
 use crate::{
     client_launchers::{self, Launcher},
     client_runtime::{client_from_view, monitor, ClientRuntime, CLIENT},
-    lcu::game_art::GameArtPath,
+    lcu::{game_art::GameArtPath, player_tab_read::PlayerTabRead},
     opgg_window::{self, OpggPreferences, OpggWindow},
     profile::DesktopProfile,
     resg_window::{self, ResgAction, ResgWindow},
+    windows_tools::{terminate_foreground_game, GameClientHotkey},
 };
 use maxgamestudio_league_core::{
     profile_database::PROFILE_DB_VERSION,
@@ -14,7 +15,10 @@ use maxgamestudio_league_core::{
 use serde_json::{json, Map, Value};
 use std::{
     io,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 use tauri::{
     menu::{Menu, MenuItem},
@@ -35,6 +39,12 @@ use bootstrap::{AUTO_SELECT, AUX_WINDOW, OPGG_WINDOW};
 const SYNC_NAMESPACE: &str = "mobx-utils-main";
 const LOCAL_WINDOWS: [&str; 3] = ["main", "aux", "opgg"];
 const GAME_ART_SCHEME: &str = "league-art";
+const GAME_CLIENT: &str = "game-client-main";
+
+struct GameTools {
+    hotkey: Option<GameClientHotkey>,
+    startup_error: Mutex<Option<String>>,
+}
 
 fn serve_game_art(
     context: tauri::UriSchemeContext<'_, tauri::Wry>,
@@ -177,6 +187,70 @@ fn response(result: Result<Value, impl std::fmt::Display>) -> Value {
         Ok(data) => json!({"success":true,"data":data}),
         Err(error) => json!({"success":false,"error":{"message":error.to_string()}}),
     }
+}
+
+fn write_game_shortcut(app: &AppHandle, key: &str, value: &Value) -> Result<Value, String> {
+    let tools = app
+        .try_state::<GameTools>()
+        .ok_or("Windows 快捷键未能初始化。")?;
+    let hotkey = tools.hotkey.as_ref().ok_or("Windows 快捷键未能初始化。")?;
+    let profile = app.state::<DesktopProfile>();
+    let db = profile.database.lock().map_err(|_| "数据库连接中断。")?;
+    let old = bootstrap::initial_state(&db, GAME_CLIENT, "settings")
+        .map_err(|error| error.to_string())?
+        .expect("known game client settings");
+    let old_enabled = old["terminateGameClientWithShortcut"] == true;
+    let old_shortcut = old["terminateShortcut"].as_str();
+    let (shortcut, enabled) = match key {
+        "terminateGameClientWithShortcut" => (
+            old_shortcut,
+            value.as_bool().ok_or("无效的游戏快捷键设置。")?,
+        ),
+        "terminateShortcut" => {
+            if !value.is_null() && !value.is_string() {
+                return Err("无效的快捷键组合。".into());
+            }
+            if old_enabled && value.is_null() {
+                return Err("请先关闭结束游戏快捷键，再清除组合。".into());
+            }
+            (value.as_str(), old_enabled)
+        }
+        _ => return Err("未知的游戏快捷键设置。".into()),
+    };
+    if enabled && shortcut.is_none() {
+        return Err("请先选择结束游戏快捷键。".into());
+    }
+    if let ("terminateShortcut", Some(shortcut)) = (key, shortcut) {
+        GameClientHotkey::validate(shortcut)?;
+    }
+    hotkey.replace(shortcut, enabled)?;
+    let saved = bootstrap::backend_pref(GAME_CLIENT, key)
+        .expect("known game client preference")
+        .write(&db, value);
+    if let Err(error) = saved {
+        if hotkey.replace(old_shortcut, old_enabled).is_err() {
+            let _ = hotkey.replace(None, false);
+        }
+        return Err(error.to_string());
+    }
+    let revision = app.state::<SettingsRevision>().next();
+    drop(db);
+    if let Ok(mut startup_error) = tools.startup_error.lock() {
+        *startup_error = None;
+    }
+    settings_changed(app, GAME_CLIENT, key, value, revision).map_err(|error| error.to_string())?;
+    Ok(Value::Null)
+}
+
+async fn set_game_shortcut(app: &AppHandle, key: String, value: Value) -> Result<Value, String> {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let result = write_game_shortcut(&handle, &key, &value);
+        let _ = reply.send(result);
+    })
+    .map_err(|_| "Windows 快捷键暂时不可用。")?;
+    receive.await.map_err(|_| "无法更新 Windows 快捷键。")?
 }
 
 async fn update_call(
@@ -409,6 +483,49 @@ async fn league_call(
         let input = input.as_str().ok_or("缺少玩家名称和标签。")?;
         return Ok(response(client.lookup_player(shard, input).await));
     }
+    if namespace == "player-history-main" && method == "read" && window.label() == "main" {
+        let [path, params] = args.as_slice() else {
+            return Err("无效的战绩读取请求。".into());
+        };
+        let Some(request) = path
+            .as_str()
+            .and_then(|path| PlayerTabRead::parse(path, params))
+        else {
+            return Ok(response(Err("此客户端操作暂不可用。")));
+        };
+        return Ok(response(client.read_player_tab(request).await));
+    }
+    if namespace == CLIENT && method == "fixWindowMethodA" && window.label() == "main" {
+        let [options] = args.as_slice() else {
+            return Err("缺少客户端窗口尺寸。".into());
+        };
+        let dimension = |key: &str| {
+            options[key]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or("请输入有效的窗口尺寸。")
+        };
+        let result = client
+            .resize_client_window(dimension("baseWidth")?, dimension("baseHeight")?)
+            .await
+            .map(|()| Value::Null);
+        return Ok(response(result));
+    }
+    if namespace == "setting-factory-main"
+        && method == "set"
+        && args.first().and_then(Value::as_str) == Some(GAME_CLIENT)
+    {
+        let [_, key, value] = args.as_slice() else {
+            return Err("缺少游戏快捷键设置。".into());
+        };
+        if window.label() != "main" {
+            return Err("只能从主窗修改游戏快捷键。".into());
+        }
+        let key = key.as_str().ok_or("缺少设置名称。")?;
+        return Ok(response(
+            set_game_shortcut(window.app_handle(), key.to_owned(), value.clone()).await,
+        ));
+    }
     if namespace == SYNC_NAMESPACE
         && method == "subscribeAndGetInitialState"
         && matches!(
@@ -436,6 +553,14 @@ async fn league_call(
     let invoke = || -> Result<Value, Box<dyn std::error::Error>> {
         match (namespace.as_str(), method.as_str()) {
             (APP_COMMON, "getVersion") => Ok(json!(app.package_info().version.to_string())),
+            ("windows-tools-main", "capabilities") if window.label() == "main" => {
+                let tools = app.try_state::<GameTools>();
+                Ok(json!({
+                    "gameHotkey": tools.as_ref().is_some_and(|tools| tools.hotkey.is_some()),
+                    "gameHotkeyError": tools.as_ref().and_then(|tools| tools.startup_error.lock().ok()?.clone()),
+                    "resize": true,
+                }))
+            }
             (APP_COMMON, "openUserDataDir") => {
                 window
                     .opener()
@@ -755,7 +880,7 @@ pub(crate) fn run() -> tauri::Result<()> {
             let profile = DesktopProfile::prepare(app)
                 .map_err(|error| io::Error::other(format!("工具箱数据无法准备。{error}")))?;
             let webview_directory = profile.webview_directory()?;
-            let (auto_connect, resg_preferences, aram_options, opgg_preferences) = {
+            let (auto_connect, resg_preferences, aram_options, opgg_preferences, game_shortcut) = {
                 let db = profile
                     .database
                     .lock()
@@ -776,6 +901,9 @@ pub(crate) fn run() -> tauri::Result<()> {
                         enabled: opgg["enabled"] == true,
                         auto_show: opgg["autoShow"] == true,
                     },
+                    bootstrap::initial_state(&db, GAME_CLIENT, "settings")
+                        .map_err(io::Error::other)?
+                        .expect("known game client settings"),
                 )
             };
             app.manage(profile);
@@ -812,14 +940,36 @@ pub(crate) fn run() -> tauri::Result<()> {
                 tray = tray.icon(icon.clone());
             }
             tray.build(app)?;
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("main-window.html".into()))
-                .data_directory(webview_directory)
-                .title("英雄联盟工具箱")
-                .inner_size(1500.0, 860.0)
-                .min_inner_size(840.0, 600.0)
-                .decorations(false)
-                .on_navigation(bundled_navigation)
-                .build()?;
+            let main =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("main-window.html".into()))
+                    .data_directory(webview_directory)
+                    .title("英雄联盟工具箱")
+                    .inner_size(1500.0, 860.0)
+                    .min_inner_size(840.0, 600.0)
+                    .decorations(false)
+                    .on_navigation(bundled_navigation)
+                    .build()?;
+            let handle = app.handle().clone();
+            let game_hotkey = main.hwnd().ok().and_then(|hwnd| {
+                GameClientHotkey::attach(hwnd.0, move || {
+                    if let Some(client) = handle.state::<ClientRuntime>().selected_client() {
+                        let _ = terminate_foreground_game(&client);
+                    }
+                })
+                .ok()
+            });
+            let startup_error = game_hotkey.as_ref().and_then(|hotkey| {
+                hotkey
+                    .replace(
+                        game_shortcut["terminateShortcut"].as_str(),
+                        game_shortcut["terminateGameClientWithShortcut"] == true,
+                    )
+                    .err()
+            });
+            app.manage(GameTools {
+                hotkey: game_hotkey,
+                startup_error: Mutex::new(startup_error),
+            });
             tauri::async_runtime::spawn(monitor(app.handle().clone()));
             Ok(())
         })

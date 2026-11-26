@@ -28,6 +28,9 @@ mod opgg_window;
 mod aram_automation;
 
 #[cfg(windows)]
+mod windows_tools;
+
+#[cfg(windows)]
 fn main() {
     if let Err(error) = desktop::run() {
         rfd::MessageDialog::new()

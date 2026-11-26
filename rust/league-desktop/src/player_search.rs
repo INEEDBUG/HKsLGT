@@ -107,11 +107,11 @@ struct SummonerResponse {
     account_id: Value,
 }
 
-#[derive(PartialEq, Eq)]
-struct Puuid(String);
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Puuid(pub(super) String);
 
 impl Puuid {
-    fn parse(value: &str) -> Option<Self> {
+    pub(super) fn parse(value: &str) -> Option<Self> {
         if value.len() != 36
             || value == "00000000-0000-0000-0000-000000000000"
             || !value.bytes().enumerate().all(|(index, byte)| {
@@ -170,7 +170,9 @@ fn shard_from_chat(
     shard_from_platform(&chat.platform_id)
 }
 
-fn shard_from_platform(platform_id: &str) -> Result<PlayerSearchShard, PlayerSearchError> {
+pub(super) fn shard_from_platform(
+    platform_id: &str,
+) -> Result<PlayerSearchShard, PlayerSearchError> {
     let platform = platform_id.trim().to_ascii_uppercase();
     let tencent = platform.strip_prefix("TENCENT_").or_else(|| {
         // Bare PBE is Riot's test environment. Tencent PBE needs the Tencent prefix.
@@ -243,7 +245,7 @@ fn project_summoner(
     })
 }
 
-fn may_request_history(own: &Puuid, target: &Puuid, privacy: &str) -> bool {
+pub(super) fn may_request_history(own: &Puuid, target: &Puuid, privacy: &str) -> bool {
     own == target || privacy == "PUBLIC"
 }
 

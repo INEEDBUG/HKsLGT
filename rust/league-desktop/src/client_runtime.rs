@@ -7,6 +7,7 @@ use crate::{
     lcu::{
         game_art::{GameArt, GameArtPath},
         player_search::PlayerSearchShard,
+        player_tab_read::PlayerTabRead,
         GameflowSession, LcuError, LcuTransport,
     },
     opgg_window::{self, OpggTarget, OpggWindow},
@@ -15,6 +16,7 @@ use crate::{
 pub(crate) use maxgamestudio_league_core::shell_preferences::LEAGUE_CLIENT as CLIENT;
 use serde_json::{json, Map, Value};
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -132,7 +134,21 @@ struct RuntimeState {
     data_task: Option<tauri::async_runtime::JoinHandle<()>>,
     game_data: Map<String, Value>,
     art_client: Option<Arc<LocalClient>>,
+    history_access: Option<HistoryAccess>,
     opgg_checked_at: Option<Instant>,
+}
+
+#[derive(PartialEq, Eq)]
+struct HistorySession {
+    instance: ClientInstance,
+    generation: u64,
+    player: String,
+    shard: PlayerSearchShard,
+}
+
+struct HistoryAccess {
+    session: HistorySession,
+    game_ids: VecDeque<u64>,
 }
 
 pub(crate) fn empty_game_data() -> Value {
@@ -143,6 +159,16 @@ pub(crate) fn empty_game_data() -> Value {
 }
 
 impl RuntimeState {
+    fn history_session(&self) -> Option<HistorySession> {
+        let active = self.snapshot.active.as_ref()?;
+        Some(HistorySession {
+            instance: active.instance,
+            generation: self.generation,
+            player: active.summoner["puuid"].as_str()?.to_owned(),
+            shard: active.shard.clone()?,
+        })
+    }
+
     fn verified_opgg_target(&self) -> Option<OpggTarget> {
         let active = self.snapshot.active.as_ref()?;
         let target = active.opgg?;
@@ -268,6 +294,105 @@ impl ClientRuntime {
             .then_some(art)
     }
 
+    pub(crate) fn selected_client(&self) -> Option<Arc<LocalClient>> {
+        let state = self.state.lock().ok()?;
+        let active = state.snapshot.active.as_ref()?;
+        let client = state.art_client.as_ref()?;
+        (client.instance == active.instance && client.alive()).then(|| Arc::clone(client))
+    }
+
+    pub(crate) async fn resize_client_window(&self, width: u32, height: u32) -> Result<(), String> {
+        let client = self.selected_client().ok_or("请先连接英雄联盟客户端。")?;
+        let target = client.target().map_err(|_| "客户端已断开，请重新连接。")?;
+        let zoom = self
+            .transport
+            .read_window_zoom(&target)
+            .await
+            .map_err(|_| "无法读取客户端窗口缩放比例，请重试。")?;
+        if self
+            .selected_client()
+            .is_none_or(|current| current.instance != client.instance)
+        {
+            return Err("当前连接的客户端已变更，请重试。".into());
+        }
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::windows_tools::resize_league_client_window(&client, width, height, zoom)
+        })
+        .await
+        .map_err(|_| "窗口调整失败。".to_owned())?
+    }
+
+    pub(crate) async fn read_player_tab(&self, request: PlayerTabRead) -> Result<Value, String> {
+        let (session, client) = {
+            let state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+            let session = state
+                .history_session()
+                .ok_or("请启动并登录英雄联盟客户端。")?;
+            let client = state
+                .art_client
+                .as_ref()
+                .filter(|client| client.instance == session.instance)
+                .ok_or("客户端已断开，请重新连接。")?;
+            if request.detail_id().is_some_and(|id| {
+                !state.history_access.as_ref().is_some_and(|history| {
+                    history.session == session && history.game_ids.contains(&id)
+                })
+            }) {
+                return Err("请先加载这场对局所在的战绩页。".into());
+            }
+            (session, Arc::clone(client))
+        };
+        let target = client.target().map_err(|_| "客户端已断开，请重新连接。")?;
+        let data = self
+            .transport
+            .read_player_tab(&target, &request, &session.player, &session.shard)
+            .await
+            .map_err(|error| match error {
+                LcuError::Timeout => "读取战绩或玩家资料超时，请重试。",
+                LcuError::AuthenticationRejected => "当前客户端拒绝读取该玩家的资料或战绩。",
+                LcuError::UnexpectedStatus(404) => "客户端没有返回所请求的资料，请稍后重试。",
+                _ => "读取战绩或玩家资料失败，请检查客户端连接后重试。",
+            })?;
+        // The active snapshot is polled. Verify the session at the LCU again
+        // before showing results or admitting detail IDs from the page.
+        if !self
+            .transport
+            .read_player_search_shard(&target, &session.player)
+            .await
+            .is_ok_and(|observed| observed == session.shard)
+        {
+            return Err("无法确认当前登录账号，请重新查询。".into());
+        }
+        let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
+        if !client.alive() || state.history_session().as_ref() != Some(&session) {
+            return Err("客户端或登录账号已变更，请重新查询。".into());
+        }
+        if request.is_page() {
+            if state
+                .history_access
+                .as_ref()
+                .is_none_or(|history| history.session != session)
+            {
+                state.history_access = Some(HistoryAccess {
+                    session,
+                    game_ids: VecDeque::new(),
+                });
+            }
+            let history = state.history_access.as_mut().expect("active history");
+            if let Some(games) = data["games"]["games"].as_array() {
+                for id in games.iter().filter_map(|game| game["gameId"].as_u64()) {
+                    if !history.game_ids.contains(&id) {
+                        history.game_ids.push_back(id);
+                    }
+                }
+                history
+                    .game_ids
+                    .drain(..history.game_ids.len().saturating_sub(1000));
+            }
+        }
+        Ok(data)
+    }
+
     pub(crate) fn replace_aram_options(&self, options: AramOptions) -> Result<(), &'static str> {
         let mut state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
         state.aram_options = options;
@@ -381,6 +506,7 @@ impl ClientRuntime {
         state.manual_client = selection;
         state.manually_disconnected = selection.is_none();
         state.art_client = None;
+        state.history_access = None;
         state.aram.reset();
         let previous = Snapshot {
             active: state.snapshot.active.take(),

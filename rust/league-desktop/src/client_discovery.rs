@@ -59,6 +59,7 @@ pub(crate) struct ClientInstance {
 pub(crate) struct LocalClient {
     process: OwnedHandle,
     pub(crate) instance: ClientInstance,
+    install_directory: PathBuf,
     port: u16,
     token: String,
 }
@@ -76,6 +77,143 @@ impl LocalClient {
         }
         LcuTarget::new(self.port, &self.token)
     }
+
+    pub(crate) fn verified_ux_process(&self) -> io::Result<VerifiedLeagueUx> {
+        if !self.alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "League 客户端已退出。",
+            ));
+        }
+        let session = session_id(std::process::id()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "无法验证 Windows 会话。")
+        })?;
+        let (_, ui_pids) = client_process_ids()?;
+        let install_directory: Vec<_> = self.install_directory.as_os_str().encode_wide().collect();
+        let mut matches = Vec::new();
+        for pid in ui_pids {
+            if session_id(pid) != Some(session) {
+                continue;
+            }
+            let Some((process, image, created_at)) = open_named_process(pid, UI_PROCESS) else {
+                continue;
+            };
+            if created_at < self.instance.created_at {
+                continue;
+            }
+            let Some(parent) = image.parent() else {
+                continue;
+            };
+            let parent: Vec<_> = parent.as_os_str().encode_wide().collect();
+            if unsafe {
+                CompareStringOrdinal(
+                    install_directory.as_ptr(),
+                    install_directory.len() as i32,
+                    parent.as_ptr(),
+                    parent.len() as i32,
+                    1,
+                )
+            } != CSTR_EQUAL
+            {
+                continue;
+            }
+            let Some(args) = ux_launch::LaunchDetails::read(&process) else {
+                continue;
+            };
+            if args.owner_pid != self.instance.pid
+                || args.port != self.port
+                || args.token != self.token
+                || unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } != WAIT_TIMEOUT
+            {
+                continue;
+            }
+            matches.push(VerifiedLeagueUx {
+                process,
+                pid,
+                created_at,
+            });
+        }
+        if matches.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                if matches.is_empty() {
+                    "未找到与当前客户端对应的 LeagueClientUx 窗口进程。"
+                } else {
+                    "发现多个与当前客户端对应的 LeagueClientUx 进程。"
+                },
+            ));
+        }
+        Ok(matches.pop().expect("one verified League UX process"))
+    }
+
+    pub(crate) fn game_executable_candidates(&self) -> io::Result<Vec<PathBuf>> {
+        collect_game_executable_candidates(&self.install_directory)
+    }
+}
+
+pub(crate) struct VerifiedLeagueUx {
+    process: OwnedHandle,
+    pub(crate) pid: u32,
+    pub(crate) created_at: u64,
+}
+
+impl VerifiedLeagueUx {
+    pub(crate) fn alive(&self) -> bool {
+        unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) == WAIT_TIMEOUT }
+    }
+}
+
+pub(crate) fn path_eq(left: &Path, right: &Path) -> bool {
+    let left: Vec<_> = left.as_os_str().encode_wide().collect();
+    let right: Vec<_> = right.as_os_str().encode_wide().collect();
+    unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            left.len() as i32,
+            right.as_ptr(),
+            right.len() as i32,
+            1,
+        ) == CSTR_EQUAL
+    }
+}
+
+fn collect_game_executable_candidates(install_directory: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut roots = vec![install_directory.to_owned()];
+    if install_directory
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("LeagueClient"))
+    {
+        if let Some(parent) = install_directory.parent() {
+            roots.push(parent.to_owned());
+        }
+    }
+    let mut paths = Vec::new();
+    for root in roots {
+        let game_dir = root.join("Game");
+        let executable = game_dir.join("League of Legends.exe");
+        let (Ok(dir_metadata), Ok(exe_metadata)) = (
+            fs::symlink_metadata(&game_dir),
+            fs::symlink_metadata(&executable),
+        ) else {
+            continue;
+        };
+        if !dir_metadata.is_dir()
+            || dir_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || !exe_metadata.is_file()
+            || exe_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            continue;
+        }
+        if let Ok(path) = fs::canonicalize(executable) {
+            if !paths
+                .iter()
+                .any(|existing: &PathBuf| path_eq(existing, &path))
+            {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(paths)
 }
 
 pub(crate) fn discover_clients() -> io::Result<Vec<LocalClient>> {
@@ -101,7 +239,7 @@ pub(crate) fn discover_clients() -> io::Result<Vec<LocalClient>> {
     Ok(clients)
 }
 
-fn session_id(pid: u32) -> Option<u32> {
+pub(crate) fn session_id(pid: u32) -> Option<u32> {
     let mut session = 0;
     (unsafe { ProcessIdToSessionId(pid, &mut session) } != 0).then_some(session)
 }
@@ -138,6 +276,56 @@ fn client_process_ids() -> io::Result<(Vec<u32>, Vec<u32>)> {
         return Err(error);
     }
     Ok((pids, ui_pids))
+}
+
+#[cfg(test)]
+mod game_executable_tests {
+    use super::collect_game_executable_candidates;
+    use std::{fs, path::Path};
+
+    fn create_game_layout(root: &Path) {
+        fs::create_dir_all(root.join("Game")).unwrap();
+        fs::write(
+            root.join("Game/League of Legends.exe"),
+            b"synthetic executable",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolves_only_the_selected_client_game_layouts() {
+        let base = tempfile::tempdir().unwrap();
+        let direct = base.path().join("direct-install");
+        let nested_client = base.path().join("nested-install/LeagueClient");
+        create_game_layout(&direct);
+        create_game_layout(nested_client.parent().unwrap());
+
+        let direct_candidates = collect_game_executable_candidates(&direct).unwrap();
+        assert_eq!(
+            direct_candidates,
+            vec![fs::canonicalize(direct.join("Game/League of Legends.exe")).unwrap()]
+        );
+
+        let nested_candidates = collect_game_executable_candidates(&nested_client).unwrap();
+        assert_eq!(
+            nested_candidates,
+            vec![fs::canonicalize(
+                nested_client
+                    .parent()
+                    .unwrap()
+                    .join("Game/League of Legends.exe")
+            )
+            .unwrap()]
+        );
+    }
+
+    #[test]
+    fn missing_game_executable_produces_no_candidate() {
+        let base = tempfile::tempdir().unwrap();
+        assert!(collect_game_executable_candidates(base.path())
+            .unwrap()
+            .is_empty());
+    }
 }
 
 fn process_name_matches(name: &[u16], expected: &str) -> bool {
@@ -250,6 +438,7 @@ fn read_client(
     let result = LocalClient {
         process,
         instance,
+        install_directory: install_directory.to_owned(),
         port,
         token,
     };
