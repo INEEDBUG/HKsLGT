@@ -1,10 +1,10 @@
 {
   "product": "maxgamestudio-league",
   "channel": "beta",
-  "version": "1.0.0-beta.14",
-  "tag": "league-v1.0.0-beta.14",
-  "url": "https://github.com/INEEDBUG/HKsLGT/releases/download/league-v1.0.0-beta.14/MaxGameStudioLeague_1.0.0-beta.14_x64-setup.exe",
-  "sha256": "0fbb81800434d8a1a35ab99c58b20e5eea5c852f8cf8b36f17b036ca15c03dab",
-  "size": 7093484,
-  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSTHZIdDh1OFpNdnhiYm81d2pNQitTQmFwdUFtd2RtVnpSMks0TmRlUG5WOHZISjFPdlhmS0FPYzIzVHJFK1lvL2xNNS91R3pQL3RmZjVONjhxT0QwSzhZVlV3dGNqRlFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NzA1ODk2CWZpbGU6TWF4R2FtZVN0dWRpb0xlYWd1ZV8xLjAuMC1iZXRhLjE0X3g2NC1zZXR1cC5leGUKZGdDSFlwellyM05ac2VMek1VbXFWMXZhSnJQN0loU2tab3lnR3RVdlZmcUJUOVlYUEt1dmhyYlpjeHFxekRUZVM5MFJvbkN2bXFOVTF2SWp3THlsQkE9PQo="
+  "version": "1.0.0-beta.15",
+  "tag": "league-v1.0.0-beta.15",
+  "url": "https://github.com/INEEDBUG/HKsLGT/releases/download/league-v1.0.0-beta.15/MaxGameStudioLeague_1.0.0-beta.15_x64-setup.exe",
+  "sha256": "28e50443614767241709f304bbad1c0f48ab014dee73a98ed53ca52771710011",
+  "size": 7108424,
+  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSTHZIdDh1OFpNdjljM0haSytYY0p5QmJYdFhnUDA0L0RRSnZ1SnUvWHFFYTNodEx0YXpyTERtVFlvdnpRUmxuVi9IMkl3dHdKeDVab01QQ1hzTlhqbEtWek5CdDY0eFFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1NzA5OTc0CWZpbGU6TWF4R2FtZVN0dWRpb0xlYWd1ZV8xLjAuMC1iZXRhLjE1X3g2NC1zZXR1cC5leGUKNkUwMnF4WThRNnc2WXltTzBnWndXTDVGTUp1YTJORnhSL0hVQUJiRWgxQ1Q3VW9Bd00xaXJKV3lRM1NpTjZLV2RtRGdTTElZbU90SGExMG4wR3dkRGc9PQo="
 }
