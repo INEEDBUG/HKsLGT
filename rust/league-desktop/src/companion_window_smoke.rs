@@ -27,6 +27,8 @@ mod champ_select_event_smoke;
 mod champion_picker_smoke;
 #[path = "history_responsiveness_smoke.rs"]
 mod history_responsiveness_smoke;
+#[path = "consecutive_kiwi_smoke.rs"]
+mod consecutive_kiwi_smoke;
 #[path = "mini_optional_actions_smoke.rs"]
 mod mini_optional_actions_smoke;
 #[path = "partial_kiwi_selection_smoke.rs"]
@@ -147,7 +149,13 @@ async fn exercise(app: &AppHandle) {
         partial_kiwi_selection_smoke::check(app).await;
         return;
     }
-    if std::env::var_os("HKSLGT_HISTORY_ONLY").is_some() {
+    if consecutive_kiwi_smoke::requested() {
+        consecutive_kiwi_smoke::check(app).await;
+        return;
+    }
+    if std::env::var_os("HKSLGT_HISTORY_ONLY").is_some()
+        || std::env::var_os("HKSLGT_HISTORY_CDN_ONLY").is_some()
+    {
         history_responsiveness_smoke::check(app).await;
         return;
     }
@@ -347,8 +355,12 @@ async fn check_aux_room_and_selection(app: &AppHandle) {
     click(&aux, "[data-setting='autoMatchmakingEnabled']").await;
     check_renderer(
         &aux,
-        r#"document.querySelector('.aux-activity[data-phase="Matchmaking"]') != null &&
-                     document.querySelector('.queue-time')?.textContent.includes('27.9 s / 54.3 s')"#,
+        r#"(() => {
+            const caption = document.querySelector('.queue-time')?.textContent ?? '';
+            const elapsed = Number.parseFloat(caption);
+            return !!document.querySelector('.aux-activity[data-phase="Matchmaking"]') &&
+                elapsed >= 27.9 && elapsed < 32 && caption.includes('/ 54.3 s');
+        })()"#,
         "server-read queue time after clicking Start",
         || {},
     )

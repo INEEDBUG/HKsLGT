@@ -22,6 +22,7 @@ pub(crate) struct AuxSelectionObservation<'a> {
     pub(crate) current_champion: Option<u32>,
     pub(crate) player: Option<&'a str>,
     pub(crate) previous_game_mode: Option<&'static str>,
+    pub(crate) retired_game_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -202,6 +203,18 @@ impl AuxActivity {
             select.and_then(|select| draft_player(select, signed_in))
                 .and_then(|row| champion_id(&row["championId"])) == Some(id)
         });
+        let flow_refers_to_retired = observed.retired_game_id.is_some_and(|retired| {
+            flow.is_some_and(|flow| flow_refers_to_retired_game(flow, retired))
+        });
+        let replaced_retired_flow = retired_flow_can_be_ignored(
+            phase,
+            flow,
+            select,
+            observed.retired_game_id,
+            signed_in,
+            observed.current_champion,
+        );
+        let flow = if replaced_retired_flow { None } else { flow };
         // These three LCU endpoints advance independently after a ready check.
         // Only promote a late phase using this sample's active timer and matching game.
         let promoted = matches!(phase, "" | "Matchmaking" | "ReadyCheck")
@@ -234,6 +247,12 @@ impl AuxActivity {
             _ => return Self::Inactive,
         };
         let in_selection = phase == AuxPhase::ChampSelect;
+        if in_selection
+            && (select_game.is_some_and(|id| Some(id) == observed.retired_game_id)
+                || (flow_refers_to_retired && !replaced_retired_flow))
+        {
+            return Self::Unconfirmed;
+        }
         let config = config.filter(|_| !in_selection);
         let flow = match mismatched_phase {
             Some(old)
@@ -569,6 +588,87 @@ fn local_draft_actions(selection: &Value, cell: i64) -> Vec<LocalDraftAction> {
         })
         .take(32)
         .collect()
+}
+
+fn retired_flow_can_be_ignored(
+    phase: &str,
+    flow: Option<&GameflowSession>,
+    select: Option<&Value>,
+    retired_game_id: Option<u64>,
+    signed_in: Option<&str>,
+    current_champion: Option<u32>,
+) -> bool {
+    let (Some(flow), Some(select), Some(retired_game_id)) = (flow, select, retired_game_id) else {
+        return false;
+    };
+    let Some(current_game_id) = positive_id(&select["gameId"]) else {
+        return false;
+    };
+    let Some(queue_id) = positive_id(&select["queueId"]).filter(|id| matches!(*id, 450 | 2400)) else {
+        return false;
+    };
+    let Some(player) = signed_in else {
+        return false;
+    };
+    if phase != "ChampSelect"
+        || current_game_id == retired_game_id
+        || !live_draft(select)
+        || select["isCustomGame"] == true
+        || select["isSpectating"] == true
+    {
+        return false;
+    }
+    let Some(own_player) = draft_player(select, Some(player)) else {
+        return false;
+    };
+    let Some(own_champion) = champion_id(&own_player["championId"]) else {
+        return false;
+    };
+    if own_player["puuid"].as_str() != Some(player)
+        || current_champion.and_then(normalize_champion).is_some_and(|current| current != own_champion)
+    {
+        return false;
+    }
+
+    let old_id = flow.game_data.as_ref().and_then(|data| data.game_id);
+    let exact_retired_id = old_id.filter(|&id| id > 0) == Some(retired_game_id);
+    let old_matches_retired = if old_id.is_some_and(|id| id > 0) {
+        exact_retired_id
+    } else {
+        matches!(
+            flow.phase.as_str(),
+            "None" | "Lobby" | "Matchmaking" | "ReadyCheck" | "InProgress"
+                | "WaitingForStats" | "PreEndOfGame" | "EndOfGame"
+        )
+    };
+    let old_queue_raw = flow.queue().and_then(|queue| queue.id);
+    let old_queue = old_queue_raw
+        .and_then(|id| u64::try_from(id).ok())
+        .filter(|&id| id > 0);
+    let old_mode = flow.aux_game_mode();
+    old_matches_retired
+        && flow.game_data.as_ref().is_none_or(|data| data.is_custom_game != Some(true))
+        && (old_queue_raw.is_none() || old_queue.is_some())
+        && old_queue.is_none_or(|queue| {
+            if exact_retired_id {
+                matches!(queue, 450 | 2400)
+            } else {
+                queue == queue_id
+            }
+        })
+        && old_mode.is_none_or(|mode| matches!(mode, "ARAM" | "KIWI"))
+}
+
+fn flow_refers_to_retired_game(flow: &GameflowSession, retired_game_id: u64) -> bool {
+    match flow.game_data.as_ref().and_then(|data| data.game_id).filter(|&id| id > 0) {
+        Some(game_id) => game_id == retired_game_id,
+        None => matches!(
+            flow.phase.as_str(),
+            "None" | "Lobby" | "Matchmaking" | "ReadyCheck" | "GameStart" | "InProgress"
+                | "Reconnect" | "WaitingForStats" | "PreEndOfGame" | "EndOfGame"
+                | "TerminatedInError"
+        ),
+    }
 }
 
 fn signed_in_player(player: Option<&str>) -> Option<&str> {
@@ -1071,6 +1171,108 @@ mod tests {
         assert!(sample(&old, Some(55)).view().is_none());
         old["gameData"]["gameId"] = json!(901);
         assert!(sample(&old, Some(157)).view().is_none());
+    }
+
+    #[test]
+    fn second_verified_kiwi_draft_uses_retired_flow_only_for_read_only_projection() {
+        let selection = json!({
+            "gameId":8522,"queueId":2400,"localPlayerCellId":0,
+            "myTeam":[{"cellId":0,"puuid":"owner","championId":55}],
+            "benchChampions":[{"championId":136}],
+            "timer":{"phase":"FINALIZATION","adjustedTimeLeftInPhase":5000}
+        });
+        let observe = |flow: Value, retired_game_id| {
+            let flow: GameflowSession = serde_json::from_value(flow).unwrap();
+            AuxActivity::project_observed(
+                "ChampSelect",
+                Some(&flow),
+                None,
+                None,
+                AuxSelectionObservation {
+                    session: Some(&selection),
+                    current_champion: Some(55),
+                    player: Some("owner"),
+                    retired_game_id,
+                    ..Default::default()
+                },
+            )
+        };
+        let stale_same_phase = json!({
+            "phase":"ChampSelect","gameData":{"gameId":8521,"queue":{"id":2400,"gameMode":"KIWI"}}
+        });
+        let stale_supported_other_queue = json!({
+            "phase":"ChampSelect","gameData":{"gameId":8521,"queue":{"id":450,"gameMode":"ARAM"}}
+        });
+        let stale_terminal_without_id = json!({
+            "phase":"EndOfGame","gameData":{"gameId":0,"queue":{"id":2400,"gameMode":"KIWI"}}
+        });
+
+        assert!(observe(stale_same_phase.clone(), Some(8520)).view().is_none());
+        for flow in [stale_same_phase, stale_supported_other_queue, stale_terminal_without_id] {
+            assert!(observe(flow.clone(), None).view().is_none());
+            let AuxActivity::Active(projected) = observe(flow, Some(8521)) else {
+                panic!("expected fresh second-game projection");
+            };
+            assert_eq!(projected.game_id, Some(8522));
+            let data = json!(projected);
+            assert_eq!(data["gameMode"], "KIWI");
+            assert_eq!(data["championId"], 55);
+            assert_eq!(data["bench"], json!([136]));
+            assert_eq!(data["selectionActionable"], false);
+        }
+        let contradictory_zero_id = json!({
+            "phase":"EndOfGame","gameData":{"gameId":0,"queue":{"id":450,"gameMode":"ARAM"}}
+        });
+        assert!(observe(contradictory_zero_id, Some(8521)).view().is_none());
+
+        let next_lobby: GameflowSession = serde_json::from_value(json!({
+            "phase":"Lobby","gameData":{"gameId":0,"queue":{"id":2400,"gameMode":"KIWI"}}
+        })).unwrap();
+        let room = AuxActivity::project_observed(
+            "Lobby", Some(&next_lobby), None, None,
+            AuxSelectionObservation { retired_game_id: Some(8521), ..Default::default() },
+        );
+        assert_eq!(room.view().map(|view| view.phase), Some(AuxPhase::Lobby));
+
+        let flow: GameflowSession = serde_json::from_value(json!({
+            "phase":"ChampSelect","gameData":{"gameId":8521,"queue":{"id":2400,"gameMode":"KIWI"}}
+        })).unwrap();
+        for game_id in [0, 8521] {
+            let mut stale_selection = selection.clone();
+            stale_selection["gameId"] = json!(game_id);
+            assert!(AuxActivity::project_observed(
+                "ChampSelect", Some(&flow), None, None,
+                AuxSelectionObservation {
+                    session: Some(&stale_selection),
+                    current_champion: Some(55),
+                    player: Some("owner"),
+                    retired_game_id: Some(8521),
+                    ..Default::default()
+                },
+            ).view().is_none());
+        }
+        let mut non_aram_selection = selection.clone();
+        non_aram_selection["queueId"] = json!(420);
+        assert!(AuxActivity::project_observed(
+            "ChampSelect", Some(&flow), None, None,
+            AuxSelectionObservation {
+                session: Some(&non_aram_selection),
+                current_champion: Some(55),
+                player: Some("owner"),
+                retired_game_id: Some(8521),
+                ..Default::default()
+            },
+        ).view().is_none());
+        assert!(AuxActivity::project_observed(
+            "ChampSelect", Some(&flow), None, None,
+            AuxSelectionObservation {
+                session: Some(&selection),
+                current_champion: Some(103),
+                player: Some("owner"),
+                retired_game_id: Some(8521),
+                ..Default::default()
+            },
+        ).view().is_none());
     }
 
     #[test]

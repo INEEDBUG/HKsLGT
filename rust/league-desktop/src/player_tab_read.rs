@@ -1,13 +1,14 @@
 //! The match history screen only needs these authenticated LCU reads.
 
 use super::{
+    player_search::{may_request_history, shard_from_platform, PlayerSearchShard, Puuid},
     LcuError, LcuTarget, LcuTransport,
-    player_search::{PlayerSearchShard, Puuid, may_request_history, shard_from_platform},
 };
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 const PROFILE: &str = "/lol-summoner/v2/summoners/puuid/";
 const CURRENT_PROFILE: &str = "/lol-summoner/v1/current-summoner";
@@ -18,6 +19,7 @@ const RANKED: &str = "/lol-ranked/v1/ranked-stats/";
 const RECOMMENDED_POSITIONS: &str = "/lol-perks/v1/recommended-champion-positions";
 const MAX_PAGE_SIZE: u32 = 200;
 const MAX_GAME_ID: u64 = (1 << 53) - 1;
+const MAX_PROFILE_BYTES: usize = 32 * 1024;
 const MAX_RANKED_BYTES: usize = 64 * 1024;
 const MAX_RECOMMENDED_POSITIONS_BYTES: usize = 64 * 1024;
 
@@ -173,6 +175,33 @@ fn validate_recommended_positions(reply: Option<Value>) -> Result<Value, LcuErro
     serde_json::to_value(projected).map_err(|_| LcuError::InvalidPayload)
 }
 
+fn profile_matches_player(profile: &Value, player: &Puuid) -> bool {
+    profile["puuid"].as_str().and_then(Puuid::parse).as_ref() == Some(player)
+}
+
+fn profile_icon_id(profile: &Value) -> Option<u32> {
+    u32::try_from(profile["profileIconId"].as_u64()?).ok()
+}
+
+async fn fill_missing_profile_icon(
+    current: &mut Value,
+    player: &Puuid,
+    by_puuid: impl std::future::Future<Output = Result<Option<Value>, LcuError>>,
+) {
+    if profile_icon_id(current).is_some() {
+        return;
+    }
+    let Ok(Some(alternate)) = by_puuid.await else {
+        return;
+    };
+    if !profile_matches_player(&alternate, player) {
+        return;
+    }
+    if let Some(icon) = profile_icon_id(&alternate) {
+        current["profileIconId"] = Value::from(icon);
+    }
+}
+
 impl LcuTransport {
     async fn read_tab_profile(
         &self,
@@ -186,11 +215,20 @@ impl LcuTransport {
         } else {
             &by_id
         };
-        let data: Value = Self::read_json(self.local_json_get(target, path), 32 * 1024)
+        let mut data: Value = Self::read_json(self.local_json_get(target, path), MAX_PROFILE_BYTES)
             .await?
             .ok_or(LcuError::UnexpectedStatus(404))?;
-        if data["puuid"].as_str().and_then(Puuid::parse).as_ref() != Some(player) {
+        if !profile_matches_player(&data, player) {
             return Err(LcuError::InvalidPayload);
+        }
+        if player == own {
+            fill_missing_profile_icon(&mut data, player, async {
+                let icon = self
+                    .local_json_get(target, &by_id)
+                    .timeout(Duration::from_millis(750));
+                Self::read_json(icon, MAX_PROFILE_BYTES).await
+            })
+            .await;
         }
         Ok(data)
     }
@@ -274,6 +312,71 @@ mod tests {
     const PLAYER: &str = "6f541254-473e-4ddb-a9b2-e96908061989";
 
     #[test]
+    fn repairs_only_the_missing_own_icon_from_the_same_player() {
+        let player = Puuid::parse(PLAYER).unwrap();
+        for initial in [None, Some(json!(-1)), Some(json!("invalid"))] {
+            let mut current = json!({"puuid": PLAYER, "gameName": "Current", "summonerLevel": 38});
+            if let Some(initial) = initial {
+                current["profileIconId"] = initial;
+            }
+            let alternate = json!({
+                "puuid": PLAYER.to_ascii_uppercase(), "profileIconId": 29,
+                "gameName": "Alternate", "summonerLevel": 1
+            });
+            tauri::async_runtime::block_on(fill_missing_profile_icon(
+                &mut current,
+                &player,
+                std::future::ready(Ok(Some(alternate))),
+            ));
+            assert_eq!(
+                current,
+                json!({
+                    "puuid": PLAYER, "gameName": "Current", "summonerLevel": 38, "profileIconId": 29
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_current_profile_when_the_icon_lookup_cannot_supply_its_icon() {
+        let player = Puuid::parse(PLAYER).unwrap();
+        let original = json!({"puuid": PLAYER, "gameName": "Current"});
+        for response in [
+            Ok(Some(
+                json!({"puuid": "2abb5ba7-b3dc-432c-973c-1b4a780ac035", "profileIconId": 29}),
+            )),
+            Ok(Some(json!({"profileIconId": 29}))),
+            Ok(Some(
+                json!({"puuid": PLAYER, "profileIconId": 4_294_967_296_u64}),
+            )),
+            Ok(None),
+            Err(LcuError::Timeout),
+        ] {
+            let mut current = original.clone();
+            tauri::async_runtime::block_on(fill_missing_profile_icon(
+                &mut current,
+                &player,
+                std::future::ready(response),
+            ));
+            assert_eq!(current, original);
+        }
+    }
+
+    #[test]
+    fn never_reads_another_profile_for_a_valid_current_icon_including_zero() {
+        let player = Puuid::parse(PLAYER).unwrap();
+        for id in [0, 29] {
+            let mut current = json!({"puuid": PLAYER, "profileIconId": id});
+            tauri::async_runtime::block_on(fill_missing_profile_icon(
+                &mut current,
+                &player,
+                async { panic!("valid icon must not cause a second request") },
+            ));
+            assert_eq!(current["profileIconId"], id);
+        }
+    }
+
+    #[test]
     fn validates_the_pinned_renderer_get_paths_and_page_sizes() {
         let query = json!({"begIndex": 20, "endIndex": 219});
         let history = format!("{HISTORY}{PLAYER}/matches");
@@ -315,13 +418,11 @@ mod tests {
         assert!(
             PlayerTabRead::parse("/lol-ranked/v1/current-ranked-stats", &Value::Null).is_none()
         );
-        assert!(
-            PlayerTabRead::parse(
-                &format!("/lol-ranked/v1/ranked-stats/../current-ranked-stats"),
-                &Value::Null
-            )
-            .is_none()
-        );
+        assert!(PlayerTabRead::parse(
+            &format!("/lol-ranked/v1/ranked-stats/../current-ranked-stats"),
+            &Value::Null
+        )
+        .is_none());
     }
 
     #[test]

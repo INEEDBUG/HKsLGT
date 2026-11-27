@@ -172,7 +172,7 @@ import { useNativeAuxLounge } from '${MINI_ACTIVITY_MODULE}'
 
 const { t } = useTranslation()
 const {
-  lcs, agfs, pending, penaltyTime, penaltyTotalTime, willAcceptIn, willSearchMatchIn,
+  lcs, agfs, pending, elapsedQueueSeconds, penaltyTime, penaltyTotalTime, willAcceptIn, willSearchMatchIn,
   modeIconSrc, handleModeIconError,
   handleAccept, handleDecline, handleCancelAutoAccept, handleCancelAutoSearchMatch, handleCancelSearching
 } = useNativeAuxLounge()
@@ -185,7 +185,7 @@ const formatMapModeText = () => {
 }
 
 const formatMatchmakingSearchText = (search: NonNullable<typeof lcs.matchmaking.search>) => {
-  const elapsed = search.timeInQueue.toFixed(1) + ' s'
+  const elapsed = (elapsedQueueSeconds.value ?? search.timeInQueue).toFixed(1) + ' s'
   const wait = penaltyTime.value
   const penalty = penaltyTotalTime.value
   if (wait != null && ((penalty ?? 0) > 0 || wait > 0)) {

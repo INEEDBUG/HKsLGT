@@ -11,26 +11,78 @@ const stagedSource = resolve('staged-league-fixture')
 const outDir = resolve('native-webview-dist')
 
 test('a missing local champion portrait can use its official color image without forwarding a client path', async () => {
-  const { gameArtFallback } = await import('./game-art-fallback.mjs')
+  const { gameArtFallbacks } = await import('./game-art-fallback.mjs')
   const path = 'http://league-art.localhost/lol-game-data/assets/v1/champion-icons/136.png'
   const champions = { 136: { alias: 'AurelionSol' } }
-  assert.equal(gameArtFallback(path, champions), 'https://game.gtimg.cn/images/lol/act/img/champion/AurelionSol.png')
+  assert.deepEqual(gameArtFallbacks(path, champions), ['https://game.gtimg.cn/images/lol/act/img/champion/AurelionSol.png'])
   for (const invalid of [null, path + '?auth=example', path.replace('136.png', '-1.png'), path.replace('champion-icons', 'profile-icons'), path.replace('league-art.localhost', 'other.invalid')]) {
-    assert.equal(gameArtFallback(invalid, champions), null)
+    assert.deepEqual(gameArtFallbacks(invalid, champions), [])
   }
-  assert.equal(gameArtFallback(path, {}), null)
-  assert.equal(gameArtFallback(path, {136: { alias: '../other' }}), null)
+  assert.deepEqual(gameArtFallbacks(path, {}), [])
+  assert.deepEqual(gameArtFallbacks(path, {136: { alias: '../other' }}), [])
 })
 
-test('missing local profile icons use only their numeric official Tencent asset', async () => {
-  const { gameArtFallback } = await import('./game-art-fallback.mjs')
+test('profile icons try original public art before the default profile icon', async () => {
+  const { gameArtFallbacks } = await import('./game-art-fallback.mjs')
   const dir = 'http://league-art.localhost/lol-game-data/assets/v1/profile-icons/'
-  assert.equal(gameArtFallback(dir + '29.jpg', {}), 'https://game.gtimg.cn/images/lol/act/img/profileicon/29.png')
-  assert.equal(gameArtFallback(dir + '0.jpg', {}), 'https://game.gtimg.cn/images/lol/act/img/profileicon/0.png')
+  assert.deepEqual(gameArtFallbacks(dir + '29.jpg', {}), [
+    'https://game.gtimg.cn/images/lol/act/img/profileicon/29.png',
+    'https://ddragon.leagueoflegends.com/cdn/16.23.1/img/profileicon/29.png',
+    'https://game.gtimg.cn/images/lol/act/img/profileicon/0.png'
+  ])
+  assert.equal(gameArtFallbacks(dir + '0.jpg', {})[0], 'https://game.gtimg.cn/images/lol/act/img/profileicon/0.png')
   for (const invalid of ['029.jpg', '-1.jpg', '4294967296.jpg', '29.jpg?token=example', '29.jpg#a', '../29.jpg']) {
-    assert.equal(gameArtFallback(dir + invalid, {}), null)
+    assert.deepEqual(gameArtFallbacks(dir + invalid, {}), [])
   }
-  assert.equal(gameArtFallback(dir.replace('league-art.localhost', 'other.invalid') + '29.jpg', {}), null)
+  assert.deepEqual(gameArtFallbacks(dir.replace('league-art.localhost', 'other.invalid') + '29.jpg', {}), [])
+})
+
+test('history icons can recover by ID after a persistent image error or a missing catalog entry', async () => {
+  const { gameArtFallbacks } = await import('./game-art-fallback.mjs')
+  const local = 'http://league-art.localhost/lol-game-data/assets/'
+  const tencent = 'https://game.gtimg.cn/images/lol/act/img/'
+  const item = local + 'ASSETS/Items/Icons2D/3006_Class_T2_BerserkersGreaves.png'
+  for (const [source, kind, id, remote] of [
+    [item, 'item', 3006, 'item/3006.png'],
+    [null, 'item', 6672, 'item/6672.png'],
+    [null, 'spell', 4, 'spell/SummonerFlash.png'],
+    [local + 'DATA/Spells/Icons2D/Summoner_Mark.png', 'spell', 32, 'spell/SummonerSnowball.png'],
+    [null, 'perk', 8005, 'rune/8005.png'],
+    [null, 'perk-style', 8100, 'rune/7200_Domination.png']
+  ]) {
+    assert.equal(gameArtFallbacks(source, {}, kind, id)[0], tencent + remote)
+  }
+  assert.equal(gameArtFallbacks(null, {}, 'item', 6672)[1],
+    'https://ddragon.leagueoflegends.com/cdn/16.23.1/img/item/6672.png')
+  const rune = local + 'v1/perk-images/Styles/Precision/PressTheAttack/PressTheAttack.png'
+  assert.equal(gameArtFallbacks(rune, {}, 'perk', 8005)[1],
+    'https://ddragon.leagueoflegends.com/cdn/img/perk-images/Styles/Precision/PressTheAttack/PressTheAttack.png')
+  for (const id of [0, -1, 4294967296, 2.5, '3006']) {
+    assert.deepEqual(gameArtFallbacks(null, {}, 'item', id), [])
+  }
+  assert.deepEqual(gameArtFallbacks(null, {}, 'spell', 999), [])
+})
+
+test('the augment fallback only maps validated public filenames in known augmentation families', async () => {
+  const { gameArtFallbacks } = await import('./game-art-fallback.mjs')
+  const dir = 'http://league-art.localhost/lol-game-data/assets/'
+  assert.deepEqual(gameArtFallbacks(dir + 'ASSETS/Maps/Particles/Kiwi/MagicMissile_small.png', {}), [
+    'https://game.gtimg.cn/images/lol/act/img/rune/magicmissile_small.png'
+  ])
+  assert.deepEqual(gameArtFallbacks(dir + 'ASSETS/UX/Kiwi/Augments/Icons/FirstAidKit_small.png', {}), [
+    'https://game.gtimg.cn/images/lol/act/img/rune/firstaidkit_small.png'
+  ])
+  for (const invalid of [
+    'ASSETS/Maps/Particles/Kiwi/arbitrary_small.png',
+    'ASSETS/UX/Kiwi/Augments/Icons/../MagicMissile_small.png',
+    'ASSETS/UX/Kiwi/Augments/Icons/%2e%2e/MagicMissile_small.png',
+    'ASSETS/UX/Kiwi/Augments/Icons/a%2fMagicMissile_small.png',
+    'ASSETS/UX/Kiwi/Augments/Icons/MagicMissile_small.png?token=example',
+    'ASSETS/UX/Kiwi/Augments/Icons/MagicMissile_small.png#fragment',
+    'ASSETS/UX/Kiwi/Augments/Icons/MagicMissile_small.svg'
+  ]) {
+    assert.deepEqual(gameArtFallbacks(dir + invalid, {}), [])
+  }
 })
 
 test('the native renderer substitutes local vector artwork for bundled brand and game images', () => {
@@ -263,6 +315,76 @@ test('Mini tries the local Riot queue badge before its fixed public copy in ARAM
   assert.equal(icon.modeIconSrc.value, publicBadge)
   show('UNKNOWN', badge)
   assert.equal(icon.modeIconSrc.value, null)
+})
+
+test('Mini advances the displayed queue clock between reads and resets for the next search', () => {
+  const renderer = createNativeRendererConfig({}, stagedSource, outDir).plugins[0]
+  const source = renderer.load(renderer.resolveId(MINI_ACTIVITY_MODULE)).replace(/^import .*$/gm, '').replace(/^export /gm, '')
+  const script = stripTypeScriptTypes(source, { mode: 'transform' })
+  const create = new Function(
+    'inject', 'useLeagueClientStore', 'useAutoGameflowStore', 'useInstance', 'AutoGameflowRenderer',
+    'useGameResourceProvider', 'ref', 'computed', 'watch', 'useIntervalFn', 'performance',
+    `${script}\nreturn useNativeAuxLounge()`
+  )
+  const view = { value: null }
+  const watches = []
+  let monotonic = 0
+  let active = false
+  let tick
+  const ui = create(
+    () => ({ view }), () => ({}), () => ({ willAcceptAt: 0, willSearchMatch: false }),
+    () => ({}), Symbol('flow'), () => ({ assets: { resolve: () => null } }),
+    (value) => ({ value }), (getter) => ({ get value() { return getter() } }),
+    (source, change, options) => {
+      const readers = Array.isArray(source) ? source : [source]
+      const read = () => readers.map((entry) => typeof entry === 'function' ? entry() : entry.value)
+      let before = read()
+      if (options?.immediate) change(Array.isArray(source) ? before : before[0], undefined)
+      watches.push(() => {
+        const after = read()
+        if (after.every((value, index) => value === before[index])) return
+        const previous = before
+        before = after
+        change(Array.isArray(source) ? after : after[0], Array.isArray(source) ? previous : previous[0])
+      })
+    },
+    (update, period) => {
+      assert.equal(period, 100)
+      tick = update
+      return { resume() { active = true; tick() }, pause() { active = false } }
+    },
+    { now: () => monotonic }
+  )
+  const show = (phase, queueSeconds, penaltySeconds = null) => {
+    view.value = { phase, queueSeconds, estimatedSeconds: 40, penaltySeconds }
+    watches.forEach((notify) => notify())
+  }
+  const advance = (milliseconds) => { monotonic += milliseconds; if (active) tick() }
+  const seconds = () => ui.elapsedQueueSeconds?.value ?? ui.lcs.matchmaking.search?.timeInQueue ?? null
+  show('Matchmaking', 10)
+  assert.equal(seconds(), 10)
+  advance(1100)
+  assert.equal(seconds(), 11.1)
+  advance(1000)
+  show('Matchmaking', 12)
+  assert.equal(seconds(), 12.1)
+  assert.equal(ui.lcs.matchmaking.search.estimatedQueueTime, 40)
+  show('ReadyCheck', null)
+  assert.equal(active, false)
+  assert.equal(seconds(), null)
+  show('Matchmaking', 0.4)
+  advance(600)
+  assert.equal(seconds(), 1)
+  show('Matchmaking', 0.1, 2.5)
+  assert.equal(seconds(), 0.1)
+  advance(1000)
+  assert.equal(ui.penaltyTime.value, 1.5)
+  advance(8000)
+  assert.equal(ui.penaltyTime.value, 0)
+  assert.equal(seconds(), 4.1)
+  show('Lobby', null, 5)
+  assert.equal(ui.penaltyTime.value, 5)
+  assert.equal(active, false)
 })
 
 test('the Mini requests genuine OP.GG balance data once in standard ARAM selection only', async () => {

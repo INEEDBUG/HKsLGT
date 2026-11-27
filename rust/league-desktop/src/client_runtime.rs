@@ -60,6 +60,12 @@ struct ActiveClient {
     shard: Option<PlayerSearchShard>,
 }
 
+struct RetiredDraft {
+    instance: ClientInstance,
+    player: String,
+    game_id: u64,
+}
+
 #[derive(Default, PartialEq)]
 struct CompanionTargets {
     opgg: Option<OpggTarget>,
@@ -406,6 +412,7 @@ struct RuntimeState {
     game_data: Map<String, Value>,
     art_client: Option<Arc<LocalClient>>,
     confirmed_draft_mode: Option<(ClientInstance, ConfirmedDraftMode)>,
+    retired_draft: Option<RetiredDraft>,
     history_access: Option<HistoryAccess>,
     opgg_checked_at: Option<Instant>,
 }
@@ -800,8 +807,9 @@ impl ClientRuntime {
 
     #[cfg(test)]
     pub(crate) async fn sample_fixture(&self, app: &AppHandle, client: &Arc<LocalClient>) {
+        let generation = self.state.lock().unwrap().generation;
         let sample = self
-            .sample(client, CompanionDemand::from_app(app), None, None, false)
+            .sample(client, generation, CompanionDemand::from_app(app), None, None, false)
             .await
             .expect("sample loopback League fixture")
             .expect("fixture is active");
@@ -1506,6 +1514,7 @@ impl ClientRuntime {
         state.manually_disconnected = selection.is_none();
         state.art_client = None;
         state.confirmed_draft_mode = None;
+        state.retired_draft = None;
         state.history_access = None;
         state.aram_paused = false;
         state.aram.reset();
@@ -1596,9 +1605,65 @@ impl ClientRuntime {
         }
     }
 
+    fn note_draft_exit(
+        &self,
+        instance: ClientInstance,
+        generation: u64,
+        phase: &str,
+        flow: Option<&GameflowSession>,
+        player: Option<&str>,
+        reads: Option<&RoomReads>,
+        activity: Option<&AuxActivity>,
+    ) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.generation != generation {
+            return;
+        }
+        if !matches!(
+            phase,
+            "None" | "Lobby" | "Matchmaking" | "ReadyCheck" | "GameStart"
+                | "InProgress" | "Reconnect" | "WaitingForStats" | "PreEndOfGame"
+                | "EndOfGame" | "TerminatedInError"
+        ) {
+            return;
+        }
+        let Some(retired) = state.snapshot.active.as_ref().and_then(|active| {
+            if active.instance != instance {
+                return None;
+            }
+            let view = active.aux_activity.view()?;
+            if view.phase != AuxPhase::ChampSelect || !matches!(view.game_mode, "ARAM" | "KIWI") {
+                return None;
+            }
+            let player = active.summoner["puuid"].as_str()?;
+            if player.is_empty()
+                || player == "00000000-0000-0000-0000-000000000000"
+                || view.selection_player.as_deref() != Some(player)
+            {
+                return None;
+            }
+            Some(RetiredDraft {
+                instance,
+                player: player.to_owned(),
+                game_id: view.game_id.filter(|&id| id > 0)?,
+            })
+        }) else {
+            return;
+        };
+        if player != Some(retired.player.as_str())
+            || !draft_exit_is_confirmed(phase, &retired, flow, reads, activity)
+        {
+            return;
+        }
+        state.retired_draft = Some(retired);
+    }
+
     async fn sample(
         &self,
         client: &LocalClient,
+        generation: u64,
         demand: CompanionDemand,
         previous_chart: Option<ResgTarget>,
         previous_shard: Option<(String, PlayerSearchShard)>,
@@ -1633,13 +1698,13 @@ impl ClientRuntime {
             Err(_) => phase_read.await,
         };
         let direct = aux_sample_read(direct, flow_is_draft)?;
+        let raw_phase = direct.as_deref().unwrap_or("");
         let phase = match direct.as_deref() {
             Some(phase) if !phase.is_empty() => phase,
             _ if flow_is_draft && flow.is_some_and(|game| game.phase == "ReadyCheck") => "ReadyCheck",
             _ if flow_is_draft => "ChampSelect",
             _ => return Ok(None),
         };
-        let raw_phase = direct.as_deref().unwrap_or("");
         let read_aux_draft = demand.reads_aux_selection(raw_phase, flow);
         let summoner = match summoner {
             Ok(result) => result,
@@ -1692,15 +1757,30 @@ impl ClientRuntime {
             select, own_champion, self.read_aux_room(&target, client.instance, raw_phase, demand.aux || room_enabled)
         ).await;
         let player = summoner.as_ref().map(|player| player.puuid.as_str());
-        let (previous_game_mode, draft_mode_conflicted) = if demand.aux {
-            let state = self.state.lock().ok();
+        let (previous_game_mode, draft_mode_conflicted, retired_game_id) = if demand.aux {
+            let mut state = self.state.lock().ok();
+            if let Some(state) = state.as_deref_mut() {
+                if state.generation == generation
+                    && state.retired_draft.as_ref().is_some_and(|retired| {
+                        retired.instance != client.instance
+                            || player.is_some_and(|player| retired.player.as_str() != player)
+                    })
+                {
+                    state.retired_draft = None;
+                }
+            }
+            let retired_game_id = state.as_ref().and_then(|state| {
+                state.retired_draft.as_ref()
+                    .filter(|retired| retired.instance == client.instance && Some(retired.player.as_str()) == player)
+                    .map(|retired| retired.game_id)
+            });
             let previous = state.as_ref().and_then(|state| {
                 state.confirmed_draft_mode.as_ref()
                     .filter(|(instance, _)| *instance == client.instance)
             });
-            previous.map_or((None, false), |(_, mode)| {
+            previous.map_or((None, false, retired_game_id), |(_, mode)| {
                 if !mode.agrees_with_observation(player, flow, selection.as_ref()) {
-                    return (None, true);
+                    return (None, true, retired_game_id);
                 }
                 let mode = if read_aux_draft && raw_phase == "ChampSelect" {
                     selection.as_ref()
@@ -1709,10 +1789,10 @@ impl ClientRuntime {
                 } else {
                     None
                 };
-                (mode, false)
+                (mode, false, retired_game_id)
             })
         } else {
-            (None, false)
+            (None, false, None)
         };
         let companions = demand.targets(
             client.instance,
@@ -1744,8 +1824,20 @@ impl ClientRuntime {
                 current_champion,
                 player,
                 previous_game_mode,
+                retired_game_id,
             },
         );
+        if demand.aux {
+            self.note_draft_exit(
+                client.instance,
+                generation,
+                raw_phase,
+                flow,
+                player,
+                Some(&reads),
+                Some(&activity),
+            );
+        }
         let room = reads.sample(
             client.instance,
             summoner.as_ref().map(|s| s.puuid.as_str()),
@@ -1824,6 +1916,7 @@ impl ClientRuntime {
                 Duration::from_secs(4),
                 self.sample(
                     client,
+                    generation,
                     demand,
                     previous_chart,
                     previous_shard.filter(|_| Some(client.instance) == connected),
@@ -2153,6 +2246,79 @@ impl ClientRuntime {
     }
 }
 
+fn draft_exit_is_confirmed(
+    phase: &str,
+    retired: &RetiredDraft,
+    flow: Option<&GameflowSession>,
+    reads: Option<&RoomReads>,
+    activity: Option<&AuxActivity>,
+) -> bool {
+    let known_exit = matches!(
+        phase,
+        "None" | "Lobby" | "Matchmaking" | "ReadyCheck" | "GameStart"
+            | "InProgress" | "Reconnect" | "WaitingForStats" | "PreEndOfGame"
+            | "EndOfGame" | "TerminatedInError"
+    );
+    if !known_exit
+        || activity.and_then(AuxActivity::view).is_some_and(|view| {
+            view.phase == AuxPhase::ChampSelect && view.game_id == Some(retired.game_id)
+        })
+    {
+        return false;
+    }
+
+    let flow_confirms_exit = flow.is_some_and(|flow| {
+        let flow_exit = matches!(
+            flow.phase.as_str(),
+            "None" | "Lobby" | "Matchmaking" | "ReadyCheck" | "GameStart"
+                | "InProgress" | "Reconnect" | "WaitingForStats" | "PreEndOfGame"
+                | "EndOfGame" | "TerminatedInError"
+        );
+        let flow_game_id = flow.game_data.as_ref().and_then(|data| data.game_id);
+        let game_id_matches = flow_game_id
+            .filter(|&id| id > 0)
+            .is_none_or(|id| id == retired.game_id);
+        let queue_id = flow.queue().and_then(|queue| queue.id);
+        let queue_supported = queue_id.is_none_or(|id| matches!(id, 450 | 2400));
+        flow_exit
+            && flow.phase != "ChampSelect"
+            && game_id_matches
+            && queue_supported
+            && flow.game_data.as_ref().is_none_or(|data| data.is_custom_game != Some(true))
+            && flow.aux_game_mode().is_none_or(|mode| matches!(mode, "ARAM" | "KIWI"))
+    });
+    let flow_still_in_champ_select = flow.is_some_and(|flow| flow.phase == "ChampSelect");
+    let flow_is_contradictory = flow.is_some_and(|flow| {
+        flow.game_data.as_ref().is_some_and(|data| data.is_custom_game == Some(true))
+            || flow.queue().and_then(|queue| queue.id)
+                .is_some_and(|id| !matches!(id, 450 | 2400))
+            || flow.aux_game_mode().is_some_and(|mode| !matches!(mode, "ARAM" | "KIWI"))
+    });
+    if flow_still_in_champ_select || flow_is_contradictory {
+        return false;
+    }
+
+    let room_confirms_exit = reads.is_some_and(|reads| match phase {
+        "Lobby" => reads.lobby.as_ref().is_some_and(|lobby| {
+            matches!(lobby["gameConfig"]["queueId"].as_u64(), Some(450 | 2400))
+                && lobby["gameConfig"]["isCustom"] != true
+                && lobby["members"].as_array().is_some_and(|members| {
+                    members
+                        .iter()
+                        .any(|member| member["puuid"].as_str() == Some(&retired.player))
+                })
+        }),
+        "Matchmaking" => reads.search_read && reads.search.as_ref().is_some_and(|search| {
+            matches!(search["queueId"].as_u64(), Some(450 | 2400))
+        }),
+        "ReadyCheck" => reads.ready_verified && reads.search.as_ref().is_some_and(|search| {
+            matches!(search["queueId"].as_u64(), Some(450 | 2400))
+        }),
+        _ => false,
+    });
+    flow_confirms_exit || room_confirms_exit
+}
+
 async fn load_game_data(
     app: AppHandle,
     client: Arc<LocalClient>,
@@ -2437,6 +2603,64 @@ fn publish_property(
 #[cfg(test)]
 mod companion_tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn lagged_readycheck_and_search_cannot_retire_a_confirmed_live_draft() {
+        let retired = RetiredDraft {
+            instance: ClientInstance {
+                pid: 42,
+                created_at: 1,
+            },
+            player: "owner".to_owned(),
+            game_id: 8521,
+        };
+        let live_flow: GameflowSession = serde_json::from_value(json!({
+            "phase":"ChampSelect","gameData":{"gameId":8521,"queue":{"id":2400,"gameMode":"KIWI"}}
+        })).unwrap();
+        let selection = json!({
+            "gameId":8521,"queueId":2400,"localPlayerCellId":0,
+            "myTeam":[{"cellId":0,"puuid":"owner","championId":55}],
+            "timer":{"phase":"FINALIZATION","adjustedTimeLeftInPhase":5000}
+        });
+        let active = AuxActivity::project_observed(
+            "ReadyCheck",
+            Some(&live_flow),
+            None,
+            None,
+            AuxSelectionObservation {
+                session: Some(&selection),
+                current_champion: Some(55),
+                player: Some("owner"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(active.view().and_then(|view| view.game_id), Some(8521));
+        let lagged_room = RoomReads {
+            search: Some(json!({"queueId":2400,"readyCheck":{"state":"InProgress"}})),
+            search_read: true,
+            ready_verified: true,
+            ..Default::default()
+        };
+        assert!(!draft_exit_is_confirmed(
+            "ReadyCheck",
+            &retired,
+            Some(&live_flow),
+            Some(&lagged_room),
+            Some(&active),
+        ));
+
+        let terminal_flow: GameflowSession = serde_json::from_value(json!({
+            "phase":"EndOfGame","gameData":{"gameId":8521,"queue":{"id":2400,"gameMode":"KIWI"}}
+        })).unwrap();
+        assert!(draft_exit_is_confirmed(
+            "EndOfGame",
+            &retired,
+            Some(&terminal_flow),
+            None,
+            None,
+        ));
+    }
 
     #[test]
     fn draft_pause_ends_on_exit_or_new_game_but_survives_the_initial_game_id() {

@@ -85,13 +85,24 @@ try {
     } finally {
       $env:HKSLGT_HISTORY_ONLY = $previousHistoryOnly
     }
-    foreach ($scenario in @('HKSLGT_PARTIAL_KIWI_ONLY', 'HKSLGT_CHAMPION_PICKER_ONLY', 'HKSLGT_POST_GAME_ONLY', 'HKSLGT_SELECTION_EVENT_ONLY')) {
+    foreach ($scenario in @(
+      'HKSLGT_HISTORY_CDN_ONLY',
+      'HKSLGT_CONSECUTIVE_KIWI_ONLY',
+      'HKSLGT_PARTIAL_KIWI_ONLY',
+      'HKSLGT_CHAMPION_PICKER_ONLY',
+      'HKSLGT_POST_GAME_ONLY',
+      'HKSLGT_SELECTION_EVENT_ONLY'
+    )) {
       $previousScenario = [Environment]::GetEnvironmentVariable($scenario)
       try {
         [Environment]::SetEnvironmentVariable($scenario, '1')
         cargo test @cargoArgs --manifest-path $desktopManifest $companionTest -- --ignored --exact --nocapture
       } finally {
-        [Environment]::SetEnvironmentVariable($scenario, $previousScenario)
+        if ($null -eq $previousScenario) {
+          Remove-Item -LiteralPath "Env:$scenario"
+        } else {
+          [Environment]::SetEnvironmentVariable($scenario, $previousScenario)
+        }
       }
     }
     foreach ($case in @(

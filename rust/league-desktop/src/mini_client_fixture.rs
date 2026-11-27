@@ -29,6 +29,7 @@ pub(super) struct Scene {
     pub reject_next: bool,
     pub writes: Vec<(String, String)>,
     pub partial_kiwi: Option<super::partial_kiwi_selection_smoke::DraftFixture>,
+    pub consecutive_room: Option<super::consecutive_kiwi_smoke::RoomFixture>,
     pub position_reads: usize,
     pub reject_position_once: bool,
     pub post_game: Option<super::post_game_smoke::PostGameFixture>,
@@ -71,6 +72,7 @@ impl MiniClient {
             reject_next: false,
             writes: vec![],
             partial_kiwi: None,
+            consecutive_room: None,
             position_reads: 0,
             reject_position_once: false,
             post_game: None,
@@ -183,8 +185,8 @@ fn serve(
     let mut scene = scene.lock().unwrap();
     let (status, mime, bytes) = if !authenticated {
         (401, "application/json", vec![])
-    } else if let Some((503, mime)) = history_art {
-        (503, mime, vec![])
+    } else if let Some((status, mime)) = history_art.filter(|(status, _)| *status != 200) {
+        (status, mime, vec![])
     } else if method == "GET" && (path == OWNED_SKIN_PREVIEW || history_art == Some((200, "image/jpeg"))) {
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD.decode(concat!(
@@ -261,6 +263,11 @@ impl Scene {
                     return Some(super::champion_picker_smoke::recommended_positions());
                 }
                 _ => {}
+            }
+        }
+        if let Some(room) = self.consecutive_room.as_mut() {
+            if let Some(response) = room.get(path, self.phase, self.response) {
+                return Some(response);
             }
         }
         if let Some(draft) = self.partial_kiwi.as_ref() {

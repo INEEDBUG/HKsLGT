@@ -84,8 +84,7 @@ impl GameArtPath {
         if path.len() > MAX_PATH_BYTES {
             return None;
         }
-        let relative = path
-            .strip_prefix(ASSET_PREFIX)?
+        let relative = strip_case_prefix(path, ASSET_PREFIX)?
             .split('/')
             .map(canonical_segment)
             .collect::<Option<Vec<_>>>()?
@@ -95,9 +94,19 @@ impl GameArtPath {
             return None;
         }
         Some(Self {
-            canonical: format!("{ASSET_PREFIX}{relative}"),
+            canonical: format!("{}{relative}", &path[..ASSET_PREFIX.len()]),
             format,
         })
+    }
+
+    pub(super) fn parse_catalog_path(path: &str) -> Option<Self> {
+        if path.starts_with('/') {
+            Self::parse(path)
+        } else if path.len() < MAX_PATH_BYTES {
+            Self::parse(&format!("/{path}"))
+        } else {
+            None
+        }
     }
 
     pub(crate) fn path(&self) -> &str {
@@ -134,6 +143,12 @@ impl GameArtPath {
     }
 }
 
+pub(super) fn strip_case_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = path.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &path[prefix.len()..])
+}
+
 fn canonical_segment(segment: &str) -> Option<String> {
     let mut canonical = String::with_capacity(segment.len());
     let mut raw = segment.bytes();
@@ -162,10 +177,10 @@ fn canonical_segment(segment: &str) -> Option<String> {
 }
 
 fn supports_bitmap(relative: &str, format: BitmapFormat) -> bool {
-    if let Some(file) = relative.strip_prefix("v1/champion-icons/") {
+    if let Some(file) = strip_case_prefix(relative, "v1/champion-icons/") {
         return format == BitmapFormat::Png && numeric_icon(file, true);
     }
-    if let Some(file) = relative.strip_prefix("v1/profile-icons/") {
+    if let Some(file) = strip_case_prefix(relative, "v1/profile-icons/") {
         return format == BitmapFormat::Jpeg && numeric_icon(file, false);
     }
     if let Some(rest) = relative.strip_prefix("ASSETS/Characters/") {
@@ -193,11 +208,13 @@ fn supports_bitmap(relative: &str, format: BitmapFormat) -> bool {
             _ => false,
         };
     }
-    MODE_BADGES.contains(&relative)
-        || KIWI_PARTICLE_ICONS.contains(&relative)
+    MODE_BADGES
+        .iter()
+        .chain(KIWI_PARTICLE_ICONS)
+        .any(|path| path.eq_ignore_ascii_case(relative))
         || BITMAP_FAMILIES
             .iter()
-            .any(|prefix| relative.starts_with(prefix))
+            .any(|prefix| strip_case_prefix(relative, prefix).is_some())
 }
 
 fn numeric_icon(filename: &str, champion: bool) -> bool {

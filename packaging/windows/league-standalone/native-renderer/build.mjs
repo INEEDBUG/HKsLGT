@@ -272,10 +272,14 @@ function nativeRendererPlugin(sourceRoot) {
   const resources = join(sourceRoot, 'src/renderer-shared/providers/game-resource/akari.ts')
   const imageComponent = join(sourceRoot, 'src/renderer-shared/components/LcuImage.vue')
   transforms.set(imageComponent.replaceAll('\\', '/'), [
-    ['class="lcu-image" @error="handleError"', 'class="lcu-image" referrerpolicy="no-referrer" @error="handleError"'],
-    ["import { ref, watchEffect } from 'vue'", `import { computed, ref, watch } from 'vue'
+    ['class="lcu-image" @error="handleError"', ':key="url" class="lcu-image" referrerpolicy="no-referrer" @error="handleError"'],
+    ['  src?: string\n}>()', `  src?: string
+  fallbackKind?: 'item' | 'spell' | 'perk' | 'perk-style'
+  fallbackId?: number
+}>()`],
+    ["import { ref, watchEffect } from 'vue'", `import { computed, shallowRef, watch } from 'vue'
 import { useLeagueClientStore } from '@renderer-shared/shards/league-client/store'
-import { gameArtFallback } from 'virtual:hkslgt-game-art-fallback'`],
+import { gameArtFallbacks } from 'virtual:hkslgt-game-art-fallback'`],
     [`const url = ref<string | null>(null)
 const resources = useGameResourceProvider()
 
@@ -293,20 +297,66 @@ const handleError = () => {
 }`, `const resources = useGameResourceProvider()
 const client = useLeagueClientStore()
 const local = computed(() => props.src ? resources.assets.resolve(props.src) : null)
-const failedLocal = ref(false)
-const failedRemote = ref<string | null>(null)
-watch(local, () => { failedLocal.value = false; failedRemote.value = null }, { flush: 'sync' })
+const failed = shallowRef<string[]>()
+watch([local, () => props.fallbackKind, () => props.fallbackId], () => {
+  failed.value = undefined
+}, { flush: 'sync' })
 const url = computed(() => {
-  if (!failedLocal.value) return local.value
-  const remote = gameArtFallback(local.value, client.gameData.champions)
-  return remote !== failedRemote.value ? remote : null
+  const source = local.value
+  if (source && !failed.value?.includes(source)) return source
+  return gameArtFallbacks(source, client.gameData.champions, props.fallbackKind, props.fallbackId)
+    .find((candidate: string) => !failed.value?.includes(candidate)) ?? null
 })
 const handleError = (event: Event) => {
-  const failed = (event.currentTarget as HTMLImageElement).currentSrc
-  if (failed !== new URL(url.value || '', document.baseURI).href) return
-  if (!failedLocal.value) failedLocal.value = true
-  else failedRemote.value = failed
+  const source = url.value
+  // A failed fetch can leave currentSrc empty. The keyed image's src still
+  // identifies the attempted URL, including when the prior element is gone.
+  const attempted = (event.currentTarget as HTMLImageElement).src
+  if (!source || attempted !== new URL(source, document.baseURI).href) return
+  failed.value = [...(failed.value ?? []), source]
 }`]
+  ])
+  const widgetDirectory = join(sourceRoot, 'src/renderer-shared/components/widgets')
+  const fallbackWidgets = [
+    { name: 'ItemDisplay', display: 'itemDisplay', kind: 'item', id: 'itemId', tooltipImage: true },
+    { name: 'SummonerSpellDisplay', display: 'spellDisplay', kind: 'spell', id: 'spellId', className: 'spell' },
+    { name: 'PerkDisplay', display: 'perkDisplay', kind: 'perk', id: 'perkId', className: 'perk', tooltipImage: true },
+    { name: 'PerkstyleDisplay', display: 'perkStyleDisplay', kind: 'perk-style', id: 'perkstyleId', className: 'perkstyle', tooltipImage: true }
+  ]
+  for (const { name, display, kind, id, className, tooltipImage } of fallbackWidgets) {
+    const src = `:src="${display}.iconPath"`
+    const fallback = `fallback-kind="${kind}" :fallback-id="${id}"`
+    const sizeAttribute = ':style="{ width: `${size}px`, height: `${size}px` }"'
+    const placeholder = `  <div
+    v-else
+    ${sizeAttribute}`
+    const appearance = className ? `class="${className}"` : ':class="{ trinket: isTrinket, item: !isTrinket }"'
+    const replacements = [
+      [`        ${src}`, `        ${src} ${fallback}`],
+      [placeholder, `  <LcuImage
+    v-else-if="${id} && ${id} > 0"
+    v-bind="$attrs"
+    ${fallback}
+    ${appearance}
+    ${sizeAttribute}
+  />
+${placeholder}`]
+    ]
+    if (tooltipImage) replacements.push([`class="image" ${src}`, `class="image" ${src} ${fallback}`])
+    if (kind === 'item') {
+      for (const direction of ['from', 'to']) {
+        const child = `:src="componentItem.iconPath"
+        v-for="componentItem of itemDisplay.${direction}"`
+        replacements.push([child, `fallback-kind="item" :fallback-id="componentItem.id"
+        ${child}`])
+      }
+    }
+    transforms.set(join(widgetDirectory, `${name}.vue`).replaceAll('\\', '/'), replacements)
+  }
+  const gameAssetPaths = join(sourceRoot, 'src/renderer-shared/shards/league-client/game-data-assets.ts')
+  transforms.set(gameAssetPaths.replaceAll('\\', '/'), [
+    ['export function profileIconUri(iconId: number) {', `export function profileIconUri(iconId: number) {
+  if (!Number.isInteger(iconId) || iconId < 0 || iconId > 0xffff_ffff) iconId = 0`]
   ])
   const resolveFromPath = 'akari://league-client${normalizeLcuPath(normalizedSource)}'
   const resolveFromUrl = 'akari://league-client${normalizeLcuPath(`${url.pathname}${url.search}${url.hash}`)}'

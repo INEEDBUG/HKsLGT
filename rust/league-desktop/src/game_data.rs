@@ -1,6 +1,9 @@
 //! Read-only game data for the retained Vue store, using the verified local client.
 
-use super::{game_art::GameArtPath, LcuError, LcuTarget, LcuTransport, ReadEndpoint};
+use super::{
+    game_art::{strip_case_prefix, GameArtPath},
+    LcuError, LcuTarget, LcuTransport, ReadEndpoint,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -171,7 +174,10 @@ impl GameDataEndpoint {
         };
         fields.retain(|name, value| match name.as_str() {
             "iconPath" | "squarePortraitPath" => value.as_str().is_some_and(local_asset_path),
-            "augmentSmallIconPath" => value.as_str().and_then(GameArtPath::parse).is_some(),
+            "augmentSmallIconPath" => value
+                .as_str()
+                .and_then(GameArtPath::parse_catalog_path)
+                .is_some(),
             _ => !value.is_null(),
         });
         if let Some(assets) = fields.get_mut("assetMap").and_then(Value::as_object_mut) {
@@ -291,17 +297,16 @@ fn project<T: DeserializeOwned + Serialize>(value: Value) -> Result<Value, LcuEr
 }
 
 fn local_asset_path(path: &str) -> bool {
+    let relative = path.strip_prefix('/').unwrap_or(path);
     path.len() <= 1024
-        && path
-            .strip_prefix("/lol-game-data/assets/")
-            .is_some_and(|asset| {
-                asset.split('/').all(|part| {
-                    !matches!(part, "" | "." | "..")
-                        && part
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"._- ()".contains(&byte))
-                })
+        && strip_case_prefix(relative, "lol-game-data/assets/").is_some_and(|asset| {
+            asset.split('/').all(|part| {
+                !matches!(part, "" | "." | "..")
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._- ()".contains(&byte))
             })
+        })
 }
 
 // Existing Vue tooltips use v-html. Keep the elements styled by the UI,

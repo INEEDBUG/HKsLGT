@@ -241,10 +241,33 @@ export function useNativeAuxLounge() {
   const agfs = useAutoGameflowStore()
   const agf = useInstance(AutoGameflowRenderer)
   const now = ref(Date.now())
-  const { pause, resume } = useIntervalFn(() => { now.value = Date.now() }, 100, {
-    immediate: false, immediateCallback: true
-  })
-  watch(() => agfs.willAcceptAt > 0 || agfs.willSearchMatch, (active) => {
+  const queueSample = computed(() => view.value?.phase === 'Matchmaking' ? view.value.queueSeconds : null)
+  const penaltySample = computed(() => view.value?.phase === 'Matchmaking' ? view.value.penaltySeconds ?? null : null)
+  const elapsedQueueSeconds = ref<number | null>(null)
+  const tickAt = ref(performance.now())
+  let queueSampleAt = tickAt.value
+  let penaltySampleAt = tickAt.value
+  // Bridge the two-second native poll and an in-flight read without advancing
+  // indefinitely when the client stops supplying a fresh sample.
+  const secondsSince = (sampleAt: number) => Math.min(4, Math.max(0, (tickAt.value - sampleAt) / 1000))
+  watch(queueSample, (seconds, previous) => {
+    queueSampleAt = performance.now()
+    if (seconds == null || previous == null || seconds < previous) {
+      elapsedQueueSeconds.value = seconds
+    } else {
+      elapsedQueueSeconds.value = Math.max(seconds, elapsedQueueSeconds.value ?? seconds)
+    }
+  }, { immediate: true, flush: 'sync' })
+  watch(penaltySample, () => { penaltySampleAt = performance.now() }, { flush: 'sync' })
+  const { pause, resume } = useIntervalFn(() => {
+    now.value = Date.now()
+    tickAt.value = performance.now()
+    const seconds = queueSample.value
+    if (seconds != null) {
+      elapsedQueueSeconds.value = Math.max(elapsedQueueSeconds.value ?? seconds, seconds + secondsSince(queueSampleAt))
+    }
+  }, 100, { immediate: false, immediateCallback: true })
+  watch(() => queueSample.value != null || (penaltySample.value ?? 0) > 0 || agfs.willAcceptAt > 0 || agfs.willSearchMatch, (active) => {
     if (active) resume()
     else pause()
   }, { immediate: true })
@@ -253,7 +276,10 @@ export function useNativeAuxLounge() {
     ...activity, lcs, agfs, ...useNativeModeIcon(view),
     willAcceptIn: computed(() => Math.max(0, (agfs.willAcceptAt - now.value) / 1000)),
     willSearchMatchIn: computed(() => Math.max(0, (agfs.willSearchMatchAt - now.value) / 1000)),
-    penaltyTime: computed(() => view.value?.penaltySeconds ?? null),
+    elapsedQueueSeconds,
+    penaltyTime: computed(() => penaltySample.value == null
+      ? view.value?.penaltySeconds ?? null
+      : Math.max(0, penaltySample.value - secondsSince(penaltySampleAt))),
     penaltyTotalTime: computed(() => view.value?.penaltyTotalSeconds ?? null),
     handleAccept: () => run('acceptReadyCheck'),
     handleDecline: () => run('declineReadyCheck'),

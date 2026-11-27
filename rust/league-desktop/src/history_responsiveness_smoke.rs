@@ -72,6 +72,43 @@ const QUEUE_BLOCKERS: [&str; 4] = [
 ];
 const QUEUED_IMAGE: &str = "v1/champion-icons/412.png";
 const QUEUE_HOLD: Duration = Duration::from_millis(3200);
+const CDN_ONLY: &str = "HKSLGT_HISTORY_CDN_ONLY";
+const CDN_MISSING_ITEM: u32 = 6672;
+const CDN_LOCAL_MISSING: [&str; 6] = [PROFILE, ITEMS[0].1, FLASH, PERK, PERK_STYLE, AUGMENT];
+const CDN_IMAGES: [(&str, u16); 8] = [
+    (
+        "https://game.gtimg.cn/images/lol/act/img/item/3006.png",
+        200,
+    ),
+    (
+        "https://game.gtimg.cn/images/lol/act/img/item/6672.png",
+        200,
+    ),
+    (
+        "https://game.gtimg.cn/images/lol/act/img/spell/SummonerFlash.png",
+        200,
+    ),
+    (
+        "https://game.gtimg.cn/images/lol/act/img/rune/8005.png",
+        200,
+    ),
+    (
+        "https://game.gtimg.cn/images/lol/act/img/rune/7200_Domination.png",
+        200,
+    ),
+    (
+        "https://game.gtimg.cn/images/lol/act/img/rune/magicmissile_small.png",
+        200,
+    ),
+    (
+        "https://game.gtimg.cn/images/lol/act/img/profileicon/29.png",
+        404,
+    ),
+    (
+        "https://ddragon.leagueoflegends.com/cdn/16.23.1/img/profileicon/29.png",
+        200,
+    ),
+];
 
 fn expected_art() -> impl Iterator<Item = &'static str> {
     ITEMS.into_iter().map(|(_, path)| path).chain([
@@ -170,6 +207,8 @@ struct HistoryRequests {
     new_game_reads: usize,
     champion_images: usize,
     history_art: BTreeSet<&'static str>,
+    cdn_case: bool,
+    local_cdn_failures: BTreeSet<&'static str>,
     bitmap_probe_responses: Vec<u16>,
     artwork_queue: Option<ArtworkQueue>,
     catalog_reads: BTreeMap<&'static str, usize>,
@@ -209,6 +248,14 @@ impl HistoryFixture {
         *self.requests.lock().unwrap() = HistoryRequests {
             hold: true,
             hold_details: true,
+            ..Default::default()
+        };
+        self.active.store(true, Ordering::Release);
+    }
+
+    fn begin_cdn(&self) {
+        *self.requests.lock().unwrap() = HistoryRequests {
+            cdn_case: true,
             ..Default::default()
         };
         self.active.store(true, Ordering::Release);
@@ -270,8 +317,28 @@ impl HistoryFixture {
             return None;
         }
         let relative = path.strip_prefix(ASSETS)?;
-        let asset = expected_art().find(|asset| asset.eq_ignore_ascii_case(relative))?;
         let mut requests = self.requests.lock().unwrap();
+        if requests.cdn_case {
+            if let Some(asset) = CDN_LOCAL_MISSING
+                .into_iter()
+                .find(|&asset| asset == relative)
+            {
+                requests.local_cdn_failures.insert(asset);
+                return Some((404, "application/json"));
+            }
+            let known_portrait = relative
+                .strip_prefix("v1/champion-icons/")
+                .and_then(|file| file.strip_suffix(".png"))
+                .and_then(|id| id.parse::<u32>().ok())
+                .is_some_and(|id| [1, 21, 22, 45, 55, 75, 86, 99, 103, 111].contains(&id));
+            if (relative.ends_with(".png") || relative.ends_with(".jpg"))
+                && !known_portrait
+                && !expected_art().any(|asset| asset == relative && asset != ITEMS[1].1)
+            {
+                return Some((404, "application/json"));
+            }
+        }
+        let asset = expected_art().find(|asset| asset.eq_ignore_ascii_case(relative))?;
         if asset == BITMAP_PROBE && requests.bitmap_probe_responses.is_empty() {
             requests.bitmap_probe_responses.push(503);
             println!("HKSLGT_HISTORY_BITMAP_503: {asset}");
@@ -307,7 +374,8 @@ impl HistoryFixture {
             let attempts = requests.catalog_reads.entry(catalog).or_default();
             *attempts += 1;
             let attempt = *attempts;
-            if LATE_CATALOGS.contains(&catalog)
+            if !requests.cdn_case
+                && LATE_CATALOGS.contains(&catalog)
                 && (attempt <= INITIAL_CATALOG_ATTEMPTS || !requests.recover_catalogs)
             {
                 println!("HKSLGT_HISTORY_CATALOG_503: {catalog} attempt={attempt}");
@@ -373,10 +441,10 @@ impl HistoryFixture {
                     "xpSinceLastLevel":30,"xpUntilNextLevel":70,"privacy":"PUBLIC"}),
                 ))
             }
-            "/lol-game-data/assets/v1/items.json" => Some((200, json!(ITEMS.map(|(id,path)| json!({
+            "/lol-game-data/assets/v1/items.json" => Some((200, json!(ITEMS.into_iter().filter(|(id, _)| !requests.cdn_case || *id != CDN_MISSING_ITEM).map(|(id,path)| json!({
                 "id":id,"name":format!("Fixture item {id}"),"iconPath":asset_path(path),
                 "description":"<mainText>Fixture item</mainText>","from":[],"to":[],"price":500,"priceTotal":2800
-            }))))),
+            })).collect::<Vec<_>>()))),
             "/lol-game-data/assets/v1/summoner-spells.json" => Some((200, json!([
                 {"id":4,"name":"Flash","iconPath":asset_path(FLASH),"description":"Blink briefly.","summonerLevel":7,"cooldown":300,"gameModes":["ARAM","KIWI"]},
                 {"id":32,"name":"Mark","iconPath":asset_path(MARK),"description":"Mark an opponent.","summonerLevel":1,"cooldown":80,"gameModes":["ARAM","KIWI"]}
@@ -398,6 +466,12 @@ impl HistoryFixture {
             }
             GAMES => {
                 requests.pages += 1;
+                if requests.cdn_case {
+                    let games = [NEW_GAME, KIWI_GAME].map(|id| game(id, false));
+                    return Some((200, json!({"accountId":42,"platformId":"HN1","games":{
+                        "gameIndexBegin":0,"gameIndexEnd":1,"gameCount":2,"games":games
+                    }})));
+                }
                 let (mut state, elapsed) = self
                     .release
                     .wait_timeout_while(requests, Duration::from_secs(7), |r| r.hold)
@@ -972,7 +1046,271 @@ async fn input_round_trip(main: &WebviewWindow, label: &'static str) {
     println!("HKSLGT_HISTORY_UI_ACK: {label} in {:?}", started.elapsed());
 }
 
+#[derive(Default)]
+struct CdnResponses {
+    by_url: BTreeMap<&'static str, u16>,
+    had_credentials_or_referrer: bool,
+    error: Option<String>,
+}
+
+async fn intercept_cdn_images(main: &WebviewWindow) -> Arc<Mutex<CdnResponses>> {
+    use base64::Engine;
+    use webview2_com::{
+        CoTaskMemPWSTR,
+        Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_22, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE,
+            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+        },
+        WebResourceRequestedEventHandler,
+    };
+    use windows::{
+        core::{w, Error, Interface, PCWSTR, PWSTR},
+        Win32::{Foundation::E_OUTOFMEMORY, UI::Shell::SHCreateMemStream},
+    };
+
+    let decoded_png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAIAAAASFvFNAAAAFUlEQVR4nGO4pMEvt8BNK+8EA5wFAEKIBtsqErd8AAAAAElFTkSuQmCC")
+        .expect("valid, generated 3x2 artwork fixture");
+    let responses = Arc::new(Mutex::new(CdnResponses::default()));
+    let capture = Arc::clone(&responses);
+    let registration = Arc::new(Mutex::new("dispatch to the WebView2 UI thread"));
+    let step = Arc::clone(&registration);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    main.with_webview(move |webview| {
+        // WebView2 requires that the filters and handler be installed on its own UI thread.
+        let result = (|| -> windows::core::Result<()> {
+            *step.lock().unwrap() = "get CoreWebView2";
+            let controller = webview.controller();
+            let environment = webview.environment();
+            let core = unsafe { controller.CoreWebView2()? };
+            let modern_filters = core.cast::<ICoreWebView2_22>().ok();
+            for (url, _) in CDN_IMAGES {
+                *step.lock().unwrap() = url;
+                let wide: Vec<_> = url.encode_utf16().chain([0]).collect();
+                unsafe {
+                    if let Some(modern) = &modern_filters {
+                        modern.AddWebResourceRequestedFilterWithRequestSourceKinds(
+                            PCWSTR(wide.as_ptr()),
+                            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE,
+                            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+                        )?;
+                    } else {
+                        core.AddWebResourceRequestedFilter(
+                            PCWSTR(wide.as_ptr()),
+                            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE,
+                        )?;
+                    }
+                }
+            }
+            *step.lock().unwrap() = "register WebResourceRequested handler";
+            let handler = WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                // These generated COM interfaces are used only here on the WebView2 callback thread.
+                let result = (|| unsafe {
+                    let request = args.Request()?;
+                    let mut uri = PWSTR::null();
+                    request.Uri(&mut uri)?;
+                    let uri = CoTaskMemPWSTR::from(uri).to_string();
+                    let Some((url, status)) = CDN_IMAGES.into_iter().find(|&(url, _)| uri == url)
+                    else {
+                        return Ok(());
+                    };
+                    let mut method = PWSTR::null();
+                    request.Method(&mut method)?;
+                    if CoTaskMemPWSTR::from(method).to_string() != "GET" {
+                        return Ok(());
+                    }
+                    let headers = request.Headers()?;
+                    let mut authorization = Default::default();
+                    let mut referer = Default::default();
+                    headers.Contains(w!("Authorization"), &mut authorization)?;
+                    headers.Contains(w!("Referer"), &mut referer)?;
+                    let png = (status == 200).then_some(decoded_png.as_slice());
+                    let body = SHCreateMemStream(png).ok_or_else(|| Error::from(E_OUTOFMEMORY))?;
+                    let reason = if status == 200 {
+                        w!("OK")
+                    } else {
+                        w!("Not Found")
+                    };
+                    let response = environment.CreateWebResourceResponse(
+                        &body,
+                        i32::from(status),
+                        reason,
+                        w!("Content-Type: image/png\r\nCache-Control: no-store"),
+                    )?;
+                    args.SetResponse(&response)?;
+                    let mut responses = capture.lock().unwrap();
+                    responses.by_url.insert(url, status);
+                    responses.had_credentials_or_referrer |=
+                        authorization.as_bool() || referer.as_bool();
+                    Ok(())
+                })();
+                if let Err(error) = &result {
+                    capture.lock().unwrap().error = Some(format!("{error}"));
+                }
+                result
+            }));
+            let mut token = 0;
+            unsafe { core.add_WebResourceRequested(&handler, &mut token)? };
+            Ok(())
+        })();
+        let _ = send.send(result.map_err(|error| format!("{}: {error}", *step.lock().unwrap())));
+    })
+    .expect("schedule the offline response filter on the real WebView2");
+    match tokio::time::timeout(Duration::from_secs(8), receive).await {
+        Ok(Ok(Ok(()))) => println!("HKSLGT_HISTORY_CDN_FILTER_READY"),
+        Ok(Ok(Err(error))) => panic!("WebView2 CDN filter setup rejected: {error}"),
+        Ok(Err(error)) => panic!(
+            "WebView2 CDN filter callback dropped at {}: {error}",
+            *registration.lock().unwrap()
+        ),
+        Err(_) => panic!(
+            "WebView2 CDN filter setup did not finish at {}",
+            *registration.lock().unwrap()
+        ),
+    }
+    responses
+}
+
+async fn check_persistent_artwork(app: &AppHandle) {
+    let profile = app.state::<DesktopProfile>();
+    bootstrap::backend_pref("self-update-main", "autoCheckUpdates")
+        .unwrap()
+        .write(&profile.database.lock().unwrap(), &json!(false))
+        .unwrap();
+    let runtime = app.state::<ClientRuntime>();
+    runtime.select(app, None).unwrap();
+    let server = app.state::<MiniClient>();
+    server.scene.lock().unwrap().phase = "None";
+    server.history.begin_cdn();
+    let client = Arc::new(LocalClient::fixture_at(server.port).expect("isolated HN1 HTTPS peer"));
+    let main = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("main-window.html".into()))
+        .data_directory(profile.directory.join("PersistentArtWebView2"))
+        .inner_size(1000.0, 760.0)
+        .decorations(false)
+        .on_navigation(super::super::bundled_navigation)
+        .build()
+        .expect("open the genuine bundled main window");
+    // Wry queues creation for this worker thread; a builder handle alone does
+    // not prove that the UI thread has registered and navigated its WebView2.
+    check_renderer(
+        &main,
+        "!!document.querySelector('.menu-item[data-key=player-tabs]')",
+        "bundled main page mounted before installing WebView2 image filters",
+        || {},
+    )
+    .await;
+    // Set the normal wide layout before navigation, so the actual cards never
+    // need to remount in the change between local artwork and public fallback.
+    main.set_zoom(0.72)
+        .expect("widen this isolated history viewport");
+    check_renderer(
+        &main,
+        "document.querySelector('.app-frame__right-content')?.clientWidth >= 1064 && !!document.querySelector('.menu-item[data-key=player-tabs]')",
+        "genuine main navigation and wide history viewport",
+        || {},
+    )
+    .await;
+    let intercepted = intercept_cdn_images(&main).await;
+    let document_origin: f64 = page_result(&main, "performance.timeOrigin").await;
+    main.eval(
+        r#"(() => {
+        const observeCards = new MutationObserver(() => {
+            const cards = [...document.querySelectorAll('[class*="contain-intrinsic-size:116px"]')];
+            if (cards.length === 2) {
+                window.__hkslgtCdnCards = cards;
+                observeCards.disconnect();
+            }
+        });
+        observeCards.observe(document.querySelector('#app'), {subtree: true, childList: true});
+    })()"#,
+    )
+    .unwrap();
+    runtime.sample_fixture(app, &client).await;
+    assert!(page_bool(&main, "(() => { document.querySelector('.menu-item[data-key=player-tabs]').click(); return true })()", "open real ARAM and KIWI cards").await);
+    check_renderer(
+        &main,
+        "location.hash.includes('player-tabs') && window.__hkslgtCdnCards?.length === 2",
+        "the two original ARAM and KIWI card elements",
+        || {},
+    )
+    .await;
+
+    let started = Instant::now();
+    loop {
+        if let Some(error) = &intercepted.lock().unwrap().error {
+            panic!("WebView2 CDN image response failed: {error}");
+        }
+        let decoded: BTreeSet<String> = tokio::time::timeout(BUDGET, page_result(
+            &main,
+            r#"Array.from(document.querySelectorAll('.mb-6.h-28 img, [class*="contain-intrinsic-size:116px"] img'))
+                .filter(img => img.naturalWidth === 3 && img.naturalHeight === 2 && img.getClientRects().length)
+                .map(img => img.currentSrc)"#,
+        )).await.expect("read the actual fallback image dimensions");
+        let missing: Vec<_> = CDN_IMAGES
+            .into_iter()
+            .filter(|&(url, status)| status == 200 && !decoded.contains(url))
+            .map(|(url, _)| url)
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(8),
+            "HKSLGT_HISTORY_CDN_MISSING: {missing:?}; intercepted={:?}; persistent local 404={:?}; decoded={decoded:?}",
+            intercepted.lock().unwrap().by_url, server.history.requests.lock().unwrap().local_cdn_failures);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    check_renderer(
+        &main,
+        TEAMMATE_AND_EMPTY_SLOT,
+        "decoded local teammate avatar and correctly empty zero equipment slot",
+        || {},
+    )
+    .await;
+    check_renderer(&main, r#"(() => {
+        const header = document.querySelector('.mb-6.h-28');
+        const cards = [...document.querySelectorAll('[class*="contain-intrinsic-size:116px"]')];
+        return header.innerText.includes('History Fixture') &&
+            header.querySelector('img[src^="https://ddragon.leagueoflegends.com/"][src$="/profileicon/29.png"]')?.naturalWidth === 3 &&
+            cards.every((card, i) => card === window.__hkslgtCdnCards[i]) &&
+            cards.some(card => [...card.querySelectorAll('img')].some(img => img.currentSrc.includes('http://league-art.localhost/lol-game-data/assets/v1/champion-icons/') && img.naturalWidth > 1)) &&
+            cards[1].querySelector('img.augment.gold[src$="/rune/magicmissile_small.png"]')?.naturalWidth === 3 &&
+            /13\s*\/\s*3\s*\/\s*19/.test(cards[0].innerText);
+    })()"#, "the same player and two unchanged cards, with local champion and rendered KIWI fallback", || {}).await;
+    assert_eq!(
+        page_result::<f64>(&main, "performance.timeOrigin").await,
+        document_origin
+    );
+    let (_, game_data) = runtime
+        .fields("league-client-main", "gameData")
+        .unwrap()
+        .unwrap();
+    assert!(game_data["items"]
+        .get(CDN_MISSING_ITEM.to_string())
+        .is_none());
+    assert!(Arc::ptr_eq(&runtime.selected_client().unwrap(), &client));
+    assert_eq!(
+        server.history.requests.lock().unwrap().local_cdn_failures,
+        BTreeSet::from(CDN_LOCAL_MISSING)
+    );
+    let hits = intercepted.lock().unwrap();
+    assert_eq!(hits.by_url, BTreeMap::from(CDN_IMAGES));
+    assert!(
+        !hits.had_credentials_or_referrer,
+        "public artwork requests carry no native credentials or referrer"
+    );
+    println!("HKSLGT_HISTORY_CDN_PASS: six permanent local 404s and one missing item catalog ID recovered from exact offline-intercepted CDN URLs; local controls and the original cards stayed intact");
+    drop(hits);
+    server.history.end();
+    main.destroy()
+        .expect("close the isolated CDN regression window");
+}
+
 pub(super) async fn check(app: &AppHandle) {
+    if std::env::var_os(CDN_ONLY).is_some() {
+        check_persistent_artwork(app).await;
+        return;
+    }
     let profile = app.state::<DesktopProfile>();
     let (aux_enabled, auto_update) = {
         let db = profile.database.lock().unwrap();

@@ -11,7 +11,10 @@ fn normalizes_only_the_mode_badges_reported_by_map_assets() {
     let crepe_badge =
         "/lol-game-data/assets/content/src/LeagueClient/GameModeAssets/Crepe/img/game-select-icon-hover.png";
     for badge in [shared_badge, crepe_badge] {
-        assert_eq!(GameArtPath::parse(&badge[1..]).map(|path| path.canonical), None);
+        assert_eq!(
+            GameArtPath::parse(&badge[1..]).map(|path| path.canonical),
+            None
+        );
         for raw in [&badge[1..], badge, &badge.to_ascii_lowercase()] {
             let path = GameArtPath::parse_mode_icon(raw).unwrap();
             assert_eq!(path.path(), badge);
@@ -97,6 +100,21 @@ fn permits_only_known_bitmap_families_and_canonicalizes_percent_escapes() {
 }
 
 #[test]
+fn recognizes_the_same_image_families_in_different_case_without_rewriting_the_client_path() {
+    for path in [
+        "/LOL-GAME-DATA/Assets/assets/items/icons2d/3006_Class_T2_BerserkersGreaves.png",
+        "/lol-game-data/assets/data/spells/icons2d/Summoner_flash.png",
+        "/lol-game-data/assets/assets/maps/particles/kiwi/MagicMissile_small.png",
+    ] {
+        assert_eq!(GameArtPath::parse(path).unwrap().path(), path);
+    }
+    assert!(
+        GameArtPath::parse("/lol-game-data/assets/assets/maps/particles/kiwi/Unlisted.png")
+            .is_none()
+    );
+}
+
+#[test]
 fn accepts_local_skin_carousel_previews_without_opening_the_character_asset_tree() {
     for suffix in [
         "Ashe/Skins/Base/Images/ashe_splash_centered_0.jpg",
@@ -131,14 +149,20 @@ fn accepts_augment_icons_without_opening_the_generic_particle_tree() {
         "ASSETS/Maps/Particles/Kiwi/MagicMissile_small.png",
         "ASSETS/Maps/Particles/Kiwi/SelfDestruct_small.png",
     ] {
-        assert!(GameArtPath::parse(&format!("{ASSET_PREFIX}{path}")).is_some(), "{path}");
+        assert!(
+            GameArtPath::parse(&format!("{ASSET_PREFIX}{path}")).is_some(),
+            "{path}"
+        );
     }
     for path in [
         "ASSETS/UX/Kiwi/Augments/Icons/first-aid.svg",
         "ASSETS/UX/Kiwi/Augments/Other/icon.png",
         "ASSETS/Maps/Particles/Kiwi/Unlisted_small.png",
     ] {
-        assert!(GameArtPath::parse(&format!("{ASSET_PREFIX}{path}")).is_none(), "{path}");
+        assert!(
+            GameArtPath::parse(&format!("{ASSET_PREFIX}{path}")).is_none(),
+            "{path}"
+        );
     }
 }
 
