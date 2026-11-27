@@ -433,6 +433,7 @@ mod tests {
                 summoner: json!({"puuid":player}),
                 companions: CompanionTargets::default(),
                 aux_activity: AuxActivity::Inactive,
+                draft_mode_conflicted: false,
                 room: None,
                 room_unconfirmed: false,
                 shard: None,

@@ -169,7 +169,7 @@ fn serve(
     }
     let mut body = vec![0; size];
     reader.read_exact(&mut body)?;
-    let history_art = if authenticated && method == "GET" {
+    let history_art = if authenticated && method == "GET" && !history.hold_queue_artwork(path) {
         if let Some((status, response)) = history.get(path) {
             let bytes = serde_json::to_vec(&response)?;
             write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len())?;
@@ -183,7 +183,9 @@ fn serve(
     let mut scene = scene.lock().unwrap();
     let (status, mime, bytes) = if !authenticated {
         (401, "application/json", vec![])
-    } else if method == "GET" && (path == OWNED_SKIN_PREVIEW || history_art == Some("image/jpeg")) {
+    } else if let Some((503, mime)) = history_art {
+        (503, mime, vec![])
+    } else if method == "GET" && (path == OWNED_SKIN_PREVIEW || history_art == Some((200, "image/jpeg"))) {
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::STANDARD.decode(concat!(
             "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/",

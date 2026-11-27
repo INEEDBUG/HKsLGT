@@ -28,6 +28,7 @@ const FIRST_GAME: u64 = 8_050_001;
 const PAGE_SIZE: u64 = 20;
 const NEW_GAME: u64 = FIRST_GAME + PAGE_SIZE;
 const KIWI_GAME: u64 = NEW_GAME - 1;
+const BITMAP_PROBE_GAME: u64 = KIWI_GAME - 1;
 const ASSETS: &str = "/lol-game-data/assets/";
 const PROFILE: &str = "v1/profile-icons/29.jpg";
 const TEAMMATE_PROFILE: &str = "v1/profile-icons/0.jpg";
@@ -59,7 +60,18 @@ const FLASH: &str = "DATA/Spells/Icons2D/Summoner_flash.png";
 const MARK: &str = "DATA/Spells/Icons2D/Summoner_Mark.png";
 const PERK: &str = "v1/perk-images/Styles/Precision/PressTheAttack/PressTheAttack.png";
 const PERK_STYLE: &str = "v1/perk-images/Styles/7200_Domination.png";
+const BITMAP_PROBE: &str = "v1/perk-images/Styles/7202_Sorcery.png";
 const AUGMENT: &str = "ASSETS/Maps/Particles/Kiwi/MagicMissile_small.png";
+const LATE_CATALOGS: [&str; 3] = ["augments", "items", "spells"];
+const INITIAL_CATALOG_ATTEMPTS: usize = 3;
+const QUEUE_BLOCKERS: [&str; 4] = [
+    "v1/champion-icons/266.png",
+    "v1/champion-icons/222.png",
+    "v1/champion-icons/67.png",
+    "v1/champion-icons/238.png",
+];
+const QUEUED_IMAGE: &str = "v1/champion-icons/412.png";
+const QUEUE_HOLD: Duration = Duration::from_millis(3200);
 
 fn expected_art() -> impl Iterator<Item = &'static str> {
     ITEMS.into_iter().map(|(_, path)| path).chain([
@@ -69,6 +81,7 @@ fn expected_art() -> impl Iterator<Item = &'static str> {
         MARK,
         PERK,
         PERK_STYLE,
+        BITMAP_PROBE,
         AUGMENT,
     ])
 }
@@ -103,7 +116,8 @@ fn game(id: u64, full: bool) -> Value {
             "totalDamageTaken":19500,"totalMinionsKilled":41,"neutralMinionsKilled":0,"magicDamageDealtToChampions":1500,
             "physicalDamageDealtToChampions":32567,"trueDamageDealtToChampions":500,"totalDamageDealt":66000,
             "physicalDamageTaken":1000,"magicalDamageTaken":12000,"trueDamageTaken":500,"totalHeal":0,
-            "totalUnitsHealed":0,"visionScore":0,"perkPrimaryStyle":8000,"perkSubStyle":8100});
+            "totalUnitsHealed":0,"visionScore":0,"perkPrimaryStyle":8000,
+            "perkSubStyle":if id == BITMAP_PROBE_GAME && slot == 1 {8200} else {8100}});
         let fields = stats.as_object_mut().unwrap();
         for (index, (item, _)) in ITEMS.into_iter().enumerate() {
             fields.insert(
@@ -156,6 +170,8 @@ struct HistoryRequests {
     new_game_reads: usize,
     champion_images: usize,
     history_art: BTreeSet<&'static str>,
+    bitmap_probe_responses: Vec<u16>,
+    artwork_queue: Option<ArtworkQueue>,
     catalog_reads: BTreeMap<&'static str, usize>,
     recover_catalogs: bool,
     ranked: usize,
@@ -165,6 +181,15 @@ struct HistoryRequests {
     in_flight: usize,
     peak: usize,
     hold_details: bool,
+    timed_out: bool,
+}
+
+#[derive(Default)]
+struct ArtworkQueue {
+    blockers: BTreeSet<&'static str>,
+    first_read: Option<Instant>,
+    released: bool,
+    queued_reads: usize,
     timed_out: bool,
 }
 
@@ -205,21 +230,63 @@ impl HistoryFixture {
 
     fn release_catalogs(&self) {
         self.requests.lock().unwrap().recover_catalogs = true;
-        self.release.notify_all();
     }
 
-    pub(super) fn art(&self, path: &str) -> Option<&'static str> {
+    pub(super) fn hold_queue_artwork(&self, path: &str) -> bool {
+        let Some(relative) = path.strip_prefix(ASSETS) else {
+            return false;
+        };
+        let blocker = QUEUE_BLOCKERS.into_iter().find(|&image| image == relative);
+        if blocker.is_none() && relative != QUEUED_IMAGE {
+            return false;
+        }
+        let mut requests = self.requests.lock().unwrap();
+        let Some(queue) = requests.artwork_queue.as_mut() else {
+            return false;
+        };
+        let Some(blocker) = blocker else {
+            queue.queued_reads += 1;
+            return true;
+        };
+        queue.first_read.get_or_insert_with(Instant::now);
+        queue.blockers.insert(blocker);
+        let (mut requests, elapsed) = self
+            .release
+            .wait_timeout_while(requests, Duration::from_secs(4), |state| {
+                state
+                    .artwork_queue
+                    .as_ref()
+                    .is_some_and(|queue| !queue.released)
+            })
+            .unwrap();
+        if elapsed.timed_out() {
+            requests.artwork_queue.as_mut().unwrap().timed_out = true;
+        }
+        true
+    }
+
+    pub(super) fn art(&self, path: &str) -> Option<(u16, &'static str)> {
         if !self.active() {
             return None;
         }
         let relative = path.strip_prefix(ASSETS)?;
         let asset = expected_art().find(|asset| asset.eq_ignore_ascii_case(relative))?;
-        self.requests.lock().unwrap().history_art.insert(asset);
-        Some(if asset.ends_with(".jpg") {
+        let mut requests = self.requests.lock().unwrap();
+        if asset == BITMAP_PROBE && requests.bitmap_probe_responses.is_empty() {
+            requests.bitmap_probe_responses.push(503);
+            println!("HKSLGT_HISTORY_BITMAP_503: {asset}");
+            return Some((503, "application/json"));
+        }
+        if asset == BITMAP_PROBE {
+            requests.bitmap_probe_responses.push(200);
+        }
+        requests.history_art.insert(asset);
+        let mime = if asset.ends_with(".jpg") {
             "image/jpeg"
         } else {
             "image/png"
-        })
+        };
+        Some((200, mime))
     }
 
     pub(super) fn get(&self, path: &str) -> Option<(u16, Value)> {
@@ -239,20 +306,12 @@ impl HistoryFixture {
         if let Some(catalog) = catalog {
             let attempts = requests.catalog_reads.entry(catalog).or_default();
             *attempts += 1;
-            if matches!(catalog, "items" | "spells") {
-                if *attempts == 1 {
-                    println!("HKSLGT_HISTORY_CATALOG_503: {catalog}");
-                    return Some((503, json!({"message":"Fixture catalog still loading"})));
-                }
-                let (state, elapsed) = self
-                    .release
-                    .wait_timeout_while(requests, Duration::from_secs(5), |r| !r.recover_catalogs)
-                    .unwrap();
-                requests = state;
-                if elapsed.timed_out() {
-                    requests.timed_out = true;
-                    return Some((503, json!({"message":"Fixture catalog gate timed out"})));
-                }
+            let attempt = *attempts;
+            if LATE_CATALOGS.contains(&catalog)
+                && (attempt <= INITIAL_CATALOG_ATTEMPTS || !requests.recover_catalogs)
+            {
+                println!("HKSLGT_HISTORY_CATALOG_503: {catalog} attempt={attempt}");
+                return Some((503, json!({"message":"Fixture catalog still loading"})));
             }
         }
         let details = path
@@ -326,7 +385,8 @@ impl HistoryFixture {
                 {"id":8005,"name":"Press the Attack","iconPath":asset_path(PERK),"longDesc":"Repeated attacks apply damage.","endOfGameStatDescs":[]}
             ]))),
             "/lol-game-data/assets/v1/perkstyles.json" => Some((200, json!({"schemaVersion":2,"styles":[
-                {"id":8100,"name":"Domination","iconPath":asset_path(PERK_STYLE),"tooltip":"Burst damage","assetMap":{}}
+                {"id":8100,"name":"Domination","iconPath":asset_path(PERK_STYLE),"tooltip":"Burst damage","assetMap":{}},
+                {"id":8200,"name":"Sorcery","iconPath":asset_path(BITMAP_PROBE),"tooltip":"Spell damage","assetMap":{}}
             ]}))),
             "/lol-game-data/assets/v1/cherry-augments.json" => Some((200, json!([
                 {"id":1133,"augmentNameId":"ARAM_MagicMissile","nameTRA":"Magic Missile","simpleNameTRA":"",
@@ -646,7 +706,14 @@ const CATALOGS_PENDING: &str = r#"(() => {
     return cards.length === 20 &&
         icons.some(img => img.naturalWidth > 1 && img.currentSrc.endsWith('/PressTheAttack.png')) &&
         icons.some(img => img.naturalWidth > 1 && img.currentSrc.includes('/v1/champion-icons/')) &&
-        !icons.some(img => /\/Icons2D\//i.test(img.currentSrc));
+        !icons.some(img => /\/Icons2D\/|MagicMissile_small\.png/i.test(img.currentSrc));
+})()"#;
+
+const ORIGINAL_MATCH_WITH_ART: &str = r#"(() => {
+    const card = document.querySelector('[class*="contain-intrinsic-size:116px"]');
+    return /12\s*\/\s*3\s*\/\s*19/.test(card?.innerText ?? '') &&
+        [...card.querySelectorAll('img')].some(img =>
+            img.currentSrc.endsWith('/MagicMissile_small.png') && img.naturalWidth > 1);
 })()"#;
 
 const TEAMMATE_AND_EMPTY_SLOT: &str = r#"(() => {
@@ -716,6 +783,135 @@ async fn check_history_art(main: &WebviewWindow, history: &HistoryFixture) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn bitmap_retry_before_refresh(
+    main: &WebviewWindow,
+    history: &HistoryFixture,
+) -> (Vec<u16>, bool) {
+    let decoded = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let decoded: BTreeSet<String> = page_result(main, DECODED_ART).await;
+            if decoded.contains(&BITMAP_PROBE.to_ascii_lowercase()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let responses = history
+        .requests
+        .lock()
+        .unwrap()
+        .bitmap_probe_responses
+        .clone();
+    println!("HKSLGT_HISTORY_BITMAP_BEFORE_REFRESH: {BITMAP_PROBE} responses={responses:?}; decoded={decoded}");
+    (responses, decoded)
+}
+
+async fn check_artwork_queue(main: &WebviewWindow, history: &HistoryFixture) {
+    history.requests.lock().unwrap().artwork_queue = Some(ArtworkQueue::default());
+    let paths = QUEUE_BLOCKERS.map(|path| format!("http://league-art.localhost{ASSETS}{path}"));
+    let original_document: f64 = page_result(main, "performance.timeOrigin").await;
+    // Exercise the real WebView URI handler using fresh image URLs. Existing match
+    // cards may already have decoded and cached their own artwork.
+    main.eval(format!(
+        "window.__hkslgtQueue = {{ blockers: {}.map(src => {{ const img = new Image(); img.src = src; return img }}) }}",
+        json!(paths)
+    ))
+    .expect("request the four real image subresources");
+    let first_read = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            {
+                let state = history.requests.lock().unwrap();
+                let queue = state.artwork_queue.as_ref().unwrap();
+                if queue.blockers.len() == QUEUE_BLOCKERS.len() {
+                    break queue.first_read.unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("four distinct HTTPS image requests occupy the four native permits");
+    let queued_url = format!("http://league-art.localhost{ASSETS}{QUEUED_IMAGE}");
+    main.eval(format!(
+        "window.__hkslgtQueue.last = new Image(); window.__hkslgtQueue.last.src = {}",
+        json!(queued_url)
+    ))
+    .expect("queue the fifth image in the same WebView");
+    assert!(
+        page_bool(
+            main,
+            "Boolean(window.__hkslgtQueue?.last?.src)",
+            "observe the queued image in the same browser document"
+        )
+        .await
+    );
+    let queued_at = Instant::now();
+    tokio::time::sleep(QUEUE_HOLD).await;
+    let (released_at, reads_before_release) = {
+        let mut state = history.requests.lock().unwrap();
+        let queue = state.artwork_queue.as_mut().unwrap();
+        queue.released = true;
+        (Instant::now(), queue.queued_reads)
+    };
+    history.release.notify_all();
+    let held_while_waiting = released_at.duration_since(queued_at);
+    let oldest_request = released_at.duration_since(first_read);
+    assert!(
+        held_while_waiting >= QUEUE_HOLD && oldest_request < Duration::from_millis(3900),
+        "four valid requests held {held_while_waiting:?} after the fifth was issued, oldest request {oldest_request:?} (LCU deadline 4s)"
+    );
+    assert_eq!(
+        reads_before_release, 0,
+        "the fifth request must wait for a permit"
+    );
+    let (blocker_widths, queued_width, source): (Vec<u32>, u32, String) =
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let result: (bool, Vec<u32>, u32, String) = page_result(
+                    main,
+                    r#"(() => {
+                        const {blockers, last} = window.__hkslgtQueue;
+                        return [last.complete && blockers.every(i => i.complete),
+                            blockers.map(i => i.naturalWidth), last.naturalWidth, last.currentSrc];
+                    })()"#,
+                )
+                .await;
+                if result.0 {
+                    break (result.1, result.2, result.3);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("all five WebView artwork requests settled after releasing the first four");
+    let queue = history
+        .requests
+        .lock()
+        .unwrap()
+        .artwork_queue
+        .take()
+        .unwrap();
+    println!(
+        "HKSLGT_HISTORY_ART_QUEUE: occupied={} held={held_while_waiting:?} oldest={oldest_request:?} fifthTlsReads={} blockerWidths={blocker_widths:?} fifthWidth={queued_width}",
+        queue.blockers.len(), queue.queued_reads
+    );
+    assert!(
+        !queue.timed_out
+            && blocker_widths.len() == 4
+            && blocker_widths.iter().all(|&width| width > 1)
+    );
+    assert_eq!(
+        page_result::<f64>(main, "performance.timeOrigin").await,
+        original_document
+    );
+    assert!(
+        queue.queued_reads == 1 && queued_width > 1 && source == queued_url,
+        "the same fifth URI needs one authenticated HTTPS request and decoded pixels after waiting"
+    );
 }
 
 async fn click_ready_refresh(main: &WebviewWindow, label: &'static str) {
@@ -961,18 +1157,32 @@ pub(super) async fn check(app: &AppHandle) {
         "HKSLGT_HISTORY_FIRST_PAGE: 20 match cards rendered at {:?}",
         started.elapsed()
     );
+    tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let exhausted = {
+                let state = server.history.requests.lock().unwrap();
+                LATE_CATALOGS.iter().all(|key| {
+                    state.catalog_reads.get(key).copied().unwrap_or(0) >= INITIAL_CATALOG_ATTEMPTS
+                })
+            };
+            if exhausted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("three real HTTPS attempts reached each unavailable catalog");
     check_renderer(
         &main,
         CATALOGS_PENDING,
-        "visible champion and rune art while transient item and spell catalogs are unavailable",
+        "visible champion and rune art while item, spell and augment catalogs remain unavailable",
         || {},
     )
     .await;
-    let document_origin: f64 = page_result(&main, "performance.timeOrigin").await;
-    println!(
-        "HKSLGT_HISTORY_CATALOG_PENDING: champions and runes decoded; item and spell images absent"
-    );
-    server.history.release_catalogs();
+    let original_document: (f64, String) =
+        page_result(&main, "[performance.timeOrigin, location.hash]").await;
+    println!("HKSLGT_HISTORY_CATALOG_PENDING: all startup attempts exhausted; champion and rune art decoded, item, spell and augment art absent");
     tokio::time::timeout(Duration::from_secs(12), async {
         while server.history.requests.lock().unwrap().timelines < PAGE_SIZE as usize {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1002,27 +1212,64 @@ pub(super) async fn check(app: &AppHandle) {
             returned_wall - open_wall, loaded_wall - open_wall as f64, fired_wall - open_wall);
     }
     input_round_trip(&main, "full history rendered alongside visible room").await;
+
+    // The second ordinary match has a unique rune style, so another card cannot
+    // hide a lost image request. Observe recovery before zoom or any UI refresh.
+    let bitmap = bitmap_retry_before_refresh(&main, &server.history).await;
+    *stage.lock().unwrap() = "artwork queued behind four native reads";
+    check_artwork_queue(&main, &server.history).await;
+    *stage.lock().unwrap() = "catalog recovery after stock refresh";
+    server.history.release_catalogs();
+    click_ready_refresh(&main, "refresh the same page after its catalogs recover").await;
+    tokio::time::timeout(Duration::from_secs(6), async {
+        while server.history.requests.lock().unwrap().pages < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the stock refresh re-requested the same HN1 page");
     show_recent_teammates(&main).await;
     check_history_art(&main, &server.history).await;
+    check_renderer(
+        &main,
+        ORIGINAL_MATCH_WITH_ART,
+        "the original KIWI match now has its decoded augment",
+        || {},
+    )
+    .await;
     assert_eq!(
-        page_result::<f64>(&main, "performance.timeOrigin").await,
-        document_origin
+        page_result::<(f64, String)>(&main, "[performance.timeOrigin, location.hash]").await,
+        original_document
+    );
+    assert!(Arc::ptr_eq(
+        &runtime.selected_client().expect("same connected fixture"),
+        &client
+    ));
+    let (_, owner) = runtime
+        .fields("league-client-main", "summoner")
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner["me"]["puuid"], PLAYER);
+    assert_eq!(
+        bitmap,
+        (vec![503, 200], true),
+        "the first bitmap error must recover on the same URI before refresh, through the native bridge"
     );
     {
         let state = server.history.requests.lock().unwrap();
         assert_eq!(
             state.catalog_reads,
             BTreeMap::from([
-                ("augments", 1),
+                ("augments", 4),
                 ("champions", 1),
-                ("items", 2),
+                ("items", 4),
                 ("perks", 1),
                 ("perkstyles", 1),
-                ("spells", 2)
+                ("spells", 4)
             ])
         );
     }
-    println!("HKSLGT_HISTORY_CATALOG_RECOVERED: items and spells retried once in the same WebView; healthy catalogs stayed at one read");
+    println!("HKSLGT_HISTORY_CATALOG_RECOVERED: the same match and connection recovered three exhausted catalogs after refresh; healthy catalogs stayed at one read");
 
     *stage.lock().unwrap() = "failed refresh and retry";
     server.history.requests.lock().unwrap().fail = true;

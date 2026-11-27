@@ -152,6 +152,40 @@ fn rejects_bad_table_shapes_without_discarding_a_successful_catalog() {
 }
 
 #[test]
+fn discards_a_malformed_icon_record_without_losing_the_rest_of_its_catalog() {
+    let items = GameDataEndpoint::Items
+        .normalize(json!([
+            {"id": 1001, "name": "速度之靴", "price": 300, "from": [], "to": [3006]},
+            {"id": "invalid", "name": "损坏条目"},
+            {"id": 3006, "name": "狂战士胫甲", "price": 1100, "from": [1001], "to": []},
+            {"id": 3006, "name": "损坏的重复条目", "from": ["1001"], "to": []},
+        ]))
+        .unwrap();
+    assert_eq!(items.as_object().unwrap().len(), 2);
+    assert_eq!(items["1001"]["price"], 300);
+    assert_eq!(items["3006"]["from"], json!([1001]));
+
+    assert_eq!(
+        GameDataEndpoint::Queues.normalize(json!([{"id": 450, "name": "ARAM"}, {"id": -2}])),
+        Err(LcuError::InvalidPayload)
+    );
+}
+
+#[test]
+fn retries_empty_icon_catalogs_without_publishing_them_as_complete() {
+    use GameDataEndpoint::*;
+    let mut read = GameDataRead::default();
+    read.record(Items, Ok(Some(json!([])))).unwrap();
+    read.record(Perkstyles, Ok(Some(json!({"schemaVersion": 2, "styles": []}))))
+        .unwrap();
+    assert!(read.fields.is_empty());
+    assert_eq!(
+        read.unavailable,
+        vec![(Items, GameDataReadError::Missing), (Perkstyles, GameDataReadError::Missing)]
+    );
+}
+
+#[test]
 fn retains_tooltip_formatting_with_inert_markup_and_local_icon_paths() {
     let data = GameDataEndpoint::Perks.normalize(json!([{
         "id": 1,

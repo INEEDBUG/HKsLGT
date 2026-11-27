@@ -99,6 +99,58 @@ pub(crate) struct AuxView {
     pub(crate) skins: Vec<AuxSkin>,
 }
 
+/// Queue evidence from a confirmed room transition or draft. Heroes and
+/// actions always come from the current ChampSelect sample.
+pub(crate) struct ConfirmedDraftMode {
+    game_id: u64,
+    player: String,
+    pub(crate) mode: &'static str,
+}
+
+impl ConfirmedDraftMode {
+    pub(crate) fn matches_available_identity(
+        &self,
+        player: Option<&str>,
+        game_id: Option<u64>,
+    ) -> bool {
+        signed_in_player(player).is_none_or(|player| player == self.player)
+            && game_id.filter(|&id| id > 0).is_none_or(|id| id == self.game_id)
+    }
+
+    pub(crate) fn agrees_with_observation(
+        &self,
+        player: Option<&str>,
+        flow: Option<&GameflowSession>,
+        selection: Option<&Value>,
+    ) -> bool {
+        let flow_queue = flow.and_then(GameflowSession::queue);
+        let selection_queue = selection.and_then(|draft| positive_id(&draft["queueId"]));
+        let flow_queue_id = flow_queue.and_then(|queue| u64::try_from(queue.id?).ok());
+        let roster_player = selection
+            .and_then(|draft| draft_player(draft, signed_in_player(player)))
+            .and_then(|row| row["puuid"].as_str());
+        self.matches_available_identity(player, flow.and_then(game_id))
+            && self.matches_available_identity(
+                roster_player, selection.and_then(|draft| positive_id(&draft["gameId"])),
+            )
+            && [selection_queue, flow_queue_id].into_iter().flatten().all(|queue| {
+                matches!((queue, self.mode), (0, _) | (450, "ARAM") | (2400, "KIWI"))
+            })
+            && flow_queue.and_then(|queue| queue.game_mode.as_deref())
+                .is_none_or(|mode| matches!(mode, "" | "ARAM" | "KIWI"))
+    }
+
+    pub(crate) fn mode_for_same_game(
+        &self,
+        player: Option<&str>,
+        select: &Value,
+    ) -> Option<&'static str> {
+        (positive_id(&select["gameId"]) == Some(self.game_id)
+            && player == Some(self.player.as_str()))
+            .then_some(self.mode)
+    }
+}
+
 impl AuxActivity {
     #[cfg(test)]
     pub(crate) fn project(
@@ -141,7 +193,7 @@ impl AuxActivity {
         observed: AuxSelectionObservation<'_>,
     ) -> Self {
         let direct_selection = phase == "ChampSelect";
-        let signed_in = observed.player.filter(|p| !p.is_empty() && *p != "00000000-0000-0000-0000-000000000000");
+        let signed_in = signed_in_player(observed.player);
         let select = observed.session.filter(|value| value.is_object());
         let select_game = select.and_then(|select| positive_id(&select["gameId"]));
         let draft_queue = select.and_then(|select| positive_id(&select["queueId"]));
@@ -157,8 +209,12 @@ impl AuxActivity {
             && flow.is_some_and(|flow| {
                 let flow_game = game_id(flow);
                 let same_game = select_game.is_some() && select_game == flow_game;
+                let same_aram_queue = matches!(draft_queue, Some(450 | 2400))
+                    && flow.queue().and_then(|queue| u64::try_from(queue.id?).ok()) == draft_queue;
+                let confirms_live_pick = same_pick()
+                    && (phase.is_empty() || (signed_in.is_some() && same_aram_queue));
                 compatible_ids(select_game, flow_game)
-                    && ((flow.phase == "ChampSelect" && (same_game || (phase.is_empty() && same_pick())))
+                    && ((flow.phase == "ChampSelect" && (same_game || confirms_live_pick))
                         || (flow.phase == "ReadyCheck" && same_game))
             });
         if promoted && config.is_some_and(|config| {
@@ -328,9 +384,7 @@ impl AuxActivity {
                 .as_i64()
                 .filter(|&cell| cell >= 0);
             let player = draft_player(select, signed_in);
-            let row_player = player
-                .and_then(|player| player["puuid"].as_str())
-                .filter(|puuid| !puuid.is_empty() && *puuid != "00000000-0000-0000-0000-000000000000");
+            let row_player = signed_in_player(player.and_then(|player| player["puuid"].as_str()));
             if row_player
                 .zip(signed_in)
                 .is_some_and(|(roster, current)| roster != current)
@@ -453,12 +507,15 @@ impl AuxActivity {
 }
 
 impl AuxView {
-    pub(crate) fn mode_for_same_game(&self, player: Option<&str>, select: &Value) -> Option<&'static str> {
-        let current_game = positive_id(&select["gameId"])?;
-        let player = player?;
-        (matches!(self.phase, AuxPhase::ReadyCheck | AuxPhase::ChampSelect)
-            && self.game_id == Some(current_game) && self.selection_player.as_deref() == Some(player))
-            .then_some(self.game_mode)
+    pub(crate) fn confirmed_mode(&self) -> Option<ConfirmedDraftMode> {
+        if !matches!(self.phase, AuxPhase::ReadyCheck | AuxPhase::ChampSelect) {
+            return None;
+        }
+        Some(ConfirmedDraftMode {
+            game_id: self.game_id?,
+            player: self.selection_player.clone()?,
+            mode: self.game_mode,
+        })
     }
 
     pub(crate) fn confirms_selection(&self, original: &Self) -> bool {
@@ -512,6 +569,10 @@ fn local_draft_actions(selection: &Value, cell: i64) -> Vec<LocalDraftAction> {
         })
         .take(32)
         .collect()
+}
+
+fn signed_in_player(player: Option<&str>) -> Option<&str> {
+    player.filter(|player| !player.is_empty() && *player != "00000000-0000-0000-0000-000000000000")
 }
 
 fn compatible_ids(left: Option<u64>, right: Option<u64>) -> bool {
@@ -944,6 +1005,35 @@ mod tests {
     }
 
     #[test]
+    fn late_ready_check_shows_the_live_kiwi_draft_before_both_game_ids_arrive() {
+        let flow: GameflowSession = serde_json::from_value(json!({
+            "phase":"ChampSelect","gameData":{"gameId":0,"queue":{"id":2400,"gameMode":"KIWI"}}
+        })).unwrap();
+        let mut selection = json!({
+            "gameId":913,"queueId":2400,"localPlayerCellId":0,
+            "myTeam":[{"cellId":0,"puuid":"owner","championId":77}],
+            "benchEnabled":true,"benchChampions":[{"championId":268}],
+            "timer":{"phase":"FINALIZATION","adjustedTimeLeftInPhase":1950}
+        });
+        let observe = |selection: &Value, champion, player| AuxActivity::project_observed(
+            "ReadyCheck", Some(&flow), None, None,
+            AuxSelectionObservation {
+                session: Some(selection), current_champion: Some(champion), player,
+                ..Default::default()
+            },
+        );
+        let data = view(observe(&selection, 77, Some("owner")));
+        assert_eq!(data["championId"], 77);
+        assert_eq!(data["bench"], json!([268]));
+        assert_eq!(data["remainingSeconds"], 2);
+        assert_eq!(data["selectionActionable"], false);
+        assert_eq!(observe(&selection, 55, Some("owner")), AuxActivity::Unconfirmed);
+        assert_eq!(observe(&selection, 77, Some("different-player")), AuxActivity::Unconfirmed);
+        selection["queueId"] = json!(420);
+        assert_eq!(observe(&selection, 77, Some("owner")), AuxActivity::Unconfirmed);
+    }
+
+    #[test]
     fn draft_roster_supplies_own_pick_when_current_champion_or_local_cell_is_not_ready() {
         let flow: GameflowSession = serde_json::from_value(json!({
             "phase":"ChampSelect","gameData":{"gameId":901,"queue":{"id":2400,"gameMode":"KIWI"}}
@@ -989,7 +1079,7 @@ mod tests {
             "gameData":{"gameId":901,"queue":{"id":2400,"gameMode":"KIWI"}}})).unwrap();
         let previous = AuxActivity::project_observed("ReadyCheck", Some(&ready), None, None,
             AuxSelectionObservation {player:Some("owner"), ..Default::default()});
-        let previous = previous.view().unwrap();
+        let previous = previous.view().unwrap().confirmed_mode().unwrap();
         let mut select = json!({"gameId":901,"localPlayerCellId":0,
             "myTeam":[{"cellId":0,"puuid":"owner","championId":157}],
             "benchChampions":[{"championId":22}],"timer":{"phase":"FINALIZATION","adjustedTimeLeftInPhase":16000}});

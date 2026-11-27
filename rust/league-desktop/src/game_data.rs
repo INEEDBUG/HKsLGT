@@ -27,6 +27,14 @@ impl GameDataEndpoint {
         Self::Queues,
     ];
 
+    pub(crate) const HISTORY_ART: [Self; 5] = [
+        Self::Perks,
+        Self::Perkstyles,
+        Self::SummonerSpells,
+        Self::Items,
+        Self::Augments,
+    ];
+
     pub(super) const fn path(self) -> &'static str {
         match self {
             Self::Champions => "/lol-game-data/assets/v1/champion-summary.json",
@@ -52,7 +60,7 @@ impl GameDataEndpoint {
         kib * 1024
     }
 
-    const fn property(self) -> &'static str {
+    pub(crate) const fn property(self) -> &'static str {
         match self {
             Self::Champions => "champions",
             Self::Perks => "perks",
@@ -94,18 +102,30 @@ impl GameDataEndpoint {
         if rows.len() > self.row_limit() {
             return Err(LcuError::InvalidPayload);
         }
+        let has_rows = !rows.is_empty();
+        let allow_partial = Self::HISTORY_ART.contains(&self);
         let mut indexed = Map::new();
         for row in rows {
-            let id = record_id(&row["id"])?;
-            if id < 0 && !(self == Self::Champions && id == -1) {
-                return Err(LcuError::InvalidPayload);
-            }
+            let id = match record_id(&row["id"]) {
+                Ok(id) if id >= 0 || (self == Self::Champions && id == -1) => id,
+                _ if allow_partial => continue,
+                _ => return Err(LcuError::InvalidPayload),
+            };
             let key = id.to_string();
             // The first zero queue describes the custom lobby in the original client.
             if self == Self::Queues && id == 0 && indexed.contains_key(&key) {
                 continue;
             }
-            indexed.insert(key, self.project_row(row, id)?);
+            match self.project_row(row, id) {
+                Ok(value) => {
+                    indexed.insert(key, value);
+                }
+                Err(_) if allow_partial => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        if has_rows && indexed.is_empty() {
+            return Err(LcuError::InvalidPayload);
         }
         Ok(indexed)
     }
@@ -213,8 +233,19 @@ impl GameDataRead {
         let failure = match value.and_then(|value| value.map(|v| endpoint.normalize(v)).transpose())
         {
             Ok(Some(fields)) => {
-                self.fields.insert(endpoint.property().into(), fields);
-                return Ok(());
+                let rows = if endpoint == GameDataEndpoint::Perkstyles {
+                    &fields["styles"]
+                } else {
+                    &fields
+                };
+                if GameDataEndpoint::HISTORY_ART.contains(&endpoint)
+                    && rows.as_object().is_some_and(Map::is_empty)
+                {
+                    GameDataReadError::Missing
+                } else {
+                    self.fields.insert(endpoint.property().into(), fields);
+                    return Ok(());
+                }
             }
             Ok(None) => GameDataReadError::Missing,
             Err(error @ (LcuError::AuthenticationRejected | LcuError::InvalidTarget)) => {

@@ -105,6 +105,32 @@ pub(super) async fn check(app: &AppHandle) {
         "document.querySelector('.aux-draft-confirming[role=status]') && !document.querySelector('.current-champion, .bench, [data-action=\"leave-game\"]')",
         "an unclassified current draft shows verification and clears all prior KIWI data", || {}).await;
 
+    // The login response recovers while both queue sources are still missing.
+    // Retain only the confirmed mode and show the new picks from this session.
+    let recovered = json!({
+        "gameId":7812, "localPlayerCellId":0, "isSpectating":false, "isCustomGame":false,
+        "myTeam":[{"cellId":0,"puuid":PLAYER,"championId":77}],
+        "benchEnabled":true,"benchChampions":[{"championId":268}],
+        "timer":{"phase":"FINALIZATION","adjustedTimeLeftInPhase":1980}
+    });
+    {
+        let mut scene = server.scene.lock().unwrap();
+        scene.phase = "ChampSelect";
+        scene.partial_kiwi = Some(DraftFixture {
+            selection: Some(recovered), current_champion: Some(77), ..Default::default()
+        });
+    }
+    runtime.sample_fixture(app, &client).await;
+    check_renderer(&aux, r#"
+        document.querySelector('.aux-activity[data-phase="ChampSelect"] .current-champion[data-champion-id="77"] img')?.naturalWidth > 1 &&
+        document.querySelector('.bench [data-champion-id="268"][aria-disabled="true"] img')?.naturalWidth > 1 &&
+        /^2\s*(秒|s)$/.test(document.querySelector('.aux-draft-timer')?.textContent.trim()) &&
+        document.querySelector('[data-action="leave-game"]')?.disabled === true &&
+        !document.querySelector('.aux-draft-confirming')
+    "#, "same draft recovers after a gap with the latest picks and two seconds left", || {}).await;
+    assert_eq!(aux.hwnd().unwrap(), window);
+    assert_eq!(server.scene.lock().unwrap().writes.len(), writes);
+
     let mut selection = json!({
         "queueId":2400, "gameId":7812, "isSpectating":false, "isCustomGame":false,
         "benchChampions":[{"championId":22}],
@@ -218,6 +244,37 @@ pub(super) async fn check(app: &AppHandle) {
         document.querySelector('.bench [data-champion-id="44"][aria-disabled="true"] img')?.naturalWidth > 1 &&
         !document.querySelector('.current-champion[data-champion-id="103"], .bench [data-champion-id="22"]')"#,
         "same game and player recover only the mode; fresh picks replace the old roster", || {}).await;
+
+    // A contradictory queue, game or account must forget the prior mode
+    // before the next incomplete sample can try to reuse it.
+    let mut wrong_queue = selection.clone();
+    wrong_queue["queueId"] = json!(420);
+    let mut wrong_game = selection.clone();
+    wrong_game["gameId"] = json!(7813);
+    let mut wrong_player = selection.clone();
+    wrong_player["myTeam"][0]["puuid"] = json!("fixture-other-account");
+    for conflict in [wrong_queue, wrong_game, wrong_player] {
+        server.scene.lock().unwrap().partial_kiwi = Some(DraftFixture {
+            gameflow: Some(flow("ChampSelect",2400,"KIWI")),
+            selection: Some(selection.clone()), current_champion: Some(103), ..Default::default()
+        });
+        runtime.sample_fixture(app, &client).await;
+        check_renderer(&aux, VISIBLE_CHAMPION, "verified KIWI before a conflicting sample", || {}).await;
+        server.scene.lock().unwrap().partial_kiwi = Some(DraftFixture {
+            gameflow: Some(flow("ChampSelect",2400,"KIWI")),
+            selection: Some(conflict), current_champion: Some(103), ..Default::default()
+        });
+        runtime.sample_fixture(app, &client).await;
+        check_renderer(&aux, NO_DRAFT, "the conflicting sample clears the draft", || {}).await;
+        let mut incomplete = selection.clone();
+        incomplete["queueId"] = Value::Null;
+        incomplete["myTeam"][0]["puuid"] = Value::Null;
+        server.scene.lock().unwrap().partial_kiwi = Some(DraftFixture {
+            selection: Some(incomplete), current_champion: Some(103), ..Default::default()
+        });
+        runtime.sample_fixture(app, &client).await;
+        check_renderer(&aux, NO_DRAFT, "a missing queue cannot resurrect a rejected draft", || {}).await;
+    }
 
     selection["gameId"] = json!(7813);
     server.scene.lock().unwrap().partial_kiwi = Some(DraftFixture {

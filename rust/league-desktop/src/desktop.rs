@@ -518,7 +518,7 @@ async fn league_call(
         else {
             return Ok(response(Err("此客户端操作暂不可用。")));
         };
-        return Ok(response(client.read_player_tab(request).await));
+        return Ok(response(client.read_player_tab(window.app_handle(), request).await));
     }
     if namespace == CLIENT && method == "fixWindowMethodA" && window.label() == "main" {
         let [options] = args.as_slice() else {

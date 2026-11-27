@@ -10,6 +10,7 @@ use crate::{
     lcu::{
         aux_activity::{
             self, AuxActivity, AuxPhase, AuxSelectionExtras, AuxSelectionObservation, AuxView,
+            ConfirmedDraftMode,
         },
         game_art::{GameArt, GameArtPath},
         game_data::GameDataEndpoint,
@@ -53,6 +54,7 @@ struct ActiveClient {
     summoner: Value,
     companions: CompanionTargets,
     aux_activity: AuxActivity,
+    draft_mode_conflicted: bool,
     room: Option<RoomSample>,
     room_unconfirmed: bool,
     shard: Option<PlayerSearchShard>,
@@ -196,6 +198,7 @@ struct FreshAuxSelection {
 struct ReadyEventWatch {
     instance: ClientInstance,
     rounds: Arc<Mutex<lcu_events::ReadyEventDeduper>>,
+    selection_wake_enabled: Arc<std::sync::atomic::AtomicBool>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -402,6 +405,7 @@ struct RuntimeState {
     data_task: Option<tauri::async_runtime::JoinHandle<()>>,
     game_data: Map<String, Value>,
     art_client: Option<Arc<LocalClient>>,
+    confirmed_draft_mode: Option<(ClientInstance, ConfirmedDraftMode)>,
     history_access: Option<HistoryAccess>,
     opgg_checked_at: Option<Instant>,
 }
@@ -505,6 +509,28 @@ impl RuntimeState {
     ) -> Option<crate::lcu::RoomAction> {
         let due = snapshot.observe_room(&mut self.room_flow);
         self.post_game.observe(&snapshot, Instant::now());
+        let previous_mode = self.confirmed_draft_mode.take();
+        self.confirmed_draft_mode = snapshot.active.as_ref().and_then(|active| {
+            let view = active.aux_activity.view();
+            if let Some(mode) = view.and_then(AuxView::confirmed_mode) {
+                return Some((active.instance, mode));
+            }
+            if active.draft_mode_conflicted
+                || !matches!(active.phase.as_str(), "ReadyCheck" | "ChampSelect")
+                || matches!(active.aux_activity, AuxActivity::Inactive)
+            {
+                return None;
+            }
+            previous_mode.filter(|(instance, mode)| {
+                *instance == active.instance
+                    && mode.matches_available_identity(
+                        active.summoner["puuid"].as_str(),
+                        view.and_then(|view| view.game_id)
+                            .or_else(|| active.session["gameData"]["gameId"].as_u64()),
+                    )
+                    && view.is_none_or(|view| view.game_mode == mode.mode)
+            })
+        });
         if self.aram_paused && self.snapshot.left_draft(&snapshot) {
             self.aram_paused = false;
             self.aram.reset();
@@ -545,11 +571,29 @@ impl RuntimeState {
                 self.revision,
             );
         }
+        self.start_game_data_read(app, GameDataEndpoint::ALL.to_vec());
+    }
+
+    fn retry_missing_history_art(&mut self, app: &AppHandle) {
+        let missing = GameDataEndpoint::HISTORY_ART
+            .into_iter()
+            .filter(|catalog| !self.game_data.contains_key(catalog.property()))
+            .collect();
+        self.start_game_data_read(app, missing);
+    }
+
+    fn start_game_data_read(&mut self, app: &AppHandle, catalogs: Vec<GameDataEndpoint>) {
+        if catalogs.is_empty()
+            || self.data_task.as_ref().is_some_and(|task| !task.inner().is_finished())
+        {
+            return;
+        }
         if let Some(client) = self.art_client.as_ref() {
             self.data_task = Some(tauri::async_runtime::spawn(load_game_data(
                 app.clone(),
                 Arc::clone(client),
                 self.data_ticket,
+                catalogs,
             )));
         }
     }
@@ -593,7 +637,10 @@ impl ClientRuntime {
     }
 
     #[cfg(test)]
-    fn use_fixture_clients(&self, clients: Vec<Arc<LocalClient>>) {
+    pub(crate) fn use_fixture_clients(&self, clients: Vec<Arc<LocalClient>>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.snapshot.known_clients = clients.iter().map(|client| client.instance).collect();
+        }
         *self.fixture_clients.lock().unwrap() = Some(clients);
     }
 
@@ -603,7 +650,11 @@ impl ClientRuntime {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn ensure_ready_event_watch(&self) {
+    fn ensure_ready_event_watch(
+        &self,
+        selection_wake_enabled: bool,
+        initial_bench: Option<Vec<u32>>,
+    ) {
         #[cfg(test)]
         let client = if self
             .fixture_events_disabled
@@ -619,11 +670,19 @@ impl ClientRuntime {
         let Ok(mut watch) = self.ready_event_watch.lock() else {
             return;
         };
-        if watch.as_ref().is_some_and(|current| {
+        if let Some(current) = watch.as_ref().filter(|current| {
             client
                 .as_ref()
                 .is_some_and(|client| client.instance == current.instance)
         }) {
+            let was_enabled = current
+                .selection_wake_enabled
+                .swap(selection_wake_enabled, std::sync::atomic::Ordering::AcqRel);
+            if selection_wake_enabled && !was_enabled {
+                if let Ok(mut rounds) = current.rounds.lock() {
+                    rounds.seed_bench(initial_bench);
+                }
+            }
             return;
         }
         if let Some(previous) = watch.take() {
@@ -634,16 +693,32 @@ impl ClientRuntime {
             let transport = self.transport.clone();
             let wake = Arc::clone(&self.wake);
             let rounds = Arc::new(Mutex::new(lcu_events::ReadyEventDeduper::default()));
+            if let Ok(mut state) = rounds.lock() {
+                state.seed_bench(initial_bench);
+            }
             let events = Arc::clone(&rounds);
+            let selection_wake_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
+                selection_wake_enabled,
+            ));
+            let selection_gate = Arc::clone(&selection_wake_enabled);
             let task = tauri::async_runtime::spawn(async move {
-                lcu_events::watch_ready_events(client, transport, wake, events).await;
+                lcu_events::watch_ready_events(client, transport, wake, events, selection_gate)
+                    .await;
             });
             *watch = Some(ReadyEventWatch {
                 instance,
                 rounds,
+                selection_wake_enabled,
                 task,
             });
         }
+    }
+
+    fn current_selection_bench(&self) -> Option<Vec<u32>> {
+        let state = self.state.lock().ok()?;
+        let active = state.snapshot.active.as_ref()?;
+        let view = active.aux_activity.view()?;
+        (view.phase == AuxPhase::ChampSelect).then(|| view.bench.clone())
     }
 
     pub(crate) fn fields(
@@ -796,6 +871,7 @@ impl ClientRuntime {
                     summoner: json!({"puuid": PLAYER}),
                     companions,
                     aux_activity,
+                    draft_mode_conflicted: false,
                     room,
                     room_unconfirmed,
                     shard: None,
@@ -828,13 +904,26 @@ impl ClientRuntime {
     }
 
     pub(crate) async fn game_art(&self, path: &GameArtPath) -> Option<GameArt> {
-        let _permit = tokio::time::timeout(Duration::from_secs(3), self.art_reads.acquire())
+        let queued_for = self.state.lock().ok()?.art_client.as_ref()?.instance;
+        // Give the current batch time for its four-second read and one short
+        // retry before expiring the next image. Only four reads run at once.
+        let _permit = tokio::time::timeout(Duration::from_secs(6), self.art_reads.acquire())
             .await
             .ok()?
             .ok()?;
-        let client = self.state.lock().ok()?.art_client.clone()?;
+        let client = self.selected_client().filter(|client| client.instance == queued_for)?;
         let target = client.target().ok()?;
-        let art = self.transport.read_game_art(&target, path).await.ok()??;
+        let art = match self.transport.read_game_art(&target, path).await {
+            Err(LcuError::Timeout | LcuError::Transport | LcuError::UnexpectedStatus(500..=599)) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let current = self.selected_client().filter(|current| current.instance == client.instance)?;
+                let target = current.target().ok()?;
+                tokio::time::timeout(Duration::from_secs(1), self.transport.read_game_art(&target, path))
+                    .await
+                    .ok()?
+            }
+            result => result,
+        }.ok()??;
         self.state
             .lock()
             .ok()?
@@ -1201,7 +1290,11 @@ impl ClientRuntime {
         .map_err(|_| "窗口调整失败。".to_owned())?
     }
 
-    pub(crate) async fn read_player_tab(&self, request: PlayerTabRead) -> Result<Value, String> {
+    pub(crate) async fn read_player_tab(
+        &self,
+        app: &AppHandle,
+        request: PlayerTabRead,
+    ) -> Result<Value, String> {
         let (session, client) = {
             let state = self.state.lock().map_err(|_| "客户端状态不可用。")?;
             let session = state
@@ -1247,6 +1340,7 @@ impl ClientRuntime {
             return Err("客户端或登录账号已变更，请重新查询。".into());
         }
         if request.is_page() {
+            state.retry_missing_history_art(app);
             if state
                 .history_access
                 .as_ref()
@@ -1411,6 +1505,7 @@ impl ClientRuntime {
         state.manual_client = selection;
         state.manually_disconnected = selection.is_none();
         state.art_client = None;
+        state.confirmed_draft_mode = None;
         state.history_access = None;
         state.aram_paused = false;
         state.aram.reset();
@@ -1597,13 +1692,28 @@ impl ClientRuntime {
             select, own_champion, self.read_aux_room(&target, client.instance, raw_phase, demand.aux || room_enabled)
         ).await;
         let player = summoner.as_ref().map(|player| player.puuid.as_str());
-        let previous_game_mode = selection.as_ref().filter(|s| {
-            read_aux_draft && raw_phase == "ChampSelect" && s["queueId"].as_u64().unwrap_or(0) == 0
-        }).and_then(|select| {
-            let state = self.state.lock().ok()?;
-            let previous = state.snapshot.active.as_ref().filter(|active| active.instance == client.instance)?;
-            previous.aux_activity.view()?.mode_for_same_game(player, select)
-        });
+        let (previous_game_mode, draft_mode_conflicted) = if demand.aux {
+            let state = self.state.lock().ok();
+            let previous = state.as_ref().and_then(|state| {
+                state.confirmed_draft_mode.as_ref()
+                    .filter(|(instance, _)| *instance == client.instance)
+            });
+            previous.map_or((None, false), |(_, mode)| {
+                if !mode.agrees_with_observation(player, flow, selection.as_ref()) {
+                    return (None, true);
+                }
+                let mode = if read_aux_draft && raw_phase == "ChampSelect" {
+                    selection.as_ref()
+                        .filter(|draft| draft["queueId"].as_u64().unwrap_or(0) == 0)
+                        .and_then(|draft| mode.mode_for_same_game(player, draft))
+                } else {
+                    None
+                };
+                (mode, false)
+            })
+        } else {
+            (None, false)
+        };
         let companions = demand.targets(
             client.instance,
             session,
@@ -1661,6 +1771,7 @@ impl ClientRuntime {
                 summoner: json!(summoner),
                 companions,
                 aux_activity,
+                draft_mode_conflicted,
                 room,
                 room_unconfirmed,
                 shard,
@@ -2042,9 +2153,13 @@ impl ClientRuntime {
     }
 }
 
-async fn load_game_data(app: AppHandle, client: Arc<LocalClient>, ticket: u64) {
+async fn load_game_data(
+    app: AppHandle,
+    client: Arc<LocalClient>,
+    ticket: u64,
+    mut catalogs: Vec<GameDataEndpoint>,
+) {
     let runtime = app.state::<ClientRuntime>();
-    let mut catalogs = GameDataEndpoint::ALL.to_vec();
     // A connected League client may still be preparing some of its game data.
     // Publish healthy catalogs promptly and retry only the ones that failed temporarily.
     for delay in [0, 350, 1000] {
@@ -2237,8 +2352,20 @@ pub(crate) fn reconcile_companions(app: &AppHandle) {
 pub(crate) async fn monitor(app: AppHandle) {
     let runtime = app.state::<ClientRuntime>();
     loop {
-        runtime.refresh(&app, CompanionDemand::from_app(&app)).await;
-        runtime.ensure_ready_event_watch();
+        let demand = CompanionDemand::from_app(&app);
+        runtime.refresh(&app, demand).await;
+        let selection_wake_enabled = demand.aux
+            && matches!(
+                runtime.aux_observation(),
+                AuxObservation::Active {
+                    stage: AuxStage::Selection,
+                    ..
+                }
+            );
+        let initial_bench = selection_wake_enabled
+            .then(|| runtime.current_selection_bench())
+            .flatten();
+        runtime.ensure_ready_event_watch(selection_wake_enabled, initial_bench);
         reconcile_companions(&app);
         let interval = runtime
             .state
@@ -2325,6 +2452,7 @@ mod companion_tests {
                 summoner: Value::Null,
                 companions: CompanionTargets::default(),
                 aux_activity: AuxActivity::Inactive,
+                draft_mode_conflicted: false,
                 room: None,
                 room_unconfirmed: false,
                 shard: None,
@@ -2434,6 +2562,7 @@ mod aux_action_tests {
                     summoner: Value::Null,
                     companions: CompanionTargets::default(),
                     aux_activity: activity,
+                    draft_mode_conflicted: false,
                     room: None,
                     room_unconfirmed: false,
                     shard: None,

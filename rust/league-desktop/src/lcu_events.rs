@@ -4,7 +4,10 @@ use crate::{client_discovery::LocalClient, lcu::LcuTransport};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::sync::Notify;
@@ -13,14 +16,17 @@ use tokio_tungstenite::tungstenite::Message;
 const EVENT_TOPIC: &str = "OnJsonApiEvent";
 const GAMEFLOW_PHASE: &str = "/lol-gameflow/v1/gameflow-phase";
 const READY_CHECK: &str = "/lol-matchmaking/v1/ready-check";
+const CHAMP_SELECT: &str = "/lol-champ-select/v1/session";
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const PROCESS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+const BENCH_EVENT_COALESCE: Duration = Duration::from_millis(50);
 
 pub(super) async fn watch_ready_events(
     client: Arc<LocalClient>,
     transport: LcuTransport,
     wake: Arc<Notify>,
     rounds: Arc<Mutex<ReadyEventDeduper>>,
+    selection_wake_enabled: Arc<AtomicBool>,
 ) {
     while client.alive() {
         let target = match client.target() {
@@ -46,8 +52,22 @@ pub(super) async fn watch_ready_events(
             continue;
         }
 
+        let mut bench_deadline = None;
         loop {
-            let message = match tokio::time::timeout(PROCESS_CHECK_INTERVAL, socket.next()).await {
+            let deadline = bench_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + PROCESS_CHECK_INTERVAL);
+            let result = tokio::time::timeout_at(deadline, socket.next()).await;
+            let message = match result {
+                Err(_) if bench_deadline.is_some() => {
+                    bench_deadline = None;
+                    if !client.alive() {
+                        return;
+                    }
+                    if selection_wake_enabled.load(Ordering::Acquire) {
+                        wake.notify_one();
+                    }
+                    continue;
+                }
                 Err(_) if !client.alive() => return,
                 Err(_) => continue,
                 Ok(Some(Ok(message))) => message,
@@ -55,11 +75,24 @@ pub(super) async fn watch_ready_events(
             };
             match message {
                 Message::Text(text) => {
-                    if rounds
+                    let signal = rounds
                         .lock()
-                        .is_ok_and(|mut state| state.should_wake(&text))
-                    {
-                        wake.notify_one();
+                        .ok()
+                        .and_then(|mut state| state.observe(&text));
+                    match signal {
+                        Some(EventWake::Immediate) => {
+                            bench_deadline = None;
+                            wake.notify_one();
+                        }
+                        Some(EventWake::BenchChanged)
+                            if selection_wake_enabled.load(Ordering::Acquire) =>
+                        {
+                            if bench_deadline.is_none() {
+                                bench_deadline =
+                                    Some(tokio::time::Instant::now() + BENCH_EVENT_COALESCE);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Message::Ping(payload) => {
@@ -93,6 +126,13 @@ pub(super) struct ReadyEventDeduper {
     seen_ready: bool,
     reopen_after_disconnect: bool,
     round: ReadyRound,
+    bench: Option<Vec<u32>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventWake {
+    Immediate,
+    BenchChanged,
 }
 
 impl ReadyEventDeduper {
@@ -104,6 +144,11 @@ impl ReadyEventDeduper {
         self.phase = None;
         self.ready_pending = false;
         self.reopen_after_disconnect = self.round.closed;
+        self.bench = None;
+    }
+
+    pub(super) fn seed_bench(&mut self, bench: Option<Vec<u32>>) {
+        self.bench = bench;
     }
 
     pub(super) fn confirm_http(&mut self, started_in: ReadyRound) -> bool {
@@ -131,15 +176,20 @@ impl ReadyEventDeduper {
         changed
     }
 
+    #[cfg(test)]
     fn should_wake(&mut self, text: &str) -> bool {
+        self.observe(text).is_some()
+    }
+
+    fn observe(&mut self, text: &str) -> Option<EventWake> {
         let Some(signal) = parse_event(text) else {
-            return false;
+            return None;
         };
         match signal {
             EventSignal::Phase(phase) => {
                 let changed = self.phase.as_deref() != Some(phase.as_str());
                 if !changed {
-                    return false;
+                    return None;
                 }
                 let wake = match phase.as_str() {
                     "ReadyCheck" => {
@@ -149,9 +199,9 @@ impl ReadyEventDeduper {
                     other => (self.seen_ready && self.leave()) || other == "ChampSelect",
                 };
                 self.phase = Some(phase);
-                wake
+                wake.then_some(EventWake::Immediate)
             }
-            EventSignal::Closed => self.leave(),
+            EventSignal::Closed => self.leave().then_some(EventWake::Immediate),
             EventSignal::Response { pending, created } => {
                 // A resource recreation can occur without an intervening phase poll.
                 // Duplicate Create/Update on the same open resource consumes no new round.
@@ -159,11 +209,18 @@ impl ReadyEventDeduper {
                     self.enter();
                 }
                 if self.round.closed {
-                    return false;
+                    return None;
                 }
                 let changed = self.ready_pending != pending;
                 self.ready_pending = pending;
-                changed && pending
+                (changed && pending).then_some(EventWake::Immediate)
+            }
+            EventSignal::Bench(bench) => {
+                if self.bench.as_ref() == Some(&bench) {
+                    return None;
+                }
+                let known = self.bench.replace(bench).is_some();
+                known.then_some(EventWake::BenchChanged)
             }
         }
     }
@@ -173,10 +230,12 @@ enum EventSignal {
     Phase(String),
     Closed,
     Response { pending: bool, created: bool },
+    Bench(Vec<u32>),
 }
 
 fn parse_event(text: &str) -> Option<EventSignal> {
-    if !text.contains(GAMEFLOW_PHASE) && !text.contains(READY_CHECK) {
+    if !text.contains(GAMEFLOW_PHASE) && !text.contains(READY_CHECK) && !text.contains(CHAMP_SELECT)
+    {
         return None;
     }
     let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(text) else {
@@ -199,6 +258,9 @@ fn parse_event(text: &str) -> Option<EventSignal> {
     if uri == READY_CHECK && event_type == "Delete" {
         return Some(EventSignal::Closed);
     }
+    if uri == CHAMP_SELECT && event_type == "Delete" {
+        return Some(EventSignal::Bench(Vec::new()));
+    }
     if !matches!(event_type, "Create" | "Update") {
         return None;
     }
@@ -215,16 +277,46 @@ fn parse_event(text: &str) -> Option<EventSignal> {
             }),
             _ => None,
         },
+        (EVENT_TOPIC, CHAMP_SELECT) => bench_signature(data).map(EventSignal::Bench),
         _ => None,
     }
+}
+
+fn bench_signature(data: &Value) -> Option<Vec<u32>> {
+    let champions = data.get("benchChampions")?.as_array()?;
+    if champions.len() > 20 {
+        return None;
+    }
+    let mut ids = Vec::with_capacity(champions.len());
+    for champion in champions {
+        let Some(id) = champion
+            .get("championId")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| (1..100_000).contains(id))
+        else {
+            continue;
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    (champions.is_empty() || !ids.is_empty()).then_some(ids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ReadyEventDeduper, GAMEFLOW_PHASE, READY_CHECK};
 
+    const CHAMP_SELECT: &str = "/lol-champ-select/v1/session";
+
     fn event(uri: &str, data: serde_json::Value) -> String {
         serde_json::json!([8,"OnJsonApiEvent",{"uri":uri,"eventType":"Update","data":data}])
+            .to_string()
+    }
+
+    fn champ_select_event(event_type: &str, data: serde_json::Value) -> String {
+        serde_json::json!([8,"OnJsonApiEvent",{"uri":CHAMP_SELECT,"eventType":event_type,"data":data}])
             .to_string()
     }
 
@@ -312,5 +404,95 @@ mod tests {
         assert!(!state.confirm_http(closed));
         assert!(state.confirm_http(second));
         assert!(state.current() == second);
+    }
+
+    #[test]
+    fn only_real_bench_id_sequence_changes_wake_for_selection_updates() {
+        let mut state = ReadyEventDeduper::default();
+        let session = |bench: serde_json::Value, remaining: u64| {
+            serde_json::json!({
+                "benchChampions": bench,
+                "timer": {"adjustedTimeLeftInPhase": remaining},
+                "myTeam": [{"cellId": 0, "championId": 22}]
+            })
+        };
+
+        let initial = champ_select_event("Create", session(serde_json::json!([]), 20_000));
+        assert!(
+            !state.should_wake(&initial),
+            "initial empty bench is not a change"
+        );
+
+        let added = champ_select_event(
+            "Update",
+            session(
+                serde_json::json!([
+                    {"championId": 103},
+                    {"championId": 0},
+                    {"championId": 103}
+                ]),
+                19_500,
+            ),
+        );
+        assert!(
+            state.should_wake(&added),
+            "a newly benched champion wakes the monitor"
+        );
+        assert!(
+            !state.should_wake(&champ_select_event(
+                "Update",
+                session(serde_json::json!([{"championId": 103}]), 19_000),
+            )),
+            "zero placeholders and duplicates do not change the visible ID sequence"
+        );
+
+        let timer_only = champ_select_event(
+            "Update",
+            session(serde_json::json!([{"championId": 103}]), 18_000),
+        );
+        assert!(
+            !state.should_wake(&timer_only),
+            "timer-only updates do not wake the monitor"
+        );
+
+        let reordered = champ_select_event(
+            "Update",
+            session(
+                serde_json::json!([{"championId": 22}, {"championId": 103}]),
+                17_000,
+            ),
+        );
+        assert!(
+            state.should_wake(&reordered),
+            "bench ID order changes are observable"
+        );
+
+        let cleared = champ_select_event("Update", session(serde_json::json!([]), 16_000));
+        assert!(
+            state.should_wake(&cleared),
+            "clearing the bench is observable"
+        );
+        assert!(
+            !state.should_wake(&cleared),
+            "duplicate clear updates are ignored"
+        );
+        assert!(state.should_wake(&champ_select_event(
+            "Update",
+            session(serde_json::json!([{"championId": 103}]), 15_000),
+        )));
+        assert!(state.should_wake(&champ_select_event("Delete", serde_json::Value::Null)));
+        assert!(!state.should_wake(&champ_select_event("Delete", serde_json::Value::Null)));
+
+        for ignored in [
+            r#"[8,"wrong-topic",{"uri":"/lol-champ-select/v1/session","eventType":"Update","data":{"benchChampions":[{"championId":103}]}}]"#,
+            r#"[8,"OnJsonApiEvent",{"uri":"/lol-champ-select/v1/session","eventType":"Delete","data":{"benchChampions":[{"championId":103}]}}]"#,
+            r#"[8,"OnJsonApiEvent",{"uri":"/lol-champ-select/v1/session","eventType":"Update","data":{"benchChampions":"bad"}}]"#,
+            r#"[8,"OnJsonApiEvent",{"uri":"/lol-champ-select/v1/session","eventType":"Update","data":{"benchChampions":[{"championId":0}]}}]"#,
+        ] {
+            assert!(
+                !state.should_wake(ignored),
+                "unexpected selection wake for {ignored}"
+            );
+        }
     }
 }

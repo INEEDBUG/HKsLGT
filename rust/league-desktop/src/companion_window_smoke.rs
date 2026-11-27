@@ -21,14 +21,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWi
 #[path = "mini_client_fixture.rs"]
 mod mini_client_fixture;
 use mini_client_fixture::MiniClient;
-#[path = "mini_optional_actions_smoke.rs"]
-mod mini_optional_actions_smoke;
-#[path = "history_responsiveness_smoke.rs"]
-mod history_responsiveness_smoke;
-#[path = "partial_kiwi_selection_smoke.rs"]
-mod partial_kiwi_selection_smoke;
+#[path = "champ_select_event_smoke.rs"]
+mod champ_select_event_smoke;
 #[path = "champion_picker_smoke.rs"]
 mod champion_picker_smoke;
+#[path = "history_responsiveness_smoke.rs"]
+mod history_responsiveness_smoke;
+#[path = "mini_optional_actions_smoke.rs"]
+mod mini_optional_actions_smoke;
+#[path = "partial_kiwi_selection_smoke.rs"]
+mod partial_kiwi_selection_smoke;
 #[path = "post_game_smoke.rs"]
 mod post_game_smoke;
 
@@ -72,12 +74,19 @@ fn champ_select_opens_real_windows() {
     let mut runtime =
         ClientRuntime::new(false, Default::default()).expect("disconnected fixture runtime");
     let mini_client = MiniClient::start();
-    runtime.use_fixture_transport(mini_client.root.clone());
+    let selection_fixture = champ_select_event_smoke::requested()
+        .then(|| std::sync::Arc::new(champ_select_event_smoke::SelectionFixture::start()));
+    let fixture_root = selection_fixture
+        .as_ref()
+        .map(|fixture| fixture.root.clone())
+        .unwrap_or_else(|| mini_client.root.clone());
+    runtime.use_fixture_transport(fixture_root);
     let app = tauri::Builder::default()
         .any_thread()
         .manage(profile)
         .manage(runtime)
         .manage(mini_client)
+        .manage(selection_fixture)
         .manage(AuxWindow::new(false, true))
         .manage(OpggWindow::new(OpggPreferences {
             enabled: false,
@@ -122,6 +131,10 @@ fn champ_select_opens_real_windows() {
 }
 
 async fn exercise(app: &AppHandle) {
+    if champ_select_event_smoke::requested() {
+        champ_select_event_smoke::check(app).await;
+        return;
+    }
     if post_game_smoke::requested() {
         post_game_smoke::check(app).await;
         return;

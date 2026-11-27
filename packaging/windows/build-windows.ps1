@@ -85,7 +85,7 @@ try {
     } finally {
       $env:HKSLGT_HISTORY_ONLY = $previousHistoryOnly
     }
-    foreach ($scenario in @('HKSLGT_PARTIAL_KIWI_ONLY', 'HKSLGT_CHAMPION_PICKER_ONLY', 'HKSLGT_POST_GAME_ONLY')) {
+    foreach ($scenario in @('HKSLGT_PARTIAL_KIWI_ONLY', 'HKSLGT_CHAMPION_PICKER_ONLY', 'HKSLGT_POST_GAME_ONLY', 'HKSLGT_SELECTION_EVENT_ONLY')) {
       $previousScenario = [Environment]::GetEnvironmentVariable($scenario)
       try {
         [Environment]::SetEnvironmentVariable($scenario, '1')
