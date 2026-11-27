@@ -659,6 +659,40 @@ const TEAMMATE_AND_EMPTY_SLOT: &str = r#"(() => {
         newest.querySelectorAll('.item.empty').length === 1;
 })()"#;
 
+const HISTORY_LAYOUT: &str = r#"(() => {
+    const header = document.querySelector('.mb-6.h-28');
+    return [
+        window.innerWidth,
+        document.querySelector('.app-frame__right-content')?.clientWidth ?? 0,
+        header?.parentElement?.classList.contains('w-266') ?? false
+    ];
+})()"#;
+
+async fn show_recent_teammates(main: &WebviewWindow) {
+    let (initial_viewport, initial_content, initially_wide): (f64, f64, bool) =
+        page_result(main, HISTORY_LAYOUT).await;
+    if !initially_wide {
+        // Stock PlayerTab mounts recent teammates only in the wide layout. Change the
+        // native WebView zoom so a small runner desktop gets that layout too.
+        let zoom = (initial_viewport / 1360.0).clamp(0.25, 1.0);
+        main.set_zoom(zoom)
+            .expect("widen the real history viewport on a small desktop");
+    }
+    check_renderer(
+        main,
+        r#"document.querySelector('.app-frame__right-content').clientWidth >= 1064 &&
+            [...document.querySelectorAll('.w-266 .w-75 .flex.items-center')].some(
+                row => row.innerText.includes('Fixture player 2'))"#,
+        "stock wide history layout with the fixture's recent teammate row",
+        || {},
+    )
+    .await;
+    let (viewport, content, wide): (f64, f64, bool) = page_result(main, HISTORY_LAYOUT).await;
+    println!(
+        "HKSLGT_HISTORY_RECENT_LAYOUT: viewport {initial_viewport} -> {viewport}, content {initial_content} -> {content}, wide {initially_wide} -> {wide}"
+    );
+}
+
 async fn check_history_art(main: &WebviewWindow, history: &HistoryFixture) {
     let started = Instant::now();
     loop {
@@ -777,7 +811,7 @@ pub(super) async fn check(app: &AppHandle) {
                 .webview_directory()
                 .expect("shared fixture WebView2 directory"),
         )
-        .inner_size(1280.0, 760.0)
+        .inner_size(1000.0, 760.0)
         .decorations(false)
         .on_navigation(super::super::bundled_navigation)
         .build()
@@ -968,6 +1002,7 @@ pub(super) async fn check(app: &AppHandle) {
             returned_wall - open_wall, loaded_wall - open_wall as f64, fired_wall - open_wall);
     }
     input_round_trip(&main, "full history rendered alongside visible room").await;
+    show_recent_teammates(&main).await;
     check_history_art(&main, &server.history).await;
     assert_eq!(
         page_result::<f64>(&main, "performance.timeOrigin").await,
