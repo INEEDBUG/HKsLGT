@@ -357,17 +357,19 @@ impl LcuTransport {
         parse_party_members(raw)
     }
 
-    pub(crate) async fn complete_missions_celebration(
+    pub(crate) async fn missions_celebration_pending(
         &self,
         target: &LcuTarget<'_>,
     ) -> Result<bool, LcuError> {
         let raw = Self::read_json(self.sequence_request(target), 8 * 1024).await?;
-        if parse_sequence(raw)? != Some(SequenceEvent::MissionsCelebration) {
-            return Ok(false);
-        }
-        self.send_action(self.complete_sequence_request(target))
-            .await?;
-        Ok(true)
+        Ok(parse_sequence(raw)? == Some(SequenceEvent::MissionsCelebration))
+    }
+
+    pub(crate) async fn send_missions_celebration_complete(
+        &self,
+        target: &LcuTarget<'_>,
+    ) -> Result<(), LcuError> {
+        self.send_action(self.complete_sequence_request(target)).await
     }
 
     pub(crate) async fn submit_post_game_honor(

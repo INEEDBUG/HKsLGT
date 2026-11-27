@@ -23,6 +23,8 @@ $revision = (git -C $root rev-parse HEAD).Trim()
 if ($env:GITHUB_SHA -and $revision -cne $env:GITHUB_SHA) { throw 'Unexpected workflow checkout.' }
 
 $known = [ordered]@{
+  # Exact native inventory from the beta.19 candidate delivered from run 46046497678.
+  'trusted-1.0.0-beta.19.json' = '15c88c593a44207f3e4e3e5c80421c62a7fb71d4b184e37340f1f0a9bfec1a13'
   # Exact native inventory from the beta.18 candidate delivered from run 46030344287.
   'trusted-1.0.0-beta.18.json' = 'ca932a4f841a8c68f9a0f4757921596904c63f9bb13c56008580e6530dbdd7b8'
   'trusted-1.0.0-beta.13.json' = '3f46a024b631c0b615fe7ea2610818e512892cfbfa94168e92cf7287286e3ac1'
@@ -114,7 +116,10 @@ try {
       'missing_direct_ready_check_never_accepts_stale_search_pending',
       'polling_baseline_accept_waits_for_next_two_second_monitor_tick',
       'monitor_falls_back_to_normal_polling_after_event_socket_closes',
-      'ready_check_event_does_not_accept_non_aram_queue'
+      'ready_check_event_does_not_accept_non_aram_queue',
+      'post_game_ballot_event_wakes_fast_and_return_observes_upstream_deadline',
+      'post_game_ballot_event_is_not_lost_during_slow_optional_sequence_read',
+      'post_game_incomplete_successful_revalidation_requires_a_verified_ballot'
     )) {
       cargo test @cargoArgs --manifest-path $desktopManifest "client_runtime::ready_accept_smoke::$case" -- --ignored --exact --nocapture
     }

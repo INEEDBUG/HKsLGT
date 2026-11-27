@@ -17,6 +17,9 @@ const EVENT_TOPIC: &str = "OnJsonApiEvent";
 const GAMEFLOW_PHASE: &str = "/lol-gameflow/v1/gameflow-phase";
 const READY_CHECK: &str = "/lol-matchmaking/v1/ready-check";
 const CHAMP_SELECT: &str = "/lol-champ-select/v1/session";
+const POST_GAME_BALLOT: &str = "/lol-honor-v2/v1/ballot/";
+const POST_GAME_BALLOT_NO_SLASH: &str = "/lol-honor-v2/v1/ballot";
+const POST_GAME_SEQUENCE: &str = "/lol-pre-end-of-game/v1/currentSequenceEvent";
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const PROCESS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const BENCH_EVENT_COALESCE: Duration = Duration::from_millis(50);
@@ -27,6 +30,8 @@ pub(super) async fn watch_ready_events(
     wake: Arc<Notify>,
     rounds: Arc<Mutex<ReadyEventDeduper>>,
     selection_wake_enabled: Arc<AtomicBool>,
+    post_game_wake_enabled: Arc<AtomicBool>,
+    post_game_pending: Arc<AtomicBool>,
 ) {
     while client.alive() {
         let target = match client.target() {
@@ -79,20 +84,22 @@ pub(super) async fn watch_ready_events(
                         .lock()
                         .ok()
                         .and_then(|mut state| state.observe(&text));
-                    match signal {
-                        Some(EventWake::Immediate) => {
+                    if let Some(signal) = signal {
+                        let post_game =
+                            signal.post_game && post_game_wake_enabled.load(Ordering::Acquire);
+                        if post_game {
+                            post_game_pending.store(true, Ordering::Release);
+                        }
+                        if signal.immediate || post_game {
                             bench_deadline = None;
                             wake.notify_one();
                         }
-                        Some(EventWake::BenchChanged)
-                            if selection_wake_enabled.load(Ordering::Acquire) =>
-                        {
+                        if signal.bench_changed && selection_wake_enabled.load(Ordering::Acquire) {
                             if bench_deadline.is_none() {
                                 bench_deadline =
                                     Some(tokio::time::Instant::now() + BENCH_EVENT_COALESCE);
                             }
                         }
-                        _ => {}
                     }
                 }
                 Message::Ping(payload) => {
@@ -127,12 +134,21 @@ pub(super) struct ReadyEventDeduper {
     reopen_after_disconnect: bool,
     round: ReadyRound,
     bench: Option<Vec<u32>>,
+    post_game_ballot: Option<u64>,
+    post_game_sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EventWake {
-    Immediate,
-    BenchChanged,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EventWake {
+    immediate: bool,
+    bench_changed: bool,
+    post_game: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PostGameResource {
+    Ballot,
+    Sequence,
 }
 
 impl ReadyEventDeduper {
@@ -145,6 +161,8 @@ impl ReadyEventDeduper {
         self.ready_pending = false;
         self.reopen_after_disconnect = self.round.closed;
         self.bench = None;
+        self.post_game_ballot = None;
+        self.post_game_sequence = None;
     }
 
     pub(super) fn seed_bench(&mut self, bench: Option<Vec<u32>>) {
@@ -191,6 +209,8 @@ impl ReadyEventDeduper {
                 if !changed {
                     return None;
                 }
+                let post_game = is_post_game_phase(&phase)
+                    || self.phase.as_deref().is_some_and(is_post_game_phase);
                 let wake = match phase.as_str() {
                     "ReadyCheck" => {
                         self.enter();
@@ -199,9 +219,17 @@ impl ReadyEventDeduper {
                     other => (self.seen_ready && self.leave()) || other == "ChampSelect",
                 };
                 self.phase = Some(phase);
-                wake.then_some(EventWake::Immediate)
+                (wake || post_game).then_some(EventWake {
+                    immediate: wake,
+                    bench_changed: false,
+                    post_game,
+                })
             }
-            EventSignal::Closed => self.leave().then_some(EventWake::Immediate),
+            EventSignal::Closed => self.leave().then_some(EventWake {
+                immediate: true,
+                bench_changed: false,
+                post_game: false,
+            }),
             EventSignal::Response { pending, created } => {
                 // A resource recreation can occur without an intervening phase poll.
                 // Duplicate Create/Update on the same open resource consumes no new round.
@@ -213,28 +241,69 @@ impl ReadyEventDeduper {
                 }
                 let changed = self.ready_pending != pending;
                 self.ready_pending = pending;
-                (changed && pending).then_some(EventWake::Immediate)
+                (changed && pending).then_some(EventWake {
+                    immediate: true,
+                    bench_changed: false,
+                    post_game: false,
+                })
             }
             EventSignal::Bench(bench) => {
                 if self.bench.as_ref() == Some(&bench) {
                     return None;
                 }
                 let known = self.bench.replace(bench).is_some();
-                known.then_some(EventWake::BenchChanged)
+                known.then_some(EventWake {
+                    immediate: false,
+                    bench_changed: true,
+                    post_game: false,
+                })
+            }
+            EventSignal::PostGame {
+                resource,
+                signature,
+            } => {
+                let previous = match resource {
+                    PostGameResource::Ballot => &mut self.post_game_ballot,
+                    PostGameResource::Sequence => &mut self.post_game_sequence,
+                };
+                if *previous == Some(signature) {
+                    return None;
+                }
+                *previous = Some(signature);
+                Some(EventWake {
+                    immediate: false,
+                    bench_changed: false,
+                    post_game: true,
+                })
             }
         }
     }
 }
 
+fn is_post_game_phase(phase: &str) -> bool {
+    matches!(phase, "WaitingForStats" | "PreEndOfGame" | "EndOfGame")
+}
+
 enum EventSignal {
     Phase(String),
     Closed,
-    Response { pending: bool, created: bool },
+    Response {
+        pending: bool,
+        created: bool,
+    },
     Bench(Vec<u32>),
+    PostGame {
+        resource: PostGameResource,
+        signature: u64,
+    },
 }
 
 fn parse_event(text: &str) -> Option<EventSignal> {
-    if !text.contains(GAMEFLOW_PHASE) && !text.contains(READY_CHECK) && !text.contains(CHAMP_SELECT)
+    if !text.contains(GAMEFLOW_PHASE)
+        && !text.contains(READY_CHECK)
+        && !text.contains(CHAMP_SELECT)
+        && !text.contains(POST_GAME_BALLOT_NO_SLASH)
+        && !text.contains(POST_GAME_SEQUENCE)
     {
         return None;
     }
@@ -260,6 +329,23 @@ fn parse_event(text: &str) -> Option<EventSignal> {
     }
     if uri == CHAMP_SELECT && event_type == "Delete" {
         return Some(EventSignal::Bench(Vec::new()));
+    }
+    if matches!(event_type, "Create" | "Update" | "Delete") {
+        let resource = match uri {
+            POST_GAME_BALLOT | POST_GAME_BALLOT_NO_SLASH => Some(PostGameResource::Ballot),
+            POST_GAME_SEQUENCE => Some(PostGameResource::Sequence),
+            _ => None,
+        };
+        if let Some(resource) = resource {
+            let data = payload.get("data")?;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            data.to_string().hash(&mut hasher);
+            return Some(EventSignal::PostGame {
+                resource,
+                signature: hasher.finish(),
+            });
+        }
     }
     if !matches!(event_type, "Create" | "Update") {
         return None;
@@ -306,7 +392,9 @@ fn bench_signature(data: &Value) -> Option<Vec<u32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadyEventDeduper, GAMEFLOW_PHASE, READY_CHECK};
+    use super::{
+        ReadyEventDeduper, GAMEFLOW_PHASE, POST_GAME_BALLOT, POST_GAME_SEQUENCE, READY_CHECK,
+    };
 
     const CHAMP_SELECT: &str = "/lol-champ-select/v1/session";
 
@@ -318,6 +406,60 @@ mod tests {
     fn champ_select_event(event_type: &str, data: serde_json::Value) -> String {
         serde_json::json!([8,"OnJsonApiEvent",{"uri":CHAMP_SELECT,"eventType":event_type,"data":data}])
             .to_string()
+    }
+
+    fn typed_event(uri: &str, event_type: &str, data: serde_json::Value) -> String {
+        serde_json::json!([8,"OnJsonApiEvent",{"uri":uri,"eventType":event_type,"data":data}])
+            .to_string()
+    }
+
+    #[test]
+    fn post_game_events_wake_only_on_exact_phase_and_resource_changes() {
+        let mut state = ReadyEventDeduper::default();
+        let end = typed_event(GAMEFLOW_PHASE, "Update", serde_json::json!("EndOfGame"));
+        let wake = state.observe(&end).expect("end-game phase event");
+        assert!(wake.post_game);
+        assert!(state.observe(&end).is_none(), "duplicate phase is ignored");
+        let lobby = typed_event(GAMEFLOW_PHASE, "Update", serde_json::json!("Lobby"));
+        assert!(
+            state.observe(&lobby).unwrap().post_game,
+            "leaving end-game wakes"
+        );
+        assert!(state.observe(&lobby).is_none());
+
+        let ballot = typed_event(
+            POST_GAME_BALLOT,
+            "Create",
+            serde_json::json!({"gameId":42,"votePool":{"votes":2},"honoredPlayers":[]}),
+        );
+        assert!(state.observe(&ballot).unwrap().post_game);
+        assert!(
+            state.observe(&ballot).is_none(),
+            "same ballot update is coalesced"
+        );
+        let changed_ballot = typed_event(
+            "/lol-honor-v2/v1/ballot",
+            "Update",
+            serde_json::json!({"gameId":42,"votePool":{"votes":1},"honoredPlayers":["synthetic"]}),
+        );
+        assert!(state.observe(&changed_ballot).unwrap().post_game);
+
+        let sequence = typed_event(
+            POST_GAME_SEQUENCE,
+            "Update",
+            serde_json::json!({"name":"missions-celebration"}),
+        );
+        assert!(state.observe(&sequence).unwrap().post_game);
+        assert!(state.observe(&sequence).is_none());
+
+        for ignored in [
+            typed_event("/lol-honor/v1/ballot", "Update", serde_json::json!({"gameId":42})),
+            typed_event("/lol-honor-v2/v1/ballot-extra", "Update", serde_json::json!({"gameId":42})),
+            r#"[8,"wrong-topic",{"uri":"/lol-honor-v2/v1/ballot/","eventType":"Update","data":{"gameId":42}}]"#.to_owned(),
+            typed_event(GAMEFLOW_PHASE, "Delete", serde_json::json!("EndOfGame")),
+        ] {
+            assert!(state.observe(&ignored).is_none(), "unexpected wake for {ignored}");
+        }
     }
 
     #[test]

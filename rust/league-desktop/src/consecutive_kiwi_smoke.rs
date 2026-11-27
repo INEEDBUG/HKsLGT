@@ -14,7 +14,9 @@ use std::{
 
 const FIRST_GAME: u64 = 8521;
 const SECOND_GAME: u64 = 8522;
+const UNRELATED_GAME: u64 = 8523;
 const KIWI_QUEUE: u32 = 2400;
+const BENCH_SWAP: &str = "/lol-champ-select/v1/session/bench/swap/";
 
 pub(super) fn requested() -> bool {
     std::env::var_os("HKSLGT_CONSECUTIVE_KIWI_ONLY").is_some()
@@ -45,6 +47,31 @@ impl RoomFixture {
             _ => return None,
         })
     }
+
+    pub(super) fn swap_bench(draft: &mut DraftFixture, path: &str) -> Option<u16> {
+        let requested = path.strip_prefix(BENCH_SWAP)?;
+        let accepted = (|| {
+            let requested = requested.parse::<u32>().ok()?;
+            let selection = draft.selection.as_mut()?;
+            if selection["gameId"] != SECOND_GAME || selection["queueId"] != KIWI_QUEUE {
+                return None;
+            }
+            let local = &selection["myTeam"][0];
+            let bench = &selection["benchChampions"][0];
+            let current = draft.current_champion?;
+            if local["puuid"] != PLAYER
+                || local["championId"] != current
+                || bench["championId"] != requested
+            {
+                return None;
+            }
+            selection["myTeam"][0]["championId"] = json!(requested);
+            selection["benchChampions"][0]["championId"] = json!(current);
+            draft.current_champion = Some(requested);
+            Some(())
+        })();
+        Some(if accepted.is_some() { 204 } else { 409 })
+    }
 }
 
 fn flow(phase: &str, game_id: u64, queue: u32, mode: &str) -> Value {
@@ -65,21 +92,23 @@ fn selection(game_id: u64, champion: u32, bench: u32, remaining_ms: u32) -> Valu
     })
 }
 
+fn serve_draft(app: &AppHandle, phase: &'static str, draft: DraftFixture) {
+    let server = app.state::<MiniClient>();
+    let mut scene = server.scene.lock().unwrap();
+    scene.phase = phase;
+    if phase == "ReadyCheck" {
+        scene.response = "None";
+    }
+    scene.partial_kiwi = Some(draft);
+}
+
 async fn sample(
     app: &AppHandle,
     client: &Arc<LocalClient>,
     phase: &'static str,
     draft: DraftFixture,
 ) {
-    let server = app.state::<MiniClient>();
-    {
-        let mut scene = server.scene.lock().unwrap();
-        scene.phase = phase;
-        if phase == "ReadyCheck" {
-            scene.response = "None";
-        }
-        scene.partial_kiwi = Some(draft);
-    }
+    serve_draft(app, phase, draft);
     app.state::<ClientRuntime>()
         .sample_fixture(app, client)
         .await;
@@ -248,6 +277,188 @@ async fn queue_clock(
     (values, before_polls)
 }
 
+fn second_draft(gameflow: Value, champion: u32, bench: u32) -> DraftFixture {
+    DraftFixture {
+        gameflow: Some(gameflow),
+        selection: Some(selection(SECOND_GAME, champion, bench, 5_000)),
+        current_champion: Some(champion),
+        ..Default::default()
+    }
+}
+
+async fn assert_forged_swap_blocked(
+    aux: &WebviewWindow,
+    server: &MiniClient,
+    champion: u32,
+    label: &str,
+) {
+    let before = server.scene.lock().unwrap().writes.len();
+    aux.eval(format!(
+        r#"
+        delete document.documentElement.dataset.rejectedBenchSwap;
+        window.__TAURI__.core.invoke('league_call', {{
+            namespace: 'aux-activity-main', method: 'swapBenchChampion', args: [{champion}]
+        }}).then(result => document.documentElement.dataset.rejectedBenchSwap =
+            result.success === false ? 'blocked' : 'unexpected')
+        "#,
+    ))
+    .unwrap();
+    check_renderer(
+        aux,
+        "document.documentElement.dataset.rejectedBenchSwap === 'blocked'",
+        label,
+        || {},
+    )
+    .await;
+    assert_eq!(
+        server.scene.lock().unwrap().writes.len(),
+        before,
+        "{label}: the rejected IPC call reached the League client's write endpoint"
+    );
+}
+
+async fn second_draft_portraits(
+    aux: &WebviewWindow,
+    champion: u32,
+    bench: u32,
+    actionable: bool,
+    label: &str,
+) {
+    check_renderer(
+        aux,
+        &format!(
+            r#"
+        document.querySelector('.aux-activity[data-phase=ChampSelect] .current-champion[data-champion-id="{champion}"] img')?.naturalWidth > 1 &&
+        document.querySelector('.bench [data-champion-id="{bench}"][aria-disabled={disabled}] img')?.naturalWidth > 1 &&
+        !document.querySelector('.aux-draft-confirming, .current-champion[data-champion-id="22"], .bench [data-champion-id="103"]') &&
+        {notice}
+        "#,
+            disabled = !actionable,
+            notice = if actionable {
+                "!document.querySelector('.aux-draft-waiting')"
+            } else {
+                "!!document.querySelector('.aux-draft-waiting')"
+            },
+        ),
+        label,
+        || {},
+    )
+    .await;
+}
+
+async fn swap_in_second_draft(
+    app: &AppHandle,
+    client: &Arc<LocalClient>,
+    aux: &WebviewWindow,
+    gameflow: Value,
+    current: &mut (u32, u32),
+    label: &str,
+) -> bool {
+    let (champion, bench) = *current;
+    let runtime = app.state::<ClientRuntime>();
+    let server = app.state::<MiniClient>();
+    sample(
+        app,
+        client,
+        "ChampSelect",
+        second_draft(gameflow.clone(), champion, bench),
+    )
+    .await;
+    let (_, state) = runtime
+        .fields(crate::lcu::aux_activity::NAMESPACE, "state")
+        .unwrap()
+        .unwrap();
+    let actionable = state["view"]["selectionActionable"] == true;
+    println!(
+        "HKSLGT_CONSECUTIVE_KIWI_BENCH: {label}, flowGame={} mode={} champion={} actionable={actionable}",
+        gameflow["gameData"]["gameId"], state["view"]["gameMode"], state["view"]["championId"]
+    );
+    assert_eq!(state["view"]["gameMode"], "KIWI", "{label}");
+    second_draft_portraits(aux, champion, bench, actionable, label).await;
+    check_renderer(
+        aux,
+        r#"/^5\s*(秒|s)$/.test(document.querySelector('.aux-draft-timer')?.textContent.trim())"#,
+        "the second draft shows the current server's five seconds",
+        || {},
+    )
+    .await;
+    if !actionable {
+        // Observe both rejected shapes on the old build before reporting failure.
+        return false;
+    }
+
+    assert_forged_swap_blocked(
+        aux,
+        &server,
+        22,
+        "even a pickable champion outside the live bench cannot be requested through IPC",
+    )
+    .await;
+    let before = server.scene.lock().unwrap().writes.len();
+    click(aux, &format!(r#".bench [data-champion-id="{bench}"]"#)).await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while server.scene.lock().unwrap().writes.len() == before {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label}: clicking the bench never reached the TLS client"));
+    {
+        let scene = server.scene.lock().unwrap();
+        assert_eq!(
+            &scene.writes[before..],
+            &[("POST".to_owned(), format!("{BENCH_SWAP}{bench}"))],
+            "{label}: the bench click must reach the exact endpoint once"
+        );
+        let draft = scene.partial_kiwi.as_ref().unwrap();
+        assert_eq!(draft.gameflow.as_ref(), Some(&gameflow), "{label}");
+        assert_eq!(draft.current_champion, Some(bench), "{label}");
+    }
+    runtime.sample_fixture(app, client).await;
+    second_draft_portraits(
+        aux,
+        bench,
+        champion,
+        true,
+        "second draft after client readback",
+    )
+    .await;
+    aux.eval("delete document.documentElement.dataset.smokeColored")
+        .unwrap();
+    assert_color_portrait(
+        aux,
+        &format!(r#".current-champion[data-champion-id="{bench}"] img"#),
+    )
+    .await;
+    *current = (bench, champion);
+    true
+}
+
+async fn reject_second_draft_write(
+    app: &AppHandle,
+    client: &Arc<LocalClient>,
+    aux: &WebviewWindow,
+    draft: DraftFixture,
+    bench: u32,
+    label: &str,
+) {
+    sample(app, client, "ChampSelect", draft).await;
+    let runtime = app.state::<ClientRuntime>();
+    let (_, state) = runtime
+        .fields(crate::lcu::aux_activity::NAMESPACE, "state")
+        .unwrap()
+        .unwrap();
+    assert_ne!(state["view"]["selectionActionable"], true, "{label}");
+    check_renderer(
+        aux,
+        "!document.querySelector('.bench [aria-disabled=false]')",
+        label,
+        || {},
+    )
+    .await;
+    assert_forged_swap_blocked(aux, &app.state::<MiniClient>(), bench, label).await;
+}
+
 pub(super) async fn check(app: &AppHandle) {
     set_preference(app, AUX_WINDOW, "enabled", true);
     set_preference(app, OPGG_WINDOW, "enabled", false);
@@ -395,91 +606,130 @@ pub(super) async fn check(app: &AppHandle) {
     let (clock, before_polls) = queue_clock(app, &client, &aux).await;
     room(app, &client, &aux, "ReadyCheck").await;
 
-    for (label, prior_flow) in [
-        (
-            "stale ChampSelect from the first game",
-            kiwi_flow("ChampSelect", FIRST_GAME),
-        ),
-        (
-            "stale terminal response with no game ID",
-            kiwi_flow("EndOfGame", 0),
-        ),
-    ] {
-        sample(
-            app,
-            &client,
-            "ChampSelect",
-            DraftFixture {
-                gameflow: Some(prior_flow),
-                selection: Some(selection(SECOND_GAME, 55, 136, 5_000)),
-                current_champion: Some(55),
-                ..Default::default()
-            },
-        )
-        .await;
-        let (_, stale) = runtime
-            .fields(crate::lcu::aux_activity::NAMESPACE, "state")
-            .unwrap()
-            .unwrap();
-        println!("HKSLGT_CONSECUTIVE_KIWI_LATE: {label}, phase={} mode={} champion={} actionable={} confirming={}",
-            stale["view"]["phase"], stale["view"]["gameMode"], stale["view"]["championId"],
-            stale["view"]["selectionActionable"], stale["verifyingDraft"]);
-        check_renderer(&aux, r#"
-            document.querySelector('.aux-activity[data-phase=ChampSelect] .current-champion[data-champion-id="55"] img')?.naturalWidth > 1 &&
-            document.querySelector('.bench [data-champion-id="136"][aria-disabled=true] img')?.naturalWidth > 1 &&
-            /^5\s*(秒|s)$/.test(document.querySelector('.aux-draft-timer')?.textContent.trim()) &&
-            !document.querySelector('.aux-draft-confirming, .current-champion[data-champion-id="22"], .bench [data-champion-id="103"]')
-        "#, label, || {}).await;
-    }
-    aux.eval("delete document.documentElement.dataset.smokeColored")
-        .unwrap();
-    assert_color_portrait(&aux, ".current-champion[data-champion-id='55'] img").await;
+    let mut portraits = (55, 136);
+    let stale = swap_in_second_draft(
+        app,
+        &client,
+        &aux,
+        kiwi_flow("ChampSelect", FIRST_GAME),
+        &mut portraits,
+        "known retired first game still returned by gameflow",
+    )
+    .await;
+    let alias = swap_in_second_draft(
+        app,
+        &client,
+        &aux,
+        flow("ChampSelect", SECOND_GAME, KIWI_QUEUE, "ARAM"),
+        &mut portraits,
+        "KIWI queue with the shared ARAM game mode label",
+    )
+    .await;
+    assert!(
+        stale && alias,
+        "the verified second KIWI draft must allow a real bench swap: retired game allowed={stale}, shared ARAM label allowed={alias}"
+    );
+    let (champion, bench) = portraits;
+    assert_eq!((champion, bench), (55, 136));
     assert_eq!(aux.hwnd().unwrap(), hwnd);
     assert!(
         aux.is_visible().unwrap(),
         "the current second draft stays visible"
     );
 
-    let mut unidentified = selection(SECOND_GAME, 55, 136, 5_000);
-    unidentified["gameId"] = Value::Null;
+    let mut changed_player = second_draft(kiwi_flow("ChampSelect", SECOND_GAME), champion, bench);
+    changed_player.selection.as_mut().unwrap()["myTeam"][0]["puuid"] =
+        json!("different-fixture-player");
+    check_renderer(
+        &aux,
+        "!!document.querySelector('.bench [aria-disabled=false]')",
+        "the known second draft is still enabled before the server-side player changes",
+        || {},
+    )
+    .await;
+    // Do not publish a new view here. The action must re-read the player identity.
+    serve_draft(app, "ChampSelect", changed_player);
+    assert_forged_swap_blocked(
+        &aux,
+        &server,
+        bench,
+        "a different player occupying the same cell cannot use the previously enabled bench",
+    )
+    .await;
+
+    let mut unidentified =
+        second_draft(flow("ChampSelect", 0, KIWI_QUEUE, "ARAM"), champion, bench);
+    unidentified
+        .selection
+        .as_mut()
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("gameId");
+    sample(app, &client, "ChampSelect", unidentified).await;
+    second_draft_portraits(
+        &aux,
+        champion,
+        bench,
+        false,
+        "the shared ARAM label without a positive game ID displays a read-only bench",
+    )
+    .await;
+
+    let mut changed_game = second_draft(
+        flow("ChampSelect", UNRELATED_GAME, KIWI_QUEUE, "ARAM"),
+        champion,
+        bench,
+    );
+    changed_game.selection.as_mut().unwrap()["gameId"] = json!(UNRELATED_GAME);
+    serve_draft(app, "ChampSelect", changed_game);
+    assert_forged_swap_blocked(
+        &aux,
+        &server,
+        bench,
+        "a newly identified game cannot authorize an IPC call from an unidentified snapshot",
+    )
+    .await;
+
+    let mut missing_id = second_draft(kiwi_flow("ChampSelect", FIRST_GAME), champion, bench);
+    missing_id.selection.as_mut().unwrap()["gameId"] = Value::Null;
+    let mut retired_id = second_draft(kiwi_flow("ChampSelect", SECOND_GAME), champion, bench);
+    retired_id.selection.as_mut().unwrap()["gameId"] = json!(FIRST_GAME);
+    for (label, draft) in [
+        ("no game ID on the draft endpoint", missing_id),
+        ("the draft endpoint returns the retired game ID", retired_id),
+        (
+            "an unrelated active game on gameflow",
+            second_draft(kiwi_flow("ChampSelect", UNRELATED_GAME), champion, bench),
+        ),
+    ] {
+        reject_second_draft_write(app, &client, &aux, draft, bench, label).await;
+    }
+
     sample(
         app,
         &client,
         "ChampSelect",
-        DraftFixture {
-            gameflow: Some(kiwi_flow("ChampSelect", FIRST_GAME)),
-            selection: Some(unidentified),
-            current_champion: Some(55),
-            ..Default::default()
-        },
+        second_draft(kiwi_flow("EndOfGame", 0), champion, bench),
     )
     .await;
-    let (_, unidentified_state) = runtime
-        .fields(crate::lcu::aux_activity::NAMESPACE, "state")
-        .unwrap()
-        .unwrap();
-    assert_ne!(
-        unidentified_state["view"]["selectionActionable"], true,
-        "an absent game ID cannot resurrect the retired first draft as writable"
-    );
-    aux.eval(
-        r#"
-        window.__TAURI__.core.invoke('league_call', {
-            namespace: 'aux-activity-main', method: 'swapBenchChampion', args: [136]
-        }).then(result => document.documentElement.dataset.staleSecondWrite =
-            result.success === false ? 'blocked' : 'unexpected')
-    "#,
-    )
-    .unwrap();
-    check_renderer(
+    second_draft_portraits(
         &aux,
-        "document.documentElement.dataset.staleSecondWrite === 'blocked'",
-        "a stale second draft cannot write",
-        || {},
+        champion,
+        bench,
+        false,
+        "stale terminal response without a game ID stays read-only",
+    )
+    .await;
+    assert_forged_swap_blocked(
+        &aux,
+        &server,
+        bench,
+        "a terminal response without a game ID cannot authorize a bench swap",
     )
     .await;
 
-    let mut next = selection(SECOND_GAME, 55, 136, 4_000);
+    let mut next = selection(SECOND_GAME, champion, bench, 4_000);
     sample(
         app,
         &client,
@@ -487,12 +737,19 @@ pub(super) async fn check(app: &AppHandle) {
         DraftFixture {
             gameflow: Some(kiwi_flow("ChampSelect", SECOND_GAME)),
             selection: Some(next.clone()),
-            current_champion: Some(55),
+            current_champion: Some(champion),
             ..Default::default()
         },
     )
     .await;
-    check_renderer(&aux, "!!document.querySelector('.bench [data-champion-id=\"136\"][aria-disabled=false]') && !document.querySelector('.aux-draft-waiting')", "fresh second game enables eligible actions", || {}).await;
+    second_draft_portraits(
+        &aux,
+        champion,
+        bench,
+        true,
+        "the agreeing second game enables eligible actions",
+    )
+    .await;
     next["queueId"] = Value::Null;
     sample(
         app,
@@ -504,10 +761,14 @@ pub(super) async fn check(app: &AppHandle) {
         },
     )
     .await;
-    check_renderer(&aux, r#"
-        document.querySelector('.current-champion[data-champion-id="55"] img')?.naturalWidth > 1 &&
-        document.querySelector('.bench [data-champion-id="136"][aria-disabled=true] img')?.naturalWidth > 1
-    "#, "metadata gap within the second verified game preserves only its own portraits", || {}).await;
+    second_draft_portraits(
+        &aux,
+        champion,
+        bench,
+        false,
+        "metadata gap preserves the correct second draft's portraits without writes",
+    )
+    .await;
 
     next["queueId"] = json!(420);
     sample(
@@ -517,7 +778,7 @@ pub(super) async fn check(app: &AppHandle) {
         DraftFixture {
             gameflow: Some(flow("ChampSelect", SECOND_GAME, 420, "CLASSIC")),
             selection: Some(next),
-            current_champion: Some(55),
+            current_champion: Some(champion),
             ..Default::default()
         },
     )
@@ -529,15 +790,19 @@ pub(super) async fn check(app: &AppHandle) {
         || {},
     )
     .await;
+    assert_forged_swap_blocked(&aux, &server, bench, "explicit non-ARAM").await;
     let observed = server.scene.lock().unwrap().writes.clone();
+    let accept = (
+        "POST".to_owned(),
+        "/lol-matchmaking/v1/ready-check/accept".to_owned(),
+    );
     assert_eq!(
         observed,
-        vec![
-            (
-                "POST".to_owned(),
-                "/lol-matchmaking/v1/ready-check/accept".to_owned()
-            );
-            2
+        [
+            accept.clone(),
+            accept,
+            ("POST".to_owned(), format!("{BENCH_SWAP}136")),
+            ("POST".to_owned(), format!("{BENCH_SWAP}55")),
         ]
     );
 
@@ -586,5 +851,5 @@ pub(super) async fn check(app: &AppHandle) {
         "the actual queue caption did not skip a displayed second: {whole_seconds:?}"
     );
     assert_eq!(aux.hwnd().unwrap(), hwnd);
-    println!("HKSLGT_CONSECUTIVE_KIWI_PASS: same Mini, two observed drafts, no stale writes; displayed seconds {whole_seconds:?} over {span:.0}ms");
+    println!("HKSLGT_CONSECUTIVE_KIWI_PASS: same Mini, two verified bench swaps with decoded client readback, no stale or forged writes; displayed seconds {whole_seconds:?} over {span:.0}ms");
 }

@@ -351,6 +351,13 @@ impl Scene {
         if std::mem::take(&mut self.reject_next) {
             return 409;
         }
+        if self.consecutive_room.is_some() && self.phase == "ChampSelect" && method == "POST" {
+            if let Some(status) = self.partial_kiwi.as_mut().and_then(|draft| {
+                super::consecutive_kiwi_smoke::RoomFixture::swap_bench(draft, path)
+            }) {
+                return status;
+            }
+        }
         match (self.phase, method, path) {
             ("Lobby", "POST", "/lol-lobby/v2/lobby/matchmaking/search") => {
                 self.phase = "Matchmaking"

@@ -9,17 +9,16 @@ use crate::{
     room_flow::RoomOptions,
 };
 use rustls::{
-    ServerConfig, ServerConnection, StreamOwned,
     pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+    ServerConfig, ServerConnection, StreamOwned,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     io::{self, BufRead, Cursor, Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
+        mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -29,6 +28,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 const PLAYER: &str = "11111111-2222-4333-8444-555555555555";
+const HONOR_TARGET: &str = "11111111-2222-4333-8444-555555555556";
 const FIXTURE_AUTH: &str = "Basic cmlvdDpmaXh0dXJlLW9ubHk=";
 
 struct ReadyFixture {
@@ -46,12 +46,21 @@ struct ReadyFixture {
 struct Scene {
     phase: String,
     queue_id: u64,
+    game_id: u64,
     response: String,
     direct_ready_response: String,
     direct_ready_available: bool,
     slow_search_ms: u64,
+    slow_sequence_once_ms: u64,
     request_trace: Vec<String>,
+    request_times: Vec<(String, Instant)>,
     posts: Vec<Instant>,
+    post_game_ballot_available: bool,
+    post_game_ballot_submitted: bool,
+    post_game_honors: Vec<String>,
+    post_game_writes: Vec<(String, Instant)>,
+    future_session_reads_until_missing: Option<usize>,
+    session_observations: Vec<(String, Option<u64>, Instant)>,
 }
 
 #[derive(Clone)]
@@ -185,6 +194,142 @@ impl ReadyFixture {
             uri: "/lol-gameflow/v1/gameflow-phase",
             data: json!(phase),
         });
+    }
+
+    fn start_post_game(&self, phase: &'static str, game_id: u64) {
+        let mut scene = self.scene.lock().unwrap();
+        scene.phase = phase.into();
+        scene.queue_id = 450;
+        scene.game_id = game_id;
+        scene.post_game_ballot_available = false;
+        scene.post_game_ballot_submitted = false;
+        scene.post_game_honors.clear();
+        scene.post_game_writes.clear();
+    }
+
+    fn slow_next_sequence_read(&self, milliseconds: u64) {
+        self.scene.lock().unwrap().slow_sequence_once_ms = milliseconds;
+    }
+
+    fn make_nth_future_session_incomplete(&self, nth: usize) {
+        self.scene
+            .lock()
+            .unwrap()
+            .future_session_reads_until_missing = Some(nth);
+    }
+
+    fn session_observations(&self) -> Vec<(String, Option<u64>, Instant)> {
+        self.scene.lock().unwrap().session_observations.clone()
+    }
+
+    async fn wait_for_incomplete_end_game_session(&self, timeout: Duration) -> Option<Instant> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some((_, _, at)) = self
+                .session_observations()
+                .iter()
+                .find(|(phase, game_id, _)| phase == "EndOfGame" && game_id.is_none())
+            {
+                return Some(*at);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.session_observations()
+            .into_iter()
+            .find(|(phase, game_id, _)| phase == "EndOfGame" && game_id.is_none())
+            .map(|(_, _, at)| at)
+    }
+
+    async fn wait_for_session_quiet(&self, quiet: Duration, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut last_count = self.session_observations().len();
+        let mut quiet_since = Instant::now();
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let count = self.session_observations().len();
+            if count != last_count {
+                last_count = count;
+                quiet_since = Instant::now();
+            } else if quiet_since.elapsed() >= quiet {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn publish_post_game_ballot(&self) {
+        let game_id = {
+            let mut scene = self.scene.lock().unwrap();
+            scene.post_game_ballot_available = true;
+            scene.game_id
+        };
+        self.emit(WsEvent {
+            event_type: "Create",
+            uri: "/lol-honor-v2/v1/ballot/",
+            data: json!({"gameId":game_id,"votePool":{"votes":1},"honoredPlayers":[]}),
+        });
+    }
+
+    fn post_game_writes(&self) -> Vec<(String, Instant)> {
+        self.scene.lock().unwrap().post_game_writes.clone()
+    }
+
+    async fn wait_for_request_after(
+        &self,
+        fragment: &str,
+        after: Instant,
+        timeout: Duration,
+    ) -> Option<Instant> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some((_, at)) = self
+                .scene
+                .lock()
+                .unwrap()
+                .request_times
+                .iter()
+                .find(|(request, at)| request.contains(fragment) && *at >= after)
+            {
+                return Some(*at);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.scene
+            .lock()
+            .unwrap()
+            .request_times
+            .iter()
+            .find(|(request, at)| request.contains(fragment) && *at >= after)
+            .map(|(_, at)| *at)
+    }
+
+    async fn wait_for_post_game_write(
+        &self,
+        path: &str,
+        after: Instant,
+        timeout: Duration,
+    ) -> Option<Instant> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some((_, at)) = self
+                .scene
+                .lock()
+                .unwrap()
+                .post_game_writes
+                .iter()
+                .find(|(request, at)| request == path && *at >= after)
+            {
+                return Some(*at);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.scene
+            .lock()
+            .unwrap()
+            .post_game_writes
+            .iter()
+            .find(|(request, at)| request == path && *at >= after)
+            .map(|(_, at)| *at)
     }
 
     fn emit_ready(&self, response: &'static str) {
@@ -474,52 +619,148 @@ fn serve_http<S: Read + Write>(
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    let (status, response, post_time) = if !authenticated {
-        (401, Value::Null, None)
-    } else if method == "POST" && path == "/lol-matchmaking/v1/ready-check/accept" {
-        let now = Instant::now();
-        let mut scene = scene.lock().unwrap();
-        scene.posts.push(now);
-        scene.response = "Accepted".into();
-        scene.direct_ready_response = "Accepted".into();
-        (200, json!({}), Some(now))
-    } else if method == "GET" {
-        let scene = scene.lock().unwrap();
-        if path == "/lol-matchmaking/v1/search" && scene.slow_search_ms > 0 {
-            thread::sleep(Duration::from_millis(scene.slow_search_ms));
+    let started_at = Instant::now();
+    let mut post_time = None;
+    if authenticated && method == "GET" && path == "/lol-pre-end-of-game/v1/currentSequenceEvent" {
+        let delay = {
+            let mut scene = scene.lock().unwrap();
+            std::mem::take(&mut scene.slow_sequence_once_ms)
+        };
+        if delay > 0 {
+            thread::sleep(Duration::from_millis(delay));
         }
+    }
+    let (status, response) = if !authenticated {
+        (401, Value::Null)
+    } else {
+        let mut scene = scene.lock().unwrap();
         let mode = if scene.queue_id == 450 {
             "ARAM"
         } else {
             "CLASSIC"
         };
-        let response = match path {
-            "/lol-summoner/v1/current-summoner" => {
-                json!({"puuid":PLAYER,"summonerId":41,"displayName":"Fixture"})
+        if method == "POST" {
+            match path {
+                "/lol-matchmaking/v1/ready-check/accept" => {
+                    scene.posts.push(started_at);
+                    scene.response = "Accepted".into();
+                    scene.direct_ready_response = "Accepted".into();
+                    post_time = Some(started_at);
+                    (200, json!({}))
+                }
+                "/lol-honor/v1/honor" => {
+                    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let recipient = body["recipientPuuid"].as_str().unwrap_or_default();
+                    let valid = matches!(scene.phase.as_str(), "PreEndOfGame" | "EndOfGame")
+                        && scene.post_game_ballot_available
+                        && !scene.post_game_ballot_submitted
+                        && body["honorType"] == "HEART"
+                        && recipient == HONOR_TARGET
+                        && !scene.post_game_honors.iter().any(|old| old == recipient);
+                    if valid {
+                        scene.post_game_honors.push(recipient.to_owned());
+                    }
+                    scene.post_game_writes.push((path.to_owned(), started_at));
+                    (if valid { 204 } else { 409 }, json!({}))
+                }
+                "/lol-honor/v1/ballot" => {
+                    let valid = matches!(scene.phase.as_str(), "PreEndOfGame" | "EndOfGame")
+                        && scene.post_game_ballot_available
+                        && !scene.post_game_ballot_submitted
+                        && scene.post_game_honors.contains(&HONOR_TARGET.to_owned());
+                    if valid {
+                        scene.post_game_ballot_submitted = true;
+                    }
+                    scene.post_game_writes.push((path.to_owned(), started_at));
+                    (if valid { 204 } else { 409 }, json!({}))
+                }
+                "/lol-lobby/v2/play-again" => {
+                    let valid = scene.phase == "EndOfGame" && scene.post_game_ballot_submitted;
+                    if valid {
+                        scene.phase = "Lobby".into();
+                    }
+                    scene.post_game_writes.push((path.to_owned(), started_at));
+                    (if valid { 204 } else { 409 }, json!({}))
+                }
+                "/lol-pre-end-of-game/v1/complete/missions-celebration" => {
+                    scene.post_game_writes.push((path.to_owned(), started_at));
+                    (204, json!({}))
+                }
+                _ => (404, Value::Null),
             }
-            "/lol-chat/v1/me" => json!({"puuid":PLAYER,"platformId":"NA1","name":"Fixture"}),
-            "/lol-gameflow/v1/gameflow-phase" => json!(scene.phase),
-            "/lol-gameflow/v1/session" => {
-                json!({"phase":scene.phase,"gameData":{"gameId":0,"isCustomGame":false,"queue":{"id":scene.queue_id,"gameMode":mode,"type":mode}}})
+        } else if method == "GET" {
+            if path == "/lol-matchmaking/v1/search" && scene.slow_search_ms > 0 {
+                thread::sleep(Duration::from_millis(scene.slow_search_ms));
             }
-            "/lol-lobby/v2/lobby" => {
-                json!({"partyId":"fixture-party","gameConfig":{"queueId":scene.queue_id,"gameMode":mode,"isCustom":false},"localMember":{"puuid":PLAYER,"isLeader":true},"members":[{"puuid":PLAYER,"isLeader":true}],"invitations":[]})
-            }
-            "/lol-matchmaking/v1/search" => {
-                json!({"queueId":scene.queue_id,"readyCheck":{"state":"InProgress","playerResponse":scene.response}})
-            }
-            "/lol-matchmaking/v1/ready-check" if scene.direct_ready_available => {
-                json!({"state":"InProgress","playerResponse":scene.direct_ready_response})
-            }
-            _ => Value::Null,
-        };
-        (if response.is_null() { 404 } else { 200 }, response, None)
-    } else {
-        (404, Value::Null, None)
+            let response = match path {
+                "/lol-summoner/v1/current-summoner" => {
+                    json!({"puuid":PLAYER,"summonerId":41,"displayName":"Fixture"})
+                }
+                "/lol-chat/v1/me" => json!({"puuid":PLAYER,"platformId":"NA1","name":"Fixture"}),
+                "/lol-gameflow/v1/gameflow-phase" => json!(scene.phase),
+                "/lol-gameflow/v1/session" => {
+                    let incomplete =
+                        scene
+                            .future_session_reads_until_missing
+                            .take()
+                            .is_some_and(|remaining| {
+                                if remaining <= 1 {
+                                    true
+                                } else {
+                                    scene.future_session_reads_until_missing = Some(remaining - 1);
+                                    false
+                                }
+                            });
+                    let game_id = (!incomplete).then_some(scene.game_id);
+                    let phase = scene.phase.clone();
+                    scene.session_observations.push((phase, game_id, started_at));
+                    if incomplete {
+                        json!({"phase":scene.phase,"gameData":{"isCustomGame":false,"queue":{"id":scene.queue_id,"gameMode":mode,"type":mode}}})
+                    } else {
+                        json!({"phase":scene.phase,"gameData":{"gameId":scene.game_id,"isCustomGame":false,"queue":{"id":scene.queue_id,"gameMode":mode,"type":mode}}})
+                    }
+                }
+                "/lol-lobby/v2/lobby" => {
+                    json!({"partyId":"fixture-party","gameConfig":{"queueId":scene.queue_id,"gameMode":mode,"isCustom":false},"localMember":{"puuid":PLAYER,"isLeader":true},"members":[{"puuid":PLAYER,"isLeader":true}],"invitations":[]})
+                }
+                "/lol-matchmaking/v1/search" => {
+                    json!({"queueId":scene.queue_id,"readyCheck":{"state":"InProgress","playerResponse":scene.response}})
+                }
+                "/lol-matchmaking/v1/ready-check" if scene.direct_ready_available => {
+                    json!({"state":"InProgress","playerResponse":scene.direct_ready_response})
+                }
+                "/lol-honor-v2/v1/ballot/" | "/lol-honor-v2/v1/ballot"
+                    if scene.post_game_ballot_available && !scene.post_game_ballot_submitted =>
+                {
+                    json!({
+                        "gameId":scene.game_id,
+                        "eligibleAllies":[{"puuid":PLAYER,"botPlayer":false},{"puuid":HONOR_TARGET,"botPlayer":false}],
+                        "eligibleOpponents":[],
+                        "honoredPlayers":[],
+                        "votePool":{"fromGamePlayed":1,"fromHighHonor":0,"fromRecentHonors":0,"fromRollover":0,"votes":1}
+                    })
+                }
+                "/lol-lobby/v2/party/eog-status" => {
+                    json!({"eogPlayers":[PLAYER],"readyPlayers":[],"leftPlayers":[],"partySize":1})
+                }
+                "/lol-pre-end-of-game/v1/currentSequenceEvent" => {
+                    json!({"name":"missions-celebration"})
+                }
+                _ => Value::Null,
+            };
+            (if response.is_null() { 404 } else { 200 }, response)
+        } else {
+            (404, Value::Null)
+        }
     };
-    scene.lock().unwrap().request_trace.push(format!(
-        "{method} {path} -> {status} (authenticated={authenticated})"
-    ));
+    {
+        let mut scene = scene.lock().unwrap();
+        let request = format!("{method} {path}");
+        scene.request_times.push((request.clone(), started_at));
+        scene.request_trace.push(format!(
+            "{request} -> {status} (authenticated={authenticated})"
+        ));
+    }
     if let Some(time) = post_time {
         let _ = post_tx.send(time);
     }
@@ -535,6 +776,19 @@ fn serve_http<S: Read + Write>(
 }
 
 fn app_with_runtime(fixture: &ReadyFixture) -> (tauri::App, Arc<LocalClient>) {
+    app_with_runtime_options(
+        fixture,
+        RoomOptions {
+            accept: true,
+            ..RoomOptions::default()
+        },
+    )
+}
+
+fn app_with_runtime_options(
+    fixture: &ReadyFixture,
+    options: RoomOptions,
+) -> (tauri::App, Arc<LocalClient>) {
     let client =
         Arc::new(LocalClient::fixture_at(fixture.port).expect("fixture listener identity"));
     assert!(client.alive(), "fixture process handle must remain live");
@@ -564,13 +818,7 @@ fn app_with_runtime(fixture: &ReadyFixture) -> (tauri::App, Arc<LocalClient>) {
         .select(&app.handle(), Some(client.instance))
         .unwrap();
     runtime
-        .replace_room_options(
-            &app.handle(),
-            RoomOptions {
-                accept: true,
-                ..RoomOptions::default()
-            },
-        )
+        .replace_room_options(&app.handle(), options)
         .unwrap();
     (app, client)
 }
@@ -759,6 +1007,300 @@ fn ready_check_event_does_not_accept_non_aram_queue() {
             0,
             "non-ARAM state must not invoke the accept route"
         );
+        monitor.abort();
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable Windows desktop runner; exercises authenticated post-game WSS wake and deadline scheduling"]
+fn post_game_ballot_event_wakes_fast_and_return_observes_upstream_deadline() {
+    let fixture = ReadyFixture::start(450);
+    let options = RoomOptions {
+        honor: true,
+        play_again: true,
+        ..RoomOptions::default()
+    };
+    let (app, _client) = app_with_runtime_options(&fixture, options);
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::block_on(async {
+        consume_startup_refresh(&app).await;
+        let monitor = tauri::async_runtime::spawn(monitor(app_handle));
+        assert!(wait_for_lobby(&app, &fixture).await);
+        assert!(fixture.wait_subscribed(Duration::from_secs(3)).await);
+
+        let phase_started = Instant::now();
+        fixture.start_post_game("EndOfGame", 7711);
+        fixture.emit_phase("EndOfGame");
+        assert!(wait_for_phase(&app, "EndOfGame", Duration::from_secs(1)).await);
+        assert!(fixture
+            .wait_for_request_after(
+                "GET /lol-honor-v2/v1/ballot/",
+                phase_started,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_some());
+        // Allow the initial no-ballot sample and its writer guard to finish before the
+        // synthetic resource Create. The test then measures the WSS-triggered work itself.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let event_started = Instant::now();
+        fixture.publish_post_game_ballot();
+        let ballot_read = fixture
+            .wait_for_request_after(
+                "GET /lol-honor-v2/v1/ballot/",
+                event_started,
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("ballot Create should trigger an authenticated fresh ballot read");
+        let honor = fixture
+            .wait_for_post_game_write(
+                "/lol-honor/v1/honor",
+                event_started,
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("the event-triggered run should submit the eligible human honor");
+        let submit = fixture
+            .wait_for_post_game_write(
+                "/lol-honor/v1/ballot",
+                event_started,
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("successful honor should submit the ballot once");
+        let ballot_latency = ballot_read.duration_since(event_started);
+        let honor_latency = honor.duration_since(event_started);
+        let submit_latency = submit.duration_since(event_started);
+        assert!(
+            ballot_latency < Duration::from_millis(500),
+            "ballot read: {ballot_latency:?}"
+        );
+        assert!(
+            honor_latency < Duration::from_millis(500),
+            "honor POST: {honor_latency:?}"
+        );
+        assert!(
+            submit_latency < Duration::from_millis(500),
+            "ballot POST: {submit_latency:?}"
+        );
+
+        let stage_deadline = phase_started + Duration::from_millis(1_575);
+        assert!(
+            fixture
+                .post_game_writes()
+                .iter()
+                .all(|(path, at)| path != "/lol-lobby/v2/play-again" || *at >= stage_deadline),
+            "Play Again must not precede the upstream EndOfGame buffer"
+        );
+        let return_timeout =
+            (stage_deadline + Duration::from_millis(500)).saturating_duration_since(Instant::now());
+        let play_again = fixture
+            .wait_for_post_game_write("/lol-lobby/v2/play-again", phase_started, return_timeout)
+            .await
+            .expect("return should follow the upstream deadline without another monitor tick");
+        assert!(
+            play_again >= stage_deadline,
+            "Play Again preceded the EndOfGame buffer"
+        );
+        let return_lag = play_again.duration_since(stage_deadline);
+        assert!(
+            return_lag < Duration::from_millis(500),
+            "due return lag: {return_lag:?}"
+        );
+
+        let writes = fixture.post_game_writes();
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(path, _)| path == "/lol-honor/v1/honor")
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(path, _)| path == "/lol-honor/v1/ballot")
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(path, _)| path == "/lol-lobby/v2/play-again")
+                .count(),
+            1
+        );
+        assert_eq!(fixture.phase(), "Lobby");
+        eprintln!(
+            "WSS post-game event -> ballot GET {ballot_latency:?}, honor POST {honor_latency:?}, ballot submit {submit_latency:?}; EndOfGame deadline -> Play Again {return_lag:?}"
+        );
+        monitor.abort();
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable Windows desktop runner; protects an event received while an optional post-game read holds the writer"]
+fn post_game_ballot_event_is_not_lost_during_slow_optional_sequence_read() {
+    let fixture = ReadyFixture::start(450);
+    fixture.slow_next_sequence_read(600);
+    let options = RoomOptions {
+        honor: true,
+        play_again: true,
+        ..RoomOptions::default()
+    };
+    let (app, _client) = app_with_runtime_options(&fixture, options);
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::block_on(async {
+        consume_startup_refresh(&app).await;
+        let monitor = tauri::async_runtime::spawn(monitor(app_handle));
+        assert!(wait_for_lobby(&app, &fixture).await);
+        assert!(fixture.wait_subscribed(Duration::from_secs(3)).await);
+
+        let stage_event = Instant::now();
+        fixture.start_post_game("PreEndOfGame", 7722);
+        fixture.emit_phase("PreEndOfGame");
+        assert!(wait_for_phase(&app, "PreEndOfGame", Duration::from_secs(1)).await);
+        assert!(fixture
+            .wait_for_request_after(
+                "GET /lol-pre-end-of-game/v1/currentSequenceEvent",
+                stage_event,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_some());
+
+        let ballot_event = Instant::now();
+        fixture.publish_post_game_ballot();
+        fixture.publish_post_game_ballot();
+        let honor = fixture
+            .wait_for_post_game_write(
+                "/lol-honor/v1/honor",
+                ballot_event,
+                Duration::from_millis(1_200),
+            )
+            .await
+            .expect(
+                "ballot Create received during sequence read must be retried after writer release",
+            );
+        let submit = fixture
+            .wait_for_post_game_write(
+                "/lol-honor/v1/ballot",
+                ballot_event,
+                Duration::from_millis(1_400),
+            )
+            .await
+            .expect("deferred event must submit the ballot without waiting for the 2s fallback");
+        assert!(honor.duration_since(ballot_event) < Duration::from_millis(1_200));
+        assert!(submit.duration_since(ballot_event) < Duration::from_millis(1_400));
+        let writes = fixture.post_game_writes();
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(path, _)| path == "/lol-honor/v1/honor")
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(path, _)| path == "/lol-honor/v1/ballot")
+                .count(),
+            1
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|(path, _)| path != "/lol-lobby/v2/play-again"),
+            "PreEndOfGame return is not due before its pinned 3.25s buffer"
+        );
+        eprintln!(
+            "slow sequence fixture: ballot event -> honor {:?}, submit {:?}",
+            honor.duration_since(ballot_event),
+            submit.duration_since(ballot_event)
+        );
+        monitor.abort();
+    });
+}
+
+#[test]
+#[ignore = "requires a disposable Windows desktop runner; blocks return when the immediate revalidation omits the game ID"]
+fn post_game_incomplete_successful_revalidation_requires_a_verified_ballot() {
+    let fixture = ReadyFixture::start(450);
+    let options = RoomOptions {
+        play_again: true,
+        ..RoomOptions::default()
+    };
+    let (app, _client) = app_with_runtime_options(&fixture, options);
+    let app_handle = app.handle().clone();
+    tauri::async_runtime::block_on(async {
+        consume_startup_refresh(&app).await;
+        let monitor = tauri::async_runtime::spawn(monitor(app_handle));
+        assert!(wait_for_lobby(&app, &fixture).await);
+        assert!(fixture.wait_subscribed(Duration::from_secs(3)).await);
+
+        let stage_event = Instant::now();
+        fixture.start_post_game("EndOfGame", 7733);
+        fixture.emit_phase("EndOfGame");
+        assert!(wait_for_phase(&app, "EndOfGame", Duration::from_secs(1)).await);
+        assert!(fixture
+            .wait_for_request_after(
+                "GET /lol-honor-v2/v1/ballot/",
+                stage_event,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_some());
+        assert!(
+            fixture
+                .wait_for_session_quiet(Duration::from_millis(100), Duration::from_millis(600))
+                .await
+        );
+
+        let before = fixture.session_observations();
+        let known_before = before
+            .iter()
+            .filter(|(phase, _, _)| phase == "EndOfGame")
+            .count();
+        assert!(
+            known_before >= 2,
+            "sample and initial action both used the matching ARAM ID: {before:?}"
+        );
+        assert!(before
+            .iter()
+            .filter(|(phase, _, _)| phase == "EndOfGame")
+            .all(|(_, game_id, _)| *game_id == Some(7733)));
+
+        // At the due sample, the 200 session read and initial action confirmation remain
+        // complete; only return_if_current receives a body whose gameData has no gameId.
+        fixture.make_nth_future_session_incomplete(3);
+        let incomplete_at = fixture
+            .wait_for_incomplete_end_game_session(Duration::from_secs(2))
+            .await
+            .expect("the immediate return revalidation must receive the incomplete 200 session");
+        let after = fixture.session_observations();
+        let last_three: Vec<_> = after
+            .iter()
+            .filter(|(phase, _, at)| phase == "EndOfGame" && *at >= before.last().unwrap().2)
+            .map(|(_, game_id, _)| *game_id)
+            .collect();
+        assert!(
+            last_three.ends_with(&[Some(7733), Some(7733), None]),
+            "unexpected session sequence: {last_three:?}"
+        );
+        assert!(fixture
+            .request_trace()
+            .iter()
+            .any(|entry| entry == "GET /lol-gameflow/v1/session -> 200 (authenticated=true)"));
+
+        // Observe the immediate attempt, before the next normal retry tick can occur.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            fixture.post_game_writes().is_empty(),
+            "an incomplete 200 return revalidation without any ballot must not POST Play Again"
+        );
+        assert!(incomplete_at >= stage_event);
         monitor.abort();
     });
 }

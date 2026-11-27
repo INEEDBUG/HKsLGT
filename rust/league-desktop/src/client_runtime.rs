@@ -22,12 +22,15 @@ use crate::{
     resg_window::{ResgAction, ResgWindow},
     room_flow::{self, RoomFlow, RoomOptions, RoomSample},
 };
-use futures_util::future::join3;
+use futures_util::future::{join3, join4};
 pub(crate) use maxgamestudio_league_core::shell_preferences::LEAGUE_CLIENT as CLIENT;
 use serde_json::{json, Map, Value};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
@@ -196,7 +199,7 @@ struct FreshAuxSelection {
     generation: u64,
     original: AuxView,
     current: AuxView,
-    flow: GameflowSession,
+    standard_game_confirmed: bool,
     selection: Value,
     extras: AuxSelectionExtras,
 }
@@ -204,7 +207,9 @@ struct FreshAuxSelection {
 struct ReadyEventWatch {
     instance: ClientInstance,
     rounds: Arc<Mutex<lcu_events::ReadyEventDeduper>>,
-    selection_wake_enabled: Arc<std::sync::atomic::AtomicBool>,
+    selection_wake_enabled: Arc<AtomicBool>,
+    post_game_wake_enabled: Arc<AtomicBool>,
+    post_game_pending: Arc<AtomicBool>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -438,6 +443,12 @@ pub(crate) fn empty_game_data() -> Value {
 }
 
 impl RuntimeState {
+    fn retired_game_id(&self, instance: ClientInstance, player: Option<&str>) -> Option<u64> {
+        self.retired_draft.as_ref()
+            .filter(|retired| retired.instance == instance && Some(retired.player.as_str()) == player)
+            .map(|retired| retired.game_id)
+    }
+
     fn publish_room(&mut self, app: &AppHandle) {
         publish_live_fields(
             app,
@@ -612,7 +623,7 @@ pub(crate) struct ClientRuntime {
     wake: Arc<tokio::sync::Notify>,
     art_reads: tokio::sync::Semaphore,
     room_writes: tokio::sync::Mutex<()>,
-    post_game_writes: tokio::sync::Mutex<()>,
+    post_game_writes: Arc<tokio::sync::Mutex<()>>,
     selection_writes: tokio::sync::Mutex<()>,
     ready_event_watch: Mutex<Option<ReadyEventWatch>>,
     #[cfg(test)]
@@ -633,7 +644,7 @@ impl ClientRuntime {
             wake: Arc::new(tokio::sync::Notify::new()),
             art_reads: tokio::sync::Semaphore::new(4),
             room_writes: tokio::sync::Mutex::new(()),
-            post_game_writes: tokio::sync::Mutex::new(()),
+            post_game_writes: Arc::new(tokio::sync::Mutex::new(())),
             selection_writes: tokio::sync::Mutex::new(()),
             ready_event_watch: Mutex::new(None),
             #[cfg(test)]
@@ -673,6 +684,10 @@ impl ClientRuntime {
         };
         #[cfg(not(test))]
         let client = self.selected_client();
+        let post_game_wake_enabled = self.state.lock().is_ok_and(|state| {
+            let options = &state.room_flow.options;
+            options.honor || options.play_again
+        });
 
         let Ok(mut watch) = self.ready_event_watch.lock() else {
             return;
@@ -684,7 +699,10 @@ impl ClientRuntime {
         }) {
             let was_enabled = current
                 .selection_wake_enabled
-                .swap(selection_wake_enabled, std::sync::atomic::Ordering::AcqRel);
+                .swap(selection_wake_enabled, Ordering::AcqRel);
+            current
+                .post_game_wake_enabled
+                .store(post_game_wake_enabled, Ordering::Release);
             if selection_wake_enabled && !was_enabled {
                 if let Ok(mut rounds) = current.rounds.lock() {
                     rounds.seed_bench(initial_bench);
@@ -704,20 +722,67 @@ impl ClientRuntime {
                 state.seed_bench(initial_bench);
             }
             let events = Arc::clone(&rounds);
-            let selection_wake_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
-                selection_wake_enabled,
-            ));
+            let selection_wake_enabled = Arc::new(AtomicBool::new(selection_wake_enabled));
+            let post_game_wake_enabled = Arc::new(AtomicBool::new(post_game_wake_enabled));
+            let post_game_pending = Arc::new(AtomicBool::new(false));
             let selection_gate = Arc::clone(&selection_wake_enabled);
+            let post_game_gate = Arc::clone(&post_game_wake_enabled);
+            let event_pending = Arc::clone(&post_game_pending);
             let task = tauri::async_runtime::spawn(async move {
-                lcu_events::watch_ready_events(client, transport, wake, events, selection_gate)
-                    .await;
+                lcu_events::watch_ready_events(
+                    client,
+                    transport,
+                    wake,
+                    events,
+                    selection_gate,
+                    post_game_gate,
+                    event_pending,
+                )
+                .await;
             });
             *watch = Some(ReadyEventWatch {
                 instance,
                 rounds,
                 selection_wake_enabled,
+                post_game_wake_enabled,
+                post_game_pending,
                 task,
             });
+        }
+    }
+
+    fn consume_post_game_wake(&self, instance: ClientInstance) {
+        let pending = self.ready_event_watch.lock().is_ok_and(|watch| {
+            watch.as_ref().is_some_and(|watch| {
+                watch.instance == instance && watch.post_game_pending.swap(false, Ordering::AcqRel)
+            })
+        });
+        if !pending {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.snapshot.active.as_ref().is_some_and(|active| active.instance == instance) {
+            state.post_game.event_wake();
+        }
+    }
+
+    fn wake_after_post_game(&self, instance: ClientInstance) {
+        let pending_event = self.ready_event_watch.lock().is_ok_and(|watch| {
+            watch.as_ref().is_some_and(|watch| {
+                watch.instance == instance && watch.post_game_pending.load(Ordering::Acquire)
+            })
+        });
+        let nearing_return = self.state.lock().is_ok_and(|state| {
+            state.snapshot.active.as_ref().is_some_and(|active| active.instance == instance)
+                && state
+                    .post_game
+                    .next_wake(&state.room_flow.options, Instant::now())
+                    .is_some_and(|delay| delay < Duration::from_secs(2))
+        });
+        if pending_event || nearing_return {
+            self.wake.notify_one();
         }
     }
 
@@ -830,7 +895,7 @@ impl ClientRuntime {
             self.dispatch_due_room(app, client, generation, action)
                 .await;
         }
-        if let Some(turn) = self.post_game_turn() {
+        if let Some(turn) = self.post_game_turn(client.instance) {
             self.process_post_game(app, client, generation, turn).await;
         }
     }
@@ -996,6 +1061,17 @@ impl ClientRuntime {
         })
     }
 
+    async fn read_aux_current_champion(&self, target: &LcuTarget<'_>) -> Option<u32> {
+        tokio::time::timeout(
+            Duration::from_millis(550),
+            self.transport.read_aux_current_champion(target),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+    }
+
     async fn fresh_aux_selection(
         &self,
         client: Arc<LocalClient>,
@@ -1014,7 +1090,7 @@ impl ClientRuntime {
         if phase.as_deref() != Some("ChampSelect") {
             return Err("英雄选择阶段已经结束，请重新查看状态。".into());
         }
-        let (flow, selection, player) = join3(
+        let (flow, selection, player, current_champion) = join4(
             tokio::time::timeout(
                 Duration::from_secs(2),
                 self.transport.read_gameflow_session(&target),
@@ -1027,6 +1103,7 @@ impl ClientRuntime {
                 Duration::from_secs(2),
                 self.transport.read_current_summoner(&target),
             ),
+            self.read_aux_current_champion(&target),
         )
         .await;
         let flow = flow
@@ -1042,9 +1119,6 @@ impl ClientRuntime {
             .flatten()
             .filter(|player| original.selection_player.as_deref() == Some(player.puuid.as_str()))
             .ok_or("当前登录玩家已变化或暂时无法确认，请重新查看状态。")?;
-        if flow.phase != "ChampSelect" {
-            return Err("英雄选择阶段已经结束，请重新查看状态。".into());
-        }
         if flow
             .game_data
             .as_ref()
@@ -1058,6 +1132,8 @@ impl ClientRuntime {
             .read_aux_selection_extras(&target, &selection)
             .await
             .unwrap_or_default();
+        let retired_game_id = self.state.lock().map_err(|_| "客户端状态不可用。")?
+            .retired_game_id(client.instance, Some(&player.puuid));
         let activity = AuxActivity::project_observed(
             "ChampSelect",
             Some(&flow),
@@ -1066,7 +1142,9 @@ impl ClientRuntime {
             AuxSelectionObservation {
                 session: Some(&selection),
                 extras: Some(&extras),
+                current_champion,
                 player: Some(&player.puuid),
+                retired_game_id,
                 ..Default::default()
             },
         );
@@ -1080,12 +1158,18 @@ impl ClientRuntime {
         if !self.aux_snapshot_is_current(&client, generation, &original) {
             return Err("当前连接或对局状态已变化，请重新查看。".into());
         }
+        let standard_game_confirmed = selection["isCustomGame"] == false
+            || (flow.phase == "ChampSelect"
+                && flow.game_data.as_ref().is_some_and(|data| {
+                    data.is_custom_game == Some(false)
+                        && data.game_id.filter(|&id| id > 0).is_none_or(|id| current.game_id == Some(id))
+                }));
         Ok(FreshAuxSelection {
             client,
             generation,
             original,
             current,
-            flow,
+            standard_game_confirmed,
             selection,
             extras,
         })
@@ -1184,13 +1268,7 @@ impl ClientRuntime {
                 let fresh = self
                     .fresh_aux_selection(client, generation, original)
                     .await?;
-                if fresh
-                    .flow
-                    .game_data
-                    .as_ref()
-                    .and_then(|data| data.is_custom_game)
-                    != Some(false)
-                {
+                if !fresh.standard_game_confirmed {
                     return Err("无法确认这是普通大乱斗对局，已阻止离开操作。".into());
                 }
                 self.apply_aux_selection_action(&fresh, AuxChampSelectAction::Leave)
@@ -1741,14 +1819,7 @@ impl ClientRuntime {
         };
         let own_champion = async {
             if read_aux_draft {
-                tokio::time::timeout(
-                    Duration::from_millis(550),
-                    self.transport.read_aux_current_champion(&target),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten()
+                self.read_aux_current_champion(&target).await
             } else {
                 None
             }
@@ -1769,11 +1840,8 @@ impl ClientRuntime {
                     state.retired_draft = None;
                 }
             }
-            let retired_game_id = state.as_ref().and_then(|state| {
-                state.retired_draft.as_ref()
-                    .filter(|retired| retired.instance == client.instance && Some(retired.player.as_str()) == player)
-                    .map(|retired| retired.game_id)
-            });
+            let retired_game_id = state.as_ref()
+                .and_then(|state| state.retired_game_id(client.instance, player));
             let previous = state.as_ref().and_then(|state| {
                 state.confirmed_draft_mode.as_ref()
                     .filter(|(instance, _)| *instance == client.instance)
@@ -1971,14 +2039,16 @@ impl ClientRuntime {
             self.dispatch_due_room(app, client, generation, action)
                 .await;
         }
-        if let (Some(client), Some(turn)) = (candidate, self.post_game_turn()) {
-            let app = app.clone();
-            let client = Arc::clone(client);
-            tauri::async_runtime::spawn(async move {
-                app.state::<ClientRuntime>()
-                    .process_post_game(&app, &client, generation, turn)
-                    .await;
-            });
+        if let Some(client) = candidate {
+            if let Some(turn) = self.post_game_turn(client.instance) {
+                let app = app.clone();
+                let client = Arc::clone(client);
+                tauri::async_runtime::spawn(async move {
+                    app.state::<ClientRuntime>()
+                        .process_post_game(&app, &client, generation, turn)
+                        .await;
+                });
+            }
         }
         if let (Some(client), Some(options), Some((flow, select))) = (candidate, options, selection)
         {
@@ -2537,11 +2607,13 @@ pub(crate) async fn monitor(app: AppHandle) {
             .state
             .lock()
             .map_or(Duration::from_secs(2), |state| {
+                let now = Instant::now();
                 let interval = state.aram.next_poll();
-                state
-                    .room_flow
-                    .next_poll(Instant::now())
-                    .map_or(interval, |room| interval.min(room))
+                let room = state.room_flow.next_poll(now);
+                let post_game = runtime.post_game_writes.try_lock().ok().and_then(|_writer| {
+                    state.post_game.next_wake(&state.room_flow.options, now)
+                });
+                room.into_iter().chain(post_game).fold(interval, Duration::min)
             });
         let _ = tokio::time::timeout(interval, runtime.wake.notified()).await;
     }

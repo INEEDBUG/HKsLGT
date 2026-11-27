@@ -5,7 +5,10 @@ use super::{
 };
 use crate::lcu::post_game::PostGameBallot;
 use futures_util::future::join3;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tauri::{AppHandle, Manager};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -46,11 +49,18 @@ pub(super) struct Turn {
     stage: Stage,
 }
 
+pub(super) struct PostGameWork {
+    turn: Turn,
+    writer: tokio::sync::OwnedMutexGuard<()>,
+}
+
 #[derive(Default)]
 pub(super) struct PostGame {
     game: Option<Game>,
     stage: Option<(Stage, Instant)>,
     next_poll: Option<Instant>,
+    retry_after: Option<Instant>,
+    return_due_attempted: bool,
     // Keep the same recipients on retry, even if a client repeats an old vote count.
     recipients: Option<Vec<String>>,
     accepted: Vec<String>,
@@ -146,6 +156,8 @@ impl PostGame {
         if self.stage.map(|s| s.0) != stage {
             self.stage = stage.map(|s| (s, now));
             self.next_poll = None;
+            self.retry_after = None;
+            self.return_due_attempted = false;
         }
     }
 
@@ -154,16 +166,45 @@ impl PostGame {
     }
 
     fn turn(&mut self, options: &RoomOptions, now: Instant) -> Option<Turn> {
+        let (stage, since) = self.stage?;
+        let due_return =
+            options.play_again && now.saturating_duration_since(since) >= stage.return_delay();
         if self.returned
             || !(options.play_again || (options.honor && !self.ballot_submitted))
-            || self.next_poll.is_some_and(|due| now < due)
+            || (self.next_poll.is_some_and(|due| now < due)
+                && !(due_return && !self.return_due_attempted))
+            || self.retry_after.is_some_and(|due| now < due)
         {
             return None;
         }
-        let (stage, _) = self.stage?;
         let game = self.game.clone()?;
         self.next_poll = Some(now + Duration::from_secs(1));
+        self.return_due_attempted |= due_return;
         Some(Turn { game, stage })
+    }
+
+    pub(super) fn event_wake(&mut self) {
+        // An authenticated LCU event may supersede the ordinary polling throttle.
+        // A failed HTTP action keeps its independent retry deadline.
+        self.next_poll = None;
+        self.return_due_attempted = false;
+    }
+
+    pub(super) fn next_wake(&self, options: &RoomOptions, now: Instant) -> Option<Duration> {
+        if self.returned || !options.play_again {
+            return None;
+        }
+        let (stage, since) = self.stage?;
+        let return_due = since + stage.return_delay();
+        let mut due = if now < return_due || !self.return_due_attempted {
+            return_due
+        } else {
+            self.next_poll.unwrap_or(now)
+        };
+        if let Some(retry_after) = self.retry_after {
+            due = due.max(retry_after);
+        }
+        Some(due.saturating_duration_since(now))
     }
 }
 
@@ -195,12 +236,15 @@ fn select_recipients(ballot: &PostGameBallot, party: &[String], player: &str) ->
 }
 
 impl ClientRuntime {
-    pub(super) fn post_game_turn(&self) -> Option<Turn> {
+    pub(super) fn post_game_turn(&self, instance: ClientInstance) -> Option<PostGameWork> {
+        let writer = Arc::clone(&self.post_game_writes).try_lock_owned().ok()?;
+        self.consume_post_game_wake(instance);
         let mut state = self.state.lock().ok()?;
         let state = &mut *state;
-        state
+        let turn = state
             .post_game
-            .turn(&state.room_flow.options, Instant::now())
+            .turn(&state.room_flow.options, Instant::now())?;
+        Some(PostGameWork { turn, writer })
     }
 
     fn with_post_game<R>(
@@ -228,25 +272,37 @@ impl ClientRuntime {
         app: &AppHandle,
         client: &LocalClient,
         generation: u64,
-        turn: Turn,
+        work: PostGameWork,
     ) {
-        let Ok(_writer) = self.post_game_writes.try_lock() else {
-            return;
-        };
+        let instance = client.instance;
+        self.process_post_game_with_writer(app, client, generation, &work.turn)
+            .await;
+        drop(work.writer);
+        self.wake_after_post_game(instance);
+    }
+
+    async fn process_post_game_with_writer(
+        &self,
+        app: &AppHandle,
+        client: &LocalClient,
+        generation: u64,
+        turn: &Turn,
+    ) {
         if self.with_post_game(generation, &turn, |_, _| ()).is_none() {
             return;
         }
         let Ok(target) = client.target() else { return };
-        let result = self.run_post_game(&target, generation, &turn).await;
+        let result = self.run_post_game(&target, generation, turn).await;
         // A failing endpoint is retried while this match is current. Show one useful
         // error after consecutive failures, without generating a toast per poll.
         let notify = self.with_post_game(generation, &turn, |work, _| {
             if result.is_err() {
                 work.failures = work.failures.saturating_add(1);
-                work.next_poll = Some(Instant::now() + Duration::from_secs(2));
+                work.retry_after = Some(Instant::now() + Duration::from_secs(2));
                 work.failures == 3
             } else {
                 work.failures = 0;
+                work.retry_after = None;
                 false
             }
         });
@@ -292,15 +348,9 @@ impl ClientRuntime {
         if flow == Some(false) {
             return Ok(());
         }
-        let Some((honor, play, submitted, celebration, previously_identified_ballot)) = self
-            .with_post_game(generation, turn, |w, o| {
-                (
-                    o.honor,
-                    o.play_again,
-                    w.ballot_submitted,
-                    w.celebration_completed,
-                    w.saw_ballot,
-                )
+        let Some((honor, play, submitted, previously_identified_ballot)) =
+            self.with_post_game(generation, turn, |w, o| {
+                (o.honor, o.play_again, w.ballot_submitted, w.saw_ballot)
             })
         else {
             return Ok(());
@@ -324,37 +374,113 @@ impl ClientRuntime {
         } else if flow != Some(true) && !previously_identified_ballot {
             return Ok(());
         }
-        if play
-            && !celebration
-            && turn.stage == Stage::PreEndOfGame
-            && self.with_post_game(generation, turn, |_, o| o.play_again) == Some(true)
-        {
-            // A missing optional ceremony must not prevent voting or returning.
-            if let Ok(true) = self.transport.complete_missions_celebration(target).await {
-                self.with_post_game(generation, turn, |w, _| w.celebration_completed = true);
-            }
-        }
-        if let Some(ballot) = ballot {
-            if honor {
+        let had_ballot = ballot.is_some();
+        match ballot {
+            Some(ballot) if honor => {
                 self.finish_ballot(target, generation, turn, &ballot)
                     .await
                     .map_err(|e| (HONOR, e))?;
             }
-            return Ok(());
+            _ => {
+                self.complete_celebration_if_current(target, generation, turn)
+                    .await;
+            }
         }
         let due = self.with_post_game(generation, turn, |w, o| {
             o.play_again
                 && !w.returned
+                && (!had_ballot || w.ballot_submitted)
                 && w.stage
                     .is_some_and(|(s, since)| since.elapsed() >= s.return_delay())
         });
         if due == Some(true) {
-            self.transport
-                .play_again(target)
-                .await
-                .map_err(|e| (RETURN, e))?;
-            self.with_post_game(generation, turn, |w, _| w.returned = true);
+            return self.return_if_current(target, generation, turn).await;
         }
+        Ok(())
+    }
+
+    async fn complete_celebration_if_current(
+        &self,
+        target: &LcuTarget<'_>,
+        generation: u64,
+        turn: &Turn,
+    ) {
+        if turn.stage != Stage::PreEndOfGame
+            || self.with_post_game(generation, turn, |work, options| {
+                options.play_again && !work.celebration_completed
+            }) != Some(true)
+        {
+            return;
+        }
+        // Complete the optional sequence after honor votes, but before ballot submit
+        // advances the phase. Bound its two-request read/write from delaying a fresh event.
+        let completion = tokio::time::timeout(Duration::from_millis(300), async {
+            if !self
+                .transport
+                .missions_celebration_pending(target)
+                .await?
+            {
+                return Ok::<bool, LcuError>(false);
+            }
+            if self.with_post_game(generation, turn, |work, options| {
+                options.play_again && !work.celebration_completed
+            }) != Some(true)
+            {
+                return Ok(false);
+            }
+            self.transport
+                .send_missions_celebration_complete(target)
+                .await?;
+            Ok(true)
+        })
+        .await;
+        if matches!(completion, Ok(Ok(true))) {
+            self.with_post_game(generation, turn, |work, _| {
+                work.celebration_completed = true
+            });
+        }
+    }
+
+    async fn return_if_current(
+        &self,
+        target: &LcuTarget<'_>,
+        generation: u64,
+        turn: &Turn,
+    ) -> Result<(), (&'static str, LcuError)> {
+        const RETURN: &str = "error-play-again";
+        let (phase, owner, session) = join3(
+            self.transport.read_phase(target),
+            self.transport.read_current_summoner(target),
+            self.transport.read_gameflow_session(target),
+        )
+        .await;
+        if phase
+            .map_err(|e| (RETURN, e))?
+            .as_deref()
+            .and_then(Stage::parse)
+            != Some(turn.stage)
+            || !owner
+                .map_err(|e| (RETURN, e))?
+                .is_some_and(|s| s.puuid.eq_ignore_ascii_case(&turn.game.player))
+        {
+            return Ok(());
+        }
+        let session = session.map_err(|e| (RETURN, e))?;
+        let confirmed = confirms_end_game(session.as_ref(), turn);
+        if confirmed == Some(false)
+            || self.with_post_game(generation, turn, |work, options| {
+                options.play_again
+                    && !work.returned
+                    && (confirmed == Some(true) || work.saw_ballot)
+            }) != Some(true)
+        {
+            return Ok(());
+        }
+        self.transport
+            .play_again(target)
+            .await
+            .map_err(|e| (RETURN, e))?;
+        self.with_post_game(generation, turn, |work, _| work.returned = true);
         Ok(())
     }
 
@@ -402,6 +528,8 @@ impl ClientRuntime {
             self.transport.submit_post_game_honor(target, &id).await?;
             self.with_post_game(generation, turn, |w, _| w.accepted.push(id));
         }
+        self.complete_celebration_if_current(target, generation, turn)
+            .await;
         if can_vote() {
             self.transport.submit_post_game_ballot(target).await?;
             self.with_post_game(generation, turn, |w, _| w.ballot_submitted = true);
@@ -473,6 +601,111 @@ mod tests {
             state.observe(&sample("EndOfGame", Value::Null, OWNER), now);
             assert!(state.turn(&options, now).is_none());
         }
+    }
+
+    #[test]
+    fn post_game_scheduler_keeps_upstream_stage_deadlines_and_retry_backoff() {
+        let now = Instant::now();
+        let options = RoomOptions {
+            play_again: true,
+            ..Default::default()
+        };
+        for (phase, delay) in [
+            ("WaitingForStats", Duration::from_secs(10)),
+            ("PreEndOfGame", Duration::from_millis(3_250)),
+            ("EndOfGame", Duration::from_millis(1_575)),
+        ] {
+            let mut state = PostGame::default();
+            state.observe(
+                &sample(
+                    "InProgress",
+                    json!({"queue":{"id":450,"gameMode":"ARAM"},"gameId":42}),
+                    OWNER,
+                ),
+                now,
+            );
+            state.observe(&sample(phase, Value::Null, OWNER), now);
+            assert_eq!(state.next_wake(&options, now), Some(delay));
+
+            state.next_poll = Some(now + Duration::from_millis(600));
+            state.retry_after = Some(now + Duration::from_secs(2));
+            assert_eq!(
+                state.next_wake(&options, now),
+                Some(delay.max(Duration::from_secs(2))),
+                "the monitor must keep a failed write's retry delay"
+            );
+            state.event_wake();
+            assert_eq!(state.next_poll, None);
+            assert_eq!(
+                state.next_wake(&options, now),
+                Some(delay.max(Duration::from_secs(2))),
+                "an event may bypass normal polling, but not failure backoff"
+            );
+        }
+    }
+
+    #[test]
+    fn overdue_return_bypasses_one_predeadline_poll_throttle_then_throttles_again() {
+        let started = Instant::now();
+        let options = RoomOptions {
+            play_again: true,
+            ..Default::default()
+        };
+        let mut state = PostGame::default();
+        state.observe(
+            &sample(
+                "InProgress",
+                json!({"queue":{"id":450,"gameMode":"ARAM"},"gameId":42}),
+                OWNER,
+            ),
+            started,
+        );
+        state.observe(&sample("EndOfGame", Value::Null, OWNER), started);
+
+        let before_due = started + Duration::from_millis(1_490);
+        assert!(state.turn(&options, before_due).is_some());
+        assert_eq!(
+            state.next_wake(&options, before_due),
+            Some(Duration::from_millis(85)),
+            "a late poll must not push the upstream 1.575s deadline out by another second"
+        );
+        let due = started + Duration::from_millis(1_575);
+        assert!(state.turn(&options, due).is_some());
+        assert_eq!(state.next_wake(&options, due), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn event_wake_bypasses_ordinary_poll_throttle_but_not_http_failure_backoff() {
+        let now = Instant::now();
+        let options = RoomOptions {
+            honor: true,
+            ..Default::default()
+        };
+        let mut state = PostGame::default();
+        state.observe(
+            &sample(
+                "InProgress",
+                json!({"queue":{"id":450,"gameMode":"ARAM"},"gameId":42}),
+                OWNER,
+            ),
+            now,
+        );
+        state.observe(&sample("EndOfGame", Value::Null, OWNER), now);
+        assert!(state.turn(&options, now).is_some());
+        assert!(state
+            .turn(&options, now + Duration::from_millis(200))
+            .is_none());
+        state.event_wake();
+        assert!(state
+            .turn(&options, now + Duration::from_millis(200))
+            .is_some());
+
+        state.retry_after = Some(now + Duration::from_secs(2));
+        state.event_wake();
+        assert!(state
+            .turn(&options, now + Duration::from_millis(400))
+            .is_none());
+        assert!(state.turn(&options, now + Duration::from_secs(2)).is_some());
     }
 
     #[test]

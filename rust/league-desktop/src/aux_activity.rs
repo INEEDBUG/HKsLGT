@@ -214,6 +214,7 @@ impl AuxActivity {
             signed_in,
             observed.current_champion,
         );
+        let replaced_identified_game = replaced_retired_flow && flow.and_then(game_id).is_some();
         let flow = if replaced_retired_flow { None } else { flow };
         // These three LCU endpoints advance independently after a ready check.
         // Only promote a late phase using this sample's active timer and matching game.
@@ -413,18 +414,34 @@ impl AuxActivity {
             let roster_cell = player.and_then(|row| row["cellId"].as_i64()).filter(|&id| id >= 0);
             view.local_player_cell_id = roster_cell;
             let roster_pick = player.and_then(|player| champion_id(&player["championId"]));
-            view.champion_id = observed.current_champion.and_then(normalize_champion).or(roster_pick);
-            // Use only the synchronized full session for write eligibility.
-            view.selection_actionable = direct_selection && !related_queue_label
-                && (draft_queue.is_some() || flow_queue_id.is_some() || matching_flow.and_then(GameflowSession::aux_game_mode).is_some())
-                && matching_flow.is_some_and(|flow| flow.phase == "ChampSelect")
-                && signed_in.is_some()
-                && cell.is_some() && cell == roster_cell
-                && observed.current_champion.is_none_or(|id| normalize_champion(id) == roster_pick);
+            let current_pick = observed.current_champion.and_then(normalize_champion);
+            view.champion_id = current_pick.or(roster_pick);
             view.timer_phase = select["timer"]["phase"]
                 .as_str()
                 .filter(|phase| matches!(*phase, "PLANNING" | "BAN_PICK" | "FINALIZATION" | "GAME_STARTING"))
                 .map(str::to_owned);
+            let queue_alias_confirmed = !related_queue_label
+                || (select_game.is_some() && select_game == flow_game && row_player == signed_in);
+            let synchronized = queue_alias_confirmed && matching_flow.is_some_and(|flow| {
+                flow.phase == "ChampSelect"
+                    && (queue.is_some() || flow.aux_game_mode().is_some())
+            });
+            // The two live draft endpoints can corroborate the new game while
+            // gameflow is still reporting a retired game with a known ID.
+            let confirmed_after_retirement = replaced_identified_game
+                && row_player == signed_in
+                && current_pick.is_some()
+                && current_pick == roster_pick
+                && matches!(view.timer_phase.as_deref(), Some("PLANNING" | "BAN_PICK" | "FINALIZATION"))
+                && select["timer"]["isInfinite"] != true
+                && select["timer"]["adjustedTimeLeftInPhase"].as_u64().is_some_and(|ms| ms > 0);
+            view.selection_actionable = direct_selection
+                && queue.is_none_or(|id| matches!(id, 450 | 2400))
+                && (synchronized || confirmed_after_retirement)
+                && signed_in.is_some()
+                && cell.is_some()
+                && cell == roster_cell
+                && observed.current_champion.is_none_or(|id| normalize_champion(id) == roster_pick);
             view.allow_subset_champion_picks = select["allowSubsetChampionPicks"] == true;
             view.allow_rerolling = select["allowRerolling"] == true;
             view.rerolls_remaining = select["rerollsRemaining"]
@@ -542,8 +559,9 @@ impl AuxView {
             && original.selection_actionable
             && self.game_mode == original.game_mode
             && self.selection_player == original.selection_player
+            && self.local_player_cell_id == original.local_player_cell_id
             && original.queue_id.is_none_or(|id| self.queue_id == Some(id))
-            && original.game_id.is_none_or(|id| self.game_id == Some(id))
+            && self.game_id == original.game_id
     }
 }
 
@@ -1174,14 +1192,14 @@ mod tests {
     }
 
     #[test]
-    fn second_verified_kiwi_draft_uses_retired_flow_only_for_read_only_projection() {
+    fn second_verified_kiwi_draft_can_act_while_the_previous_game_is_still_reported() {
         let selection = json!({
             "gameId":8522,"queueId":2400,"localPlayerCellId":0,
             "myTeam":[{"cellId":0,"puuid":"owner","championId":55}],
             "benchChampions":[{"championId":136}],
             "timer":{"phase":"FINALIZATION","adjustedTimeLeftInPhase":5000}
         });
-        let observe = |flow: Value, retired_game_id| {
+        let observe = |flow: Value, retired_game_id, current_champion| {
             let flow: GameflowSession = serde_json::from_value(flow).unwrap();
             AuxActivity::project_observed(
                 "ChampSelect",
@@ -1190,7 +1208,7 @@ mod tests {
                 None,
                 AuxSelectionObservation {
                     session: Some(&selection),
-                    current_champion: Some(55),
+                    current_champion,
                     player: Some("owner"),
                     retired_game_id,
                     ..Default::default()
@@ -1207,10 +1225,15 @@ mod tests {
             "phase":"EndOfGame","gameData":{"gameId":0,"queue":{"id":2400,"gameMode":"KIWI"}}
         });
 
-        assert!(observe(stale_same_phase.clone(), Some(8520)).view().is_none());
-        for flow in [stale_same_phase, stale_supported_other_queue, stale_terminal_without_id] {
-            assert!(observe(flow.clone(), None).view().is_none());
-            let AuxActivity::Active(projected) = observe(flow, Some(8521)) else {
+        assert!(observe(stale_same_phase.clone(), Some(8520), Some(55)).view().is_none());
+        assert!(!observe(stale_same_phase.clone(), Some(8521), None).view().unwrap().selection_actionable);
+        for (flow, actionable) in [
+            (stale_same_phase, true),
+            (stale_supported_other_queue, true),
+            (stale_terminal_without_id, false),
+        ] {
+            assert!(observe(flow.clone(), None, Some(55)).view().is_none());
+            let AuxActivity::Active(projected) = observe(flow, Some(8521), Some(55)) else {
                 panic!("expected fresh second-game projection");
             };
             assert_eq!(projected.game_id, Some(8522));
@@ -1218,12 +1241,19 @@ mod tests {
             assert_eq!(data["gameMode"], "KIWI");
             assert_eq!(data["championId"], 55);
             assert_eq!(data["bench"], json!([136]));
-            assert_eq!(data["selectionActionable"], false);
+            assert_eq!(data["selectionActionable"], actionable);
         }
+        let shared_aram_label = json!({
+            "phase":"ChampSelect","gameData":{"gameId":8522,"queue":{"id":2400,"gameMode":"ARAM"}}
+        });
+        let current = observe(shared_aram_label, Some(8521), Some(55));
+        let current = current.view().unwrap();
+        assert_eq!(current.game_mode, "KIWI");
+        assert!(current.selection_actionable);
         let contradictory_zero_id = json!({
             "phase":"EndOfGame","gameData":{"gameId":0,"queue":{"id":450,"gameMode":"ARAM"}}
         });
-        assert!(observe(contradictory_zero_id, Some(8521)).view().is_none());
+        assert!(observe(contradictory_zero_id, Some(8521), Some(55)).view().is_none());
 
         let next_lobby: GameflowSession = serde_json::from_value(json!({
             "phase":"Lobby","gameData":{"gameId":0,"queue":{"id":2400,"gameMode":"KIWI"}}
