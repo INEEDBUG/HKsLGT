@@ -20,7 +20,9 @@ if (!$IsWindows -or $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -
 
 function Run-Installer([string]$File, [string]$Arguments) {
   $result = Start-Process -FilePath $File -ArgumentList $Arguments -WindowStyle Hidden -Wait -PassThru
-  if ($result.ExitCode -ne 0) { throw "League installer returned $($result.ExitCode)." }
+  if ($result.ExitCode -ne 0) {
+    throw "League installer '$([IO.Path]::GetFileName($File))' returned $($result.ExitCode)."
+  }
 }
 
 function Assert-Install([string]$ExpectedVersion, [string]$RegistryHive = $hive, [string]$Directory = $program) {
