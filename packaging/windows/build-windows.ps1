@@ -23,6 +23,8 @@ $revision = (git -C $root rev-parse HEAD).Trim()
 if ($env:GITHUB_SHA -and $revision -cne $env:GITHUB_SHA) { throw 'Unexpected workflow checkout.' }
 
 $known = [ordered]@{
+  # Exact native inventory from the beta.20 candidate delivered from run 46084352923.
+  'trusted-1.0.0-beta.20.json' = '0309d12529d55b2d3e47c95591534f8e5c19d65b0bb026e33d0e280a963936af'
   # Exact native inventory from the beta.19 candidate delivered from run 46046497678.
   'trusted-1.0.0-beta.19.json' = '15c88c593a44207f3e4e3e5c80421c62a7fb71d4b184e37340f1f0a9bfec1a13'
   # Exact native inventory from the beta.18 candidate delivered from run 46030344287.

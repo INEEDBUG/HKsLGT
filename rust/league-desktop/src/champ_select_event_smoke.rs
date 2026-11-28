@@ -1,7 +1,8 @@
 //! Production WSS-to-monitor regression using only a synthetic local LCU peer.
 
 use super::{
-    check_renderer, set_preference, wait_for_popup, AppHandle, ClientRuntime, Manager, AUX_WINDOW,
+    check_renderer, click, set_preference, wait_for_popup, AppHandle, ClientRuntime, Manager,
+    AUX_WINDOW,
 };
 use crate::client_discovery::LocalClient;
 use rustls::{
@@ -26,6 +27,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 const PLAYER: &str = "11111111-2222-4333-8444-555555555555";
 const FIXTURE_AUTH: &str = "Basic cmlvdDpmaXh0dXJlLW9ubHk=";
 const CHAMP_SELECT: &str = "/lol-champ-select/v1/session";
+const SWAP_AHRI: &str = "/lol-champ-select/v1/session/bench/swap/103";
 const FAST_REFRESH_LIMIT: Duration = Duration::from_millis(850);
 
 pub(super) fn requested() -> bool {
@@ -45,10 +47,17 @@ pub(super) struct SelectionFixture {
 }
 
 struct Scene {
+    http_phase: &'static str,
+    flow_missing: bool,
+    game_id: u64,
+    queue_id: u32,
+    champion: u32,
     bench: Vec<u32>,
     timer_ms: u64,
+    selection_override: Option<(u16, Value)>,
     selection_reads: usize,
     flow_reads: usize,
+    posts: Vec<String>,
 }
 
 impl SelectionFixture {
@@ -68,10 +77,17 @@ impl SelectionFixture {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let scene = Arc::new(Mutex::new(Scene {
+            http_phase: "ChampSelect",
+            flow_missing: false,
+            game_id: 7100,
+            queue_id: 450,
+            champion: 22,
             bench: Vec::new(),
             timer_ms: 30_000,
+            selection_override: None,
             selection_reads: 0,
             flow_reads: 0,
+            posts: Vec::new(),
         }));
         let event_senders = Arc::new(Mutex::new(Vec::new()));
         let subscribers = Arc::new(AtomicUsize::new(0));
@@ -197,6 +213,10 @@ impl SelectionFixture {
             "data": payload
         }])
         .to_string();
+        self.emit(event)
+    }
+
+    fn emit(&self, event: String) -> Instant {
         let started = Instant::now();
         if let Ok(senders) = self.event_senders.lock() {
             for sender in senders.iter() {
@@ -333,6 +353,8 @@ pub(super) async fn check(app: &AppHandle) {
         "a burst of bench changes is coalesced into one fresh session read"
     );
 
+    check_missing_http_session(app, &fixture, &aux).await;
+
     // A disabled companion is not an active selection demand, so its bench events do not
     // wake the normal sampling loop; its bounded polling fallback remains available.
     set_preference(app, AUX_WINDOW, "enabled", false);
@@ -354,6 +376,151 @@ pub(super) async fn check(app: &AppHandle) {
     );
     monitor.abort();
     let _ = aux.close();
+}
+
+async fn check_missing_http_session(
+    app: &AppHandle,
+    fixture: &SelectionFixture,
+    aux: &WebviewWindow,
+) {
+    let runtime = app.state::<ClientRuntime>();
+    let hwnd = aux.hwnd().unwrap();
+    {
+        let mut scene = fixture.scene.lock().unwrap();
+        scene.game_id = 7101;
+        scene.queue_id = 2400;
+        scene.bench.clear();
+        scene.timer_ms = 28_000;
+    }
+    runtime.refresh_soon();
+    check_renderer(aux, r#"
+        document.querySelector('.aux-activity[data-phase=ChampSelect] .current-champion[data-champion-id="22"] img')?.naturalWidth > 1 &&
+        !document.querySelector('.bench [data-champion-id]')
+    "#, "KIWI game confirmed with an empty bench before withholding its HTTP session", || {}).await;
+    let (_, state) = runtime
+        .fields(crate::lcu::aux_activity::NAMESPACE, "state")
+        .unwrap()
+        .unwrap();
+    assert_eq!(state["view"]["gameMode"], "KIWI");
+
+    let before = {
+        let mut scene = fixture.scene.lock().unwrap();
+        scene.selection_override = Some((404, Value::Null));
+        scene.selection_reads
+    };
+    fixture.set_bench(&[103], 18_000, "Update");
+    assert!(
+        fixture
+            .wait_for_selection_reads(before + 1, Duration::from_secs(3))
+            .await,
+        "the runtime attempted a fresh HTTP GET while the authenticated event had the roster"
+    );
+    check_renderer(aux, r#"
+        document.querySelector('.current-champion[data-champion-id="22"] img')?.naturalWidth > 1 &&
+        document.querySelector('.bench [data-champion-id="103"][aria-disabled=true] img')?.naturalWidth > 1 &&
+        /^18\s*(秒|s)$/.test(document.querySelector('.aux-draft-timer')?.textContent.trim()) &&
+        !!document.querySelector('.aux-draft-waiting')
+    "#, "authenticated KIWI roster and timer rendered read-only during the HTTP 404", || {}).await;
+    aux.eval(
+        r#"
+        window.__TAURI__.core.invoke('league_call', {
+            namespace: 'aux-activity-main', method: 'swapBenchChampion', args: [103]
+        }).then(result => document.documentElement.dataset.eventRosterWrite =
+            result.success === false ? 'blocked' : 'unexpected')
+    "#,
+    )
+    .unwrap();
+    check_renderer(
+        aux,
+        "document.documentElement.dataset.eventRosterWrite === 'blocked'",
+        "event-only roster cannot authorize a direct bench write",
+        || {},
+    )
+    .await;
+    assert!(fixture.scene.lock().unwrap().posts.is_empty());
+
+    fixture.scene.lock().unwrap().selection_override = Some((200, json!({})));
+    fixture.set_bench(&[103, 55, 1, 2, 4, 12], 18_000, "Update");
+    check_renderer(
+        aux,
+        r#"(() => {
+            const slots = [...document.querySelectorAll('.bench [data-champion-id][aria-disabled=true] img')];
+            return slots.length === 6 && slots.every(img => img.naturalWidth > 1) &&
+                !document.querySelector('.aux-draft-confirming');
+        })()"#,
+        "an HTTP 200 with an empty body object cannot hide the decoded authenticated event bench",
+        || {},
+    )
+    .await;
+    {
+        let mut scene = fixture.scene.lock().unwrap();
+        scene.http_phase = "ReadyCheck";
+        scene.flow_missing = true;
+    }
+    fixture.emit(
+        json!([8, "OnJsonApiEvent", {
+            "uri": "/lol-gameflow/v1/gameflow-phase", "eventType": "Update", "data": "ChampSelect"
+        }])
+        .to_string(),
+    );
+    let complete_event = fixture.set_bench(&[103, 55, 1, 2, 4, 17], 18_000, "Update");
+    check_renderer(
+        aux,
+        r#"(() => {
+            const slots = [...document.querySelectorAll('.bench [data-champion-id][aria-disabled=true] img')];
+            return slots.length === 6 && slots.every(img => img.naturalWidth > 1) &&
+                document.querySelector('.bench [data-champion-id="17"] img')?.naturalWidth > 1 &&
+                document.querySelector('.current-champion[data-champion-id="22"] img')?.naturalWidth > 1 &&
+                !document.querySelector('.aux-draft-confirming');
+        })()"#,
+        "both authenticated draft events keep the Mini visible when the HTTP phase lags",
+        || {},
+    )
+    .await;
+    let elapsed = complete_event.elapsed();
+    assert!(
+        elapsed <= Duration::from_secs(1),
+        "authenticated selection event took {elapsed:?}"
+    );
+    println!("HKSLGT_SELECTION_EVENT_SEVEN_PORTRAITS: {elapsed:?}");
+    assert!(fixture.scene.lock().unwrap().posts.is_empty());
+    {
+        let mut scene = fixture.scene.lock().unwrap();
+        scene.http_phase = "ChampSelect";
+        scene.flow_missing = false;
+        scene.selection_override = None;
+    }
+    fixture.set_bench(&[103], 18_000, "Update");
+    click(aux, r#".bench [data-champion-id="103"]"#).await;
+    check_renderer(
+        aux,
+        r#"
+        document.querySelector('.current-champion[data-champion-id="103"] img')?.naturalWidth > 1 &&
+        document.querySelector('.bench [data-champion-id="22"] img')?.naturalWidth > 1
+    "#,
+        "fresh HTTP session re-enables the bench and reads back the one accepted swap",
+        || {},
+    )
+    .await;
+    assert_eq!(fixture.scene.lock().unwrap().posts, [SWAP_AHRI]);
+    assert_eq!(aux.hwnd().unwrap(), hwnd);
+
+    fixture.scene.lock().unwrap().selection_override = Some((404, Value::Null));
+    fixture.set_bench(&[22], 18_000, "Update");
+    check_renderer(
+        aux,
+        r#"document.querySelector('.bench [data-champion-id="22"][aria-disabled=true] img')?.naturalWidth > 1"#,
+        "the updated event roster remains in the cache before the Delete",
+        || {},
+    )
+    .await;
+    fixture.set_bench(&[], 18_000, "Delete");
+    assert!(
+        bench_order_matches(aux, &[], FAST_REFRESH_LIMIT).await,
+        "a WSS session Delete clears the old bench before polling or cache expiry"
+    );
+    assert_eq!(fixture.scene.lock().unwrap().posts, [SWAP_AHRI]);
+    println!("HKSLGT_SELECTION_EVENT_HTTP_FALLBACK_PASS: missing/empty selection and a lagging phase preserve the event roster read-only; one recovered HTTPS swap; Delete clears the bench");
 }
 
 async fn bench_visible(
@@ -439,12 +606,12 @@ async fn bench_order_matches(window: &WebviewWindow, champions: &[u32], timeout:
 
 fn session(scene: &Scene) -> Value {
     json!({
-        "queueId": 450,
-        "gameId": 7100,
+        "queueId": scene.queue_id,
+        "gameId": scene.game_id,
         "isSpectating": false,
         "isCustomGame": false,
         "localPlayerCellId": 1,
-        "myTeam": [{"cellId": 1, "puuid": PLAYER, "championId": 22, "championPickIntent": 0}],
+        "myTeam": [{"cellId": 1, "puuid": PLAYER, "championId": scene.champion, "championPickIntent": 0}],
         "theirTeam": [],
         "benchEnabled": true,
         "benchChampions": scene.bench.iter().map(|id| json!({"championId": id, "isPriority": false})).collect::<Vec<_>>(),
@@ -591,6 +758,12 @@ fn serve_http<S: Read + Write>(
             path,
             "/lol-game-data/assets/v1/champion-icons/22.png"
                 | "/lol-game-data/assets/v1/champion-icons/103.png"
+                | "/lol-game-data/assets/v1/champion-icons/55.png"
+                | "/lol-game-data/assets/v1/champion-icons/1.png"
+                | "/lol-game-data/assets/v1/champion-icons/2.png"
+                | "/lol-game-data/assets/v1/champion-icons/4.png"
+                | "/lol-game-data/assets/v1/champion-icons/12.png"
+                | "/lol-game-data/assets/v1/champion-icons/17.png"
         )
     {
         use base64::Engine as _;
@@ -601,15 +774,21 @@ fn serve_http<S: Read + Write>(
     } else {
         let mut scene = scene.lock().unwrap();
         let result = match (method, path) {
-            ("GET", "/lol-gameflow/v1/gameflow-phase") => (200, json!("ChampSelect")),
+            ("GET", "/lol-gameflow/v1/gameflow-phase") => (200, json!(scene.http_phase)),
+            ("GET", "/lol-gameflow/v1/session") if scene.flow_missing => (404, Value::Null),
             ("GET", "/lol-gameflow/v1/session") => {
                 scene.flow_reads += 1;
+                let mode = if scene.queue_id == 2400 {
+                    "KIWI"
+                } else {
+                    "ARAM"
+                };
                 (
                     200,
                     json!({
                         "phase":"ChampSelect",
-                        "gameData":{"gameId":7100,"isCustomGame":false,"queue":{"id":450,"name":"ARAM","gameMode":"ARAM","type":"ARAM"}},
-                        "map":{"name":"Howling Abyss","gameMode":"ARAM","assets":{}}
+                        "gameData":{"gameId":scene.game_id,"isCustomGame":false,"queue":{"id":scene.queue_id,"name":mode,"gameMode":mode,"type":mode}},
+                        "map":{"name":"Howling Abyss","gameMode":mode,"assets":{}}
                     }),
                 )
             }
@@ -619,10 +798,23 @@ fn serve_http<S: Read + Write>(
             ),
             ("GET", CHAMP_SELECT) => {
                 scene.selection_reads += 1;
-                (200, session(&scene))
+                scene
+                    .selection_override
+                    .clone()
+                    .unwrap_or_else(|| (200, session(&scene)))
             }
-            ("GET", "/lol-champ-select/v1/current-champion") => (200, json!(22)),
+            ("GET", "/lol-champ-select/v1/current-champion") => (200, json!(scene.champion)),
             ("GET", "/lol-champ-select/v1/pickable-champion-ids") => (200, json!([22, 103])),
+            ("POST", path) => {
+                scene.posts.push(path.to_owned());
+                if path == SWAP_AHRI && scene.selection_override.is_none() && scene.bench == [103] {
+                    scene.bench = vec![scene.champion];
+                    scene.champion = 103;
+                    (204, Value::Null)
+                } else {
+                    (409, Value::Null)
+                }
+            }
             ("GET", "/lol-lobby-team-builder/champ-select/v1/subset-champion-list") => {
                 (200, json!([]))
             }
@@ -640,15 +832,23 @@ fn serve_http<S: Read + Write>(
             ("GET", "/lol-game-data/assets/v1/perkstyles.json") => {
                 (200, json!({"schemaVersion":1,"styles":[]}))
             }
-            ("GET", "/lol-game-data/assets/v1/queues.json") => {
-                (200, json!([{"id":450,"name":"Synthetic ARAM"}]))
-            }
+            ("GET", "/lol-game-data/assets/v1/queues.json") => (
+                200,
+                json!([
+                    {"id":450,"name":"Synthetic ARAM"}, {"id":2400,"name":"Synthetic KIWI"}
+                ]),
+            ),
             _ => (
                 404,
                 json!({"error":"not present in synthetic selection fixture"}),
             ),
         };
-        (result.0, "application/json", serde_json::to_vec(&result.1)?)
+        let response = if result.0 == 204 {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&result.1)?
+        };
+        (result.0, "application/json", response)
     };
     let mut stream = reader.into_inner();
     write!(

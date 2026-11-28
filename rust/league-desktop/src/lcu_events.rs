@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::Message;
@@ -23,6 +23,7 @@ const POST_GAME_SEQUENCE: &str = "/lol-pre-end-of-game/v1/currentSequenceEvent";
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const PROCESS_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const BENCH_EVENT_COALESCE: Duration = Duration::from_millis(50);
+const MAX_DRAFT_SESSION_BYTES: usize = 256 * 1024;
 
 pub(super) async fn watch_ready_events(
     client: Arc<LocalClient>,
@@ -85,20 +86,19 @@ pub(super) async fn watch_ready_events(
                         .ok()
                         .and_then(|mut state| state.observe(&text));
                     if let Some(signal) = signal {
+                        let selection =
+                            signal.selection && selection_wake_enabled.load(Ordering::Acquire);
                         let post_game =
                             signal.post_game && post_game_wake_enabled.load(Ordering::Acquire);
                         if post_game {
                             post_game_pending.store(true, Ordering::Release);
                         }
-                        if signal.immediate || post_game {
+                        if (signal.immediate && (!signal.selection || selection)) || post_game {
                             bench_deadline = None;
                             wake.notify_one();
-                        }
-                        if signal.bench_changed && selection_wake_enabled.load(Ordering::Acquire) {
-                            if bench_deadline.is_none() {
-                                bench_deadline =
-                                    Some(tokio::time::Instant::now() + BENCH_EVENT_COALESCE);
-                            }
+                        } else if signal.bench_changed && selection && bench_deadline.is_none() {
+                            bench_deadline =
+                                Some(tokio::time::Instant::now() + BENCH_EVENT_COALESCE);
                         }
                     }
                 }
@@ -111,8 +111,12 @@ pub(super) async fn watch_ready_events(
                 _ => {}
             }
         }
-        if let Ok(mut state) = rounds.lock() {
-            state.socket_lost();
+        let cleared_draft = rounds
+            .lock()
+            .map(|mut state| state.socket_lost())
+            .unwrap_or(false);
+        if cleared_draft && selection_wake_enabled.load(Ordering::Acquire) {
+            wake.notify_one();
         }
         if client.alive() {
             tokio::time::sleep(RECONNECT_DELAY).await;
@@ -134,6 +138,9 @@ pub(super) struct ReadyEventDeduper {
     reopen_after_disconnect: bool,
     round: ReadyRound,
     bench: Option<Vec<u32>>,
+    draft_session: Option<Arc<Value>>,
+    draft_signature: Option<DraftSessionSignature>,
+    draft_deadline: Option<Instant>,
     post_game_ballot: Option<u64>,
     post_game_sequence: Option<u64>,
 }
@@ -143,6 +150,18 @@ struct EventWake {
     immediate: bool,
     bench_changed: bool,
     post_game: bool,
+    selection: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DraftSessionSignature {
+    game_id: Option<u64>,
+    queue_id: Option<u64>,
+    local_player_cell_id: i64,
+    player: Option<String>,
+    champion_id: Option<u64>,
+    champion_pick_intent: Option<u64>,
+    timer_phase: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -156,13 +175,24 @@ impl ReadyEventDeduper {
         self.round
     }
 
-    fn socket_lost(&mut self) {
+    fn socket_lost(&mut self) -> bool {
         self.phase = None;
         self.ready_pending = false;
         self.reopen_after_disconnect = self.round.closed;
-        self.bench = None;
+        let had_draft = self.clear_draft_session();
         self.post_game_ballot = None;
         self.post_game_sequence = None;
+        had_draft
+    }
+
+    pub(super) fn draft_session(&self) -> Option<Arc<Value>> {
+        self.draft_deadline
+            .filter(|deadline| Instant::now() < *deadline)
+            .and_then(|_| self.draft_session.as_ref().map(Arc::clone))
+    }
+
+    pub(super) fn has_draft_phase(&self) -> bool {
+        self.phase.as_deref() == Some("ChampSelect")
     }
 
     pub(super) fn seed_bench(&mut self, bench: Option<Vec<u32>>) {
@@ -209,6 +239,7 @@ impl ReadyEventDeduper {
                 if !changed {
                     return None;
                 }
+                let selection_cleared = phase != "ChampSelect" && self.clear_draft_session();
                 let post_game = is_post_game_phase(&phase)
                     || self.phase.as_deref().is_some_and(is_post_game_phase);
                 let wake = match phase.as_str() {
@@ -219,20 +250,26 @@ impl ReadyEventDeduper {
                     other => (self.seen_ready && self.leave()) || other == "ChampSelect",
                 };
                 self.phase = Some(phase);
-                (wake || post_game).then_some(EventWake {
-                    immediate: wake,
+                (wake || post_game || selection_cleared).then_some(EventWake {
+                    immediate: wake || selection_cleared,
                     bench_changed: false,
                     post_game,
+                    selection: selection_cleared && !wake,
                 })
             }
             EventSignal::Closed => self.leave().then_some(EventWake {
                 immediate: true,
                 bench_changed: false,
                 post_game: false,
+                selection: false,
             }),
             EventSignal::Response { pending, created } => {
                 // A resource recreation can occur without an intervening phase poll.
                 // Duplicate Create/Update on the same open resource consumes no new round.
+                if created && pending && self.has_draft_phase() {
+                    self.clear_draft_session();
+                    self.phase = None;
+                }
                 if created || (!self.round.closed && pending) {
                     self.enter();
                 }
@@ -245,17 +282,42 @@ impl ReadyEventDeduper {
                     immediate: true,
                     bench_changed: false,
                     post_game: false,
+                    selection: false,
                 })
             }
-            EventSignal::Bench(bench) => {
-                if self.bench.as_ref() == Some(&bench) {
-                    return None;
-                }
-                let known = self.bench.replace(bench).is_some();
-                known.then_some(EventWake {
-                    immediate: false,
-                    bench_changed: true,
+            EventSignal::DraftSession {
+                data,
+                signature,
+                bench,
+                expires_in,
+            } => {
+                let first = self.draft_session().is_none();
+                let significant_change = self.draft_signature.as_ref() != Some(&signature);
+                self.draft_session = Some(Arc::new(data));
+                self.draft_signature = Some(signature);
+                self.draft_deadline =
+                    (expires_in > Duration::ZERO).then(|| Instant::now() + expires_in);
+                let bench_changed = match bench {
+                    Some(bench) if self.bench.as_ref() != Some(&bench) => {
+                        self.bench.replace(bench).is_some()
+                    }
+                    _ => false,
+                };
+                let immediate = first || significant_change;
+                (immediate || bench_changed).then_some(EventWake {
+                    immediate,
+                    bench_changed,
                     post_game: false,
+                    selection: true,
+                })
+            }
+            EventSignal::DraftDeleted => {
+                let had_draft = self.clear_draft_session();
+                had_draft.then_some(EventWake {
+                    immediate: true,
+                    bench_changed: false,
+                    post_game: false,
+                    selection: true,
                 })
             }
             EventSignal::PostGame {
@@ -274,9 +336,20 @@ impl ReadyEventDeduper {
                     immediate: false,
                     bench_changed: false,
                     post_game: true,
+                    selection: false,
                 })
             }
         }
+    }
+
+    fn clear_draft_session(&mut self) -> bool {
+        let had_draft = self.draft_session.take().is_some()
+            || self.draft_signature.is_some()
+            || self.bench.is_some();
+        self.draft_signature = None;
+        self.draft_deadline = None;
+        self.bench = None;
+        had_draft
     }
 }
 
@@ -291,11 +364,17 @@ enum EventSignal {
         pending: bool,
         created: bool,
     },
-    Bench(Vec<u32>),
     PostGame {
         resource: PostGameResource,
         signature: u64,
     },
+    DraftSession {
+        data: Value,
+        signature: DraftSessionSignature,
+        bench: Option<Vec<u32>>,
+        expires_in: Duration,
+    },
+    DraftDeleted,
 }
 
 fn parse_event(text: &str) -> Option<EventSignal> {
@@ -305,6 +384,9 @@ fn parse_event(text: &str) -> Option<EventSignal> {
         && !text.contains(POST_GAME_BALLOT_NO_SLASH)
         && !text.contains(POST_GAME_SEQUENCE)
     {
+        return None;
+    }
+    if text.contains(CHAMP_SELECT) && text.len() > MAX_DRAFT_SESSION_BYTES {
         return None;
     }
     let Ok(Value::Array(parts)) = serde_json::from_str::<Value>(text) else {
@@ -328,7 +410,7 @@ fn parse_event(text: &str) -> Option<EventSignal> {
         return Some(EventSignal::Closed);
     }
     if uri == CHAMP_SELECT && event_type == "Delete" {
-        return Some(EventSignal::Bench(Vec::new()));
+        return Some(EventSignal::DraftDeleted);
     }
     if matches!(event_type, "Create" | "Update" | "Delete") {
         let resource = match uri {
@@ -363,9 +445,77 @@ fn parse_event(text: &str) -> Option<EventSignal> {
             }),
             _ => None,
         },
-        (EVENT_TOPIC, CHAMP_SELECT) => bench_signature(data).map(EventSignal::Bench),
+        (EVENT_TOPIC, CHAMP_SELECT) => {
+            let (signature, bench, expires_in) = draft_session_signature(data)?;
+            Some(EventSignal::DraftSession {
+                data: data.clone(),
+                signature,
+                bench,
+                expires_in,
+            })
+        }
         _ => None,
     }
+}
+
+fn draft_session_signature(
+    data: &Value,
+) -> Option<(DraftSessionSignature, Option<Vec<u32>>, Duration)> {
+    let object = data.as_object()?;
+    let local_player_cell_id = data["localPlayerCellId"]
+        .as_i64()
+        .filter(|&cell| cell >= 0)?;
+    let team = data["myTeam"]
+        .as_array()
+        .filter(|team| !team.is_empty() && team.len() <= 10)?;
+    let mut own_rows = team
+        .iter()
+        .filter(|row| row["cellId"].as_i64() == Some(local_player_cell_id));
+    let own = own_rows.next()?;
+    if own.as_object().is_none() || own_rows.next().is_some() {
+        return None;
+    }
+    let timer = data["timer"].as_object()?;
+    let timer_phase = timer.get("phase")?.as_str().filter(|phase| {
+        matches!(
+            *phase,
+            "PLANNING" | "BAN_PICK" | "FINALIZATION" | "GAME_STARTING"
+        )
+    })?;
+    if timer.get("isInfinite").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let remaining_ms = timer
+        .get("adjustedTimeLeftInPhase")?
+        .as_u64()
+        .filter(|ms| *ms < 86_400_000)?;
+    if remaining_ms == 0 {
+        return None;
+    }
+    let bench = match object.get("benchChampions") {
+        Some(Value::Array(champions)) if champions.len() <= 20 => {
+            let signature = bench_signature(data);
+            if !champions.is_empty() && signature.is_none() {
+                return None;
+            }
+            Some(signature.unwrap_or_default())
+        }
+        Some(_) => return None,
+        None => None,
+    };
+    Some((
+        DraftSessionSignature {
+            game_id: data.get("gameId").and_then(Value::as_u64),
+            queue_id: data.get("queueId").and_then(Value::as_u64),
+            local_player_cell_id,
+            player: own.get("puuid").and_then(Value::as_str).map(str::to_owned),
+            champion_id: own.get("championId").and_then(Value::as_u64),
+            champion_pick_intent: own.get("championPickIntent").and_then(Value::as_u64),
+            timer_phase: timer_phase.to_owned(),
+        },
+        bench,
+        Duration::from_millis(remaining_ms),
+    ))
 }
 
 fn bench_signature(data: &Value) -> Option<Vec<u32>> {
@@ -395,6 +545,7 @@ mod tests {
     use super::{
         ReadyEventDeduper, GAMEFLOW_PHASE, POST_GAME_BALLOT, POST_GAME_SEQUENCE, READY_CHECK,
     };
+    use std::time::{Duration, Instant};
 
     const CHAMP_SELECT: &str = "/lol-champ-select/v1/session";
 
@@ -553,16 +704,20 @@ mod tests {
         let mut state = ReadyEventDeduper::default();
         let session = |bench: serde_json::Value, remaining: u64| {
             serde_json::json!({
+                "gameId": 7100,
+                "queueId": 2400,
+                "localPlayerCellId": 0,
                 "benchChampions": bench,
-                "timer": {"adjustedTimeLeftInPhase": remaining},
-                "myTeam": [{"cellId": 0, "championId": 22}]
+                "timer": {"phase":"BAN_PICK","adjustedTimeLeftInPhase": remaining},
+                "myTeam": [{"cellId": 0, "puuid":"synthetic-owner", "championId": 22}]
             })
         };
 
         let initial = champ_select_event("Create", session(serde_json::json!([]), 20_000));
-        assert!(
-            !state.should_wake(&initial),
-            "initial empty bench is not a change"
+        assert!(state.should_wake(&initial), "first full session wakes");
+        assert_eq!(
+            state.draft_session().as_deref(),
+            Some(&session(serde_json::json!([]), 20_000))
         );
 
         let added = champ_select_event(
@@ -576,9 +731,17 @@ mod tests {
                 19_500,
             ),
         );
-        assert!(
-            state.should_wake(&added),
-            "a newly benched champion wakes the monitor"
+        let wake = state
+            .observe(&added)
+            .expect("a newly benched champion wakes");
+        assert!(wake.bench_changed);
+        assert!(!wake.immediate, "bench-only changes remain coalesced");
+        assert_eq!(
+            state.draft_session().as_deref(),
+            Some(&session(
+                serde_json::json!([{"championId": 103}, {"championId": 0}, {"championId": 103}]),
+                19_500,
+            ))
         );
         assert!(
             !state.should_wake(&champ_select_event(
@@ -622,7 +785,11 @@ mod tests {
             "Update",
             session(serde_json::json!([{"championId": 103}]), 15_000),
         )));
-        assert!(state.should_wake(&champ_select_event("Delete", serde_json::Value::Null)));
+        let delete = state
+            .observe(&champ_select_event("Delete", serde_json::Value::Null))
+            .expect("Delete clears a cached session even if its bench signature is unchanged");
+        assert!(delete.immediate);
+        assert!(state.draft_session().is_none());
         assert!(!state.should_wake(&champ_select_event("Delete", serde_json::Value::Null)));
 
         for ignored in [
@@ -636,5 +803,155 @@ mod tests {
                 "unexpected selection wake for {ignored}"
             );
         }
+    }
+
+    #[test]
+    fn full_session_cache_wakes_for_identity_champion_or_timer_phase_but_not_timer_churn() {
+        let session = |game_id, champion_id, timer_phase, remaining| {
+            serde_json::json!({
+                "gameId": game_id,
+                "queueId": 2400,
+                "localPlayerCellId": 0,
+                "benchChampions": [{"championId": 103}],
+                "timer": {"phase": timer_phase, "adjustedTimeLeftInPhase": remaining},
+                "myTeam": [{"cellId": 0, "puuid": "synthetic-owner", "championId": champion_id}]
+            })
+        };
+        let mut state = ReadyEventDeduper::default();
+
+        assert!(state.should_wake(&champ_select_event(
+            "Create",
+            session(7100, 22, "BAN_PICK", 20_000),
+        )));
+        let timer_only = state.observe(&champ_select_event(
+            "Update",
+            session(7100, 22, "BAN_PICK", 19_500),
+        ));
+        assert!(timer_only.is_none(), "countdown churn does not wake");
+        assert_eq!(
+            state.draft_session().as_deref(),
+            Some(&session(7100, 22, "BAN_PICK", 19_500)),
+            "cache still tracks the latest full valid event"
+        );
+
+        for changed in [
+            session(7101, 22, "BAN_PICK", 19_400),
+            session(7101, 55, "BAN_PICK", 19_300),
+            session(7101, 55, "FINALIZATION", 19_200),
+        ] {
+            let wake = state
+                .observe(&champ_select_event("Update", changed.clone()))
+                .expect("identity, champion and timer phase changes wake");
+            assert!(wake.immediate);
+            assert_eq!(state.draft_session().as_deref(), Some(&changed));
+        }
+    }
+
+    #[test]
+    fn malformed_or_oversized_session_never_replaces_the_last_valid_cache() {
+        let valid = serde_json::json!({
+            "gameId":7100,"queueId":2400,"localPlayerCellId":0,
+            "benchChampions":[],
+            "timer":{"phase":"BAN_PICK","adjustedTimeLeftInPhase":20_000},
+            "myTeam":[{"cellId":0,"puuid":"synthetic-owner","championId":22}]
+        });
+        let mut state = ReadyEventDeduper::default();
+        assert!(state.should_wake(&champ_select_event("Create", valid.clone())));
+
+        for malformed in [
+            serde_json::json!({"benchChampions":[],"timer":{},"myTeam":[]}),
+            serde_json::json!({
+                "localPlayerCellId":4,"benchChampions":[],
+                "timer":{"phase":"BAN_PICK","adjustedTimeLeftInPhase":10},
+                "myTeam":[{"cellId":0,"championId":55}]
+            }),
+            serde_json::json!({
+                "localPlayerCellId":0,"benchChampions":[],
+                "timer":{"phase":"UNKNOWN","adjustedTimeLeftInPhase":10},
+                "myTeam":[{"cellId":0,"championId":55}]
+            }),
+        ] {
+            assert!(state
+                .observe(&champ_select_event("Update", malformed))
+                .is_none());
+            assert_eq!(state.draft_session().as_deref(), Some(&valid));
+        }
+
+        let oversized = format!(
+            "[8,\"OnJsonApiEvent\",{{\"uri\":\"{CHAMP_SELECT}\",\"eventType\":\"Update\",\"data\":{{\"padding\":\"{}\"}}}}]",
+            "x".repeat(256 * 1024),
+        );
+        assert!(state.observe(&oversized).is_none());
+        assert_eq!(state.draft_session().as_deref(), Some(&valid));
+    }
+
+    #[test]
+    fn expired_cached_session_is_hidden_and_same_identity_event_wakes_again() {
+        let session = serde_json::json!({
+            "gameId":7100,"queueId":2400,"localPlayerCellId":0,
+            "benchChampions":[],
+            "timer":{"phase":"BAN_PICK","adjustedTimeLeftInPhase":20_000},
+            "myTeam":[{"cellId":0,"puuid":"synthetic-owner","championId":22}]
+        });
+        let mut state = ReadyEventDeduper::default();
+        assert!(state.should_wake(&champ_select_event("Create", session.clone())));
+        state.draft_deadline = Some(Instant::now() - Duration::from_millis(1));
+        assert!(
+            state.draft_session().is_none(),
+            "expired presentation data is hidden"
+        );
+
+        let wake = state
+            .observe(&champ_select_event("Update", session))
+            .expect("a fresh session after expiry wakes even without identity changes");
+        assert!(wake.immediate);
+        assert!(state.draft_session().is_some());
+    }
+
+    #[test]
+    fn phase_departure_and_socket_loss_clear_the_cached_session() {
+        let session = serde_json::json!({
+            "gameId":7100,"queueId":2400,"localPlayerCellId":0,
+            "benchChampions":[],
+            "timer":{"phase":"BAN_PICK","adjustedTimeLeftInPhase":20_000},
+            "myTeam":[{"cellId":0,"puuid":"synthetic-owner","championId":22}]
+        });
+        let mut state = ReadyEventDeduper::default();
+        assert!(state.should_wake(&champ_select_event("Create", session.clone())));
+        assert!(state.should_wake(&event(GAMEFLOW_PHASE, serde_json::json!("ChampSelect"))));
+        assert!(state.has_draft_phase());
+        let left = state
+            .observe(&event(GAMEFLOW_PHASE, serde_json::json!("EndOfGame")))
+            .expect("departing ChampSelect wakes the monitor");
+        assert!(left.immediate);
+        assert!(!state.has_draft_phase());
+        assert!(state.draft_session().is_none());
+
+        assert!(state.should_wake(&champ_select_event("Create", session.clone())));
+        let ready = state
+            .observe(&event(GAMEFLOW_PHASE, serde_json::json!("ReadyCheck")))
+            .expect("a new ready check wakes even while clearing draft data");
+        assert!(ready.immediate && !ready.selection);
+        assert!(state.draft_session().is_none());
+
+        assert!(state.should_wake(&event(GAMEFLOW_PHASE, serde_json::json!("ChampSelect"))));
+        assert!(state.should_wake(&champ_select_event("Create", session.clone())));
+        let new_round = typed_event(
+            READY_CHECK,
+            "Create",
+            serde_json::json!({"state":"InProgress","playerResponse":"None"}),
+        );
+        assert!(state.should_wake(&new_round));
+        assert!(!state.has_draft_phase());
+        assert!(state.draft_session().is_none());
+
+        assert!(state.should_wake(&champ_select_event("Create", session)));
+        assert!(
+            state.socket_lost(),
+            "socket loss reports a cleared draft cache"
+        );
+        assert!(!state.has_draft_phase());
+        assert!(state.draft_session().is_none());
+        assert!(!state.socket_lost(), "repeat cleanup is idempotent");
     }
 }

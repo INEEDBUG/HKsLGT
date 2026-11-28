@@ -95,8 +95,10 @@ impl CompanionDemand {
         if !self.aux {
             return false;
         }
+        if phase == "ChampSelect" {
+            return true;
+        }
         let relevant = match phase {
-            "ChampSelect" => game.filter(|game| game.phase == "ChampSelect"),
             "" | "Matchmaking" | "ReadyCheck" => match game {
                 Some(game) if game.phase == "ChampSelect"
                     || (matches!(phase, "" | "ReadyCheck") && game.phase == "ReadyCheck"
@@ -107,13 +109,10 @@ impl CompanionDemand {
         };
         relevant.is_none_or(|game| {
             let queue = game.queue();
-            match queue.and_then(|q| q.game_mode.as_deref()).filter(|mode| !mode.is_empty()) {
-                Some(mode) => matches!(mode, "ARAM" | "KIWI"),
-                None => match queue.and_then(|q| q.id) {
-                    Some(450 | 2400) => true,
-                    Some(id) if id > 0 => false,
-                    _ => game.aux_game_mode().is_none_or(|mode| matches!(mode, "ARAM" | "KIWI")),
-                },
+            match queue.and_then(|q| q.id) {
+                Some(450 | 2400) => true,
+                Some(id) if id > 0 => false,
+                _ => game.aux_game_mode().is_none_or(|mode| matches!(mode, "ARAM" | "KIWI")),
             }
         })
     }
@@ -1072,6 +1071,18 @@ impl ClientRuntime {
         .flatten()
     }
 
+    fn draft_event(&self, instance: ClientInstance) -> (bool, Option<Arc<Value>>) {
+        self.ready_event_watch
+            .lock()
+            .ok()
+            .and_then(|watch| {
+                let watch = watch.as_ref().filter(|watch| watch.instance == instance)?;
+                let events = watch.rounds.lock().ok()?;
+                Some((events.has_draft_phase(), events.draft_session()))
+            })
+            .unwrap_or_default()
+    }
+
     async fn fresh_aux_selection(
         &self,
         client: Arc<LocalClient>,
@@ -1106,10 +1117,8 @@ impl ClientRuntime {
             self.read_aux_current_champion(&target),
         )
         .await;
-        let flow = flow
-            .map_err(|_| "读取当前大乱斗会话超时，请重试。")?
-            .map_err(|_| "无法读取当前大乱斗会话，请重试。")?
-            .ok_or("无法确认当前大乱斗会话，请重试。")?;
+        let flow = aux_sample_read(flow.unwrap_or(Err(LcuError::Timeout)), true)
+            .map_err(|_| "无法读取当前大乱斗会话，请重试。")?;
         let selection = selection
             .map_err(|_| "读取英雄选择状态超时，请重试。")?
             .map_err(|_| "无法读取英雄选择状态，请重试。")?;
@@ -1119,12 +1128,7 @@ impl ClientRuntime {
             .flatten()
             .filter(|player| original.selection_player.as_deref() == Some(player.puuid.as_str()))
             .ok_or("当前登录玩家已变化或暂时无法确认，请重新查看状态。")?;
-        if flow
-            .game_data
-            .as_ref()
-            .is_some_and(|data| data.is_custom_game == Some(true))
-            || selection["isCustomGame"] == true
-        {
+        if selection["isCustomGame"] == true {
             return Err("自定义对局不支持此操作。".into());
         }
         let extras = self
@@ -1136,7 +1140,7 @@ impl ClientRuntime {
             .retired_game_id(client.instance, Some(&player.puuid));
         let activity = AuxActivity::project_observed(
             "ChampSelect",
-            Some(&flow),
+            flow.as_ref(),
             None,
             None,
             AuxSelectionObservation {
@@ -1159,7 +1163,7 @@ impl ClientRuntime {
             return Err("当前连接或对局状态已变化，请重新查看。".into());
         }
         let standard_game_confirmed = selection["isCustomGame"] == false
-            || (flow.phase == "ChampSelect"
+            || flow.as_ref().is_some_and(|flow| flow.phase == "ChampSelect"
                 && flow.game_data.as_ref().is_some_and(|data| {
                     data.is_custom_game == Some(false)
                         && data.game_id.filter(|&id| id > 0).is_none_or(|id| current.game_id == Some(id))
@@ -1768,17 +1772,29 @@ impl ClientRuntime {
         let flow_snapshot = session.flatten();
         let flow = flow_snapshot.as_ref();
         let flow_is_draft = demand.reads_aux_selection("", flow);
+        let (event_phase, event_draft) = if demand.aux {
+            self.draft_event(client.instance)
+        } else {
+            (false, None)
+        };
         // A missing endpoint can only be replaced by other fresh evidence from this client.
         // Keep the usual request deadline in other modes and propagate authentication failures.
         let direct = match direct {
             Ok(result) => result,
-            Err(_) if flow_is_draft => Err(LcuError::Timeout),
+            Err(_) if flow_is_draft || event_phase => Err(LcuError::Timeout),
             Err(_) => phase_read.await,
         };
-        let direct = aux_sample_read(direct, flow_is_draft)?;
-        let raw_phase = direct.as_deref().unwrap_or("");
-        let phase = match direct.as_deref() {
-            Some(phase) if !phase.is_empty() => phase,
+        let direct = aux_sample_read(direct, flow_is_draft || event_phase)?;
+        let direct_phase = direct.as_deref().filter(|phase| !phase.is_empty());
+        let phase_from_event = event_phase && (direct_phase.is_none()
+            || (matches!(direct_phase, Some("ReadyCheck" | "Matchmaking")) && flow.is_none()
+                && event_draft.is_some_and(|draft| {
+                    draft["gameId"].as_u64().is_some_and(|id| id > 0)
+                        && matches!(draft["queueId"].as_u64(), Some(450 | 2400))
+                })));
+        let raw_phase = if phase_from_event { "ChampSelect" } else { direct_phase.unwrap_or("") };
+        let phase = match raw_phase {
+            phase if !phase.is_empty() => phase,
             _ if flow_is_draft && flow.is_some_and(|game| game.phase == "ReadyCheck") => "ReadyCheck",
             _ if flow_is_draft => "ChampSelect",
             _ => return Ok(None),
@@ -1811,11 +1827,22 @@ impl ClientRuntime {
             };
         }
         let select = async {
-            if demand.reads_selection(raw_phase, flow, automate) {
-                optional_lcu(self.transport.read_champ_select(&target)).await
-            } else {
-                None
+            if !demand.reads_selection(raw_phase, flow, automate) {
+                return Ok((None, false));
             }
+            let sample = tokio::time::timeout(first, self.transport.read_champ_select(&target))
+                .await
+                .unwrap_or(Err(LcuError::Timeout));
+            let live = if read_aux_draft {
+                aux_sample_read(sample.map(Some), true)?
+            } else {
+                sample.ok()
+            }.filter(|value| value.as_object().is_some_and(|draft| !draft.is_empty()));
+            if live.is_some() || !read_aux_draft || raw_phase != "ChampSelect" {
+                return Ok((live, false));
+            }
+            let cached = self.draft_event(client.instance).1;
+            Ok((cached.as_deref().cloned(), cached.is_some()))
         };
         let own_champion = async {
             if read_aux_draft {
@@ -1827,6 +1854,8 @@ impl ClientRuntime {
         let (selection, current_champion, reads) = join3(
             select, own_champion, self.read_aux_room(&target, client.instance, raw_phase, demand.aux || room_enabled)
         ).await;
+        let (selection, selection_from_event) = selection?;
+        let presentation_only = selection_from_event || phase_from_event;
         let player = summoner.as_ref().map(|player| player.puuid.as_str());
         let (previous_game_mode, draft_mode_conflicted, retired_game_id) = if demand.aux {
             let mut state = self.state.lock().ok();
@@ -1865,11 +1894,11 @@ impl ClientRuntime {
         let companions = demand.targets(
             client.instance,
             session,
-            selection.as_ref(),
+            if presentation_only { None } else { selection.as_ref() },
             summoner.as_ref().map(|player| player.puuid.as_str()),
             previous_chart,
         );
-        let extras = if demand.aux && raw_phase == "ChampSelect" {
+        let extras = if demand.aux && !presentation_only && raw_phase == "ChampSelect" {
             if let Some(select) = selection.as_ref().filter(|select| select.is_object()) {
                 self.transport
                     .read_aux_selection_extras(&target, select)
@@ -1893,6 +1922,7 @@ impl ClientRuntime {
                 player,
                 previous_game_mode,
                 retired_game_id,
+                presentation_only,
             },
         );
         if demand.aux {
@@ -1922,7 +1952,7 @@ impl ClientRuntime {
             AuxActivity::Inactive
         };
         let gameflow_view = json!(session);
-        let use_for_automation = automate && session.is_some();
+        let use_for_automation = automate && !presentation_only && session.is_some();
         Ok(client.alive().then(|| {
             let client = ActiveClient {
                 instance: client.instance,
@@ -2337,6 +2367,13 @@ fn draft_exit_is_confirmed(
         return false;
     }
 
+    let eligible_flow = |flow: &GameflowSession| {
+        flow.game_data.as_ref().is_none_or(|data| data.is_custom_game != Some(true))
+            && match flow.queue().and_then(|queue| queue.id) {
+                Some(id) => matches!(id, 450 | 2400),
+                None => flow.aux_game_mode().is_none_or(|mode| matches!(mode, "ARAM" | "KIWI")),
+            }
+    };
     let flow_confirms_exit = flow.is_some_and(|flow| {
         let flow_exit = matches!(
             flow.phase.as_str(),
@@ -2348,22 +2385,10 @@ fn draft_exit_is_confirmed(
         let game_id_matches = flow_game_id
             .filter(|&id| id > 0)
             .is_none_or(|id| id == retired.game_id);
-        let queue_id = flow.queue().and_then(|queue| queue.id);
-        let queue_supported = queue_id.is_none_or(|id| matches!(id, 450 | 2400));
-        flow_exit
-            && flow.phase != "ChampSelect"
-            && game_id_matches
-            && queue_supported
-            && flow.game_data.as_ref().is_none_or(|data| data.is_custom_game != Some(true))
-            && flow.aux_game_mode().is_none_or(|mode| matches!(mode, "ARAM" | "KIWI"))
+        flow_exit && game_id_matches && eligible_flow(flow)
     });
     let flow_still_in_champ_select = flow.is_some_and(|flow| flow.phase == "ChampSelect");
-    let flow_is_contradictory = flow.is_some_and(|flow| {
-        flow.game_data.as_ref().is_some_and(|data| data.is_custom_game == Some(true))
-            || flow.queue().and_then(|queue| queue.id)
-                .is_some_and(|id| !matches!(id, 450 | 2400))
-            || flow.aux_game_mode().is_some_and(|mode| !matches!(mode, "ARAM" | "KIWI"))
-    });
+    let flow_is_contradictory = flow.is_some_and(|flow| !eligible_flow(flow));
     if flow_still_in_champ_select || flow_is_contradictory {
         return false;
     }
@@ -2590,14 +2615,7 @@ pub(crate) async fn monitor(app: AppHandle) {
     loop {
         let demand = CompanionDemand::from_app(&app);
         runtime.refresh(&app, demand).await;
-        let selection_wake_enabled = demand.aux
-            && matches!(
-                runtime.aux_observation(),
-                AuxObservation::Active {
-                    stage: AuxStage::Selection,
-                    ..
-                }
-            );
+        let selection_wake_enabled = demand.aux;
         let initial_bench = selection_wake_enabled
             .then(|| runtime.current_selection_bench())
             .flatten();
@@ -2761,7 +2779,7 @@ mod companion_tests {
     }
 
     #[test]
-    fn aux_alone_reads_selection_only_for_aram_drafts() {
+    fn aux_reads_direct_champ_select_before_deciding_which_queue_to_display() {
         let demand = CompanionDemand {
             aux: true,
             ..CompanionDemand::default()
@@ -2769,7 +2787,7 @@ mod companion_tests {
         for (phase, mode, expected) in [
             ("ChampSelect", "ARAM", true),
             ("ChampSelect", "KIWI", true),
-            ("ChampSelect", "CLASSIC", false),
+            ("ChampSelect", "CLASSIC", true),
             ("Lobby", "ARAM", false),
             ("InProgress", "KIWI", false),
         ] {

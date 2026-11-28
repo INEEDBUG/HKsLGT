@@ -9,7 +9,7 @@ use crate::client_discovery::LocalClient;
 use serde_json::{json, Value};
 use std::{
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const FIRST_GAME: u64 = 8521;
@@ -356,7 +356,6 @@ async fn swap_in_second_draft(
 ) -> bool {
     let (champion, bench) = *current;
     let runtime = app.state::<ClientRuntime>();
-    let server = app.state::<MiniClient>();
     sample(
         app,
         client,
@@ -389,32 +388,12 @@ async fn swap_in_second_draft(
 
     assert_forged_swap_blocked(
         aux,
-        &server,
+        &app.state::<MiniClient>(),
         22,
         "even a pickable champion outside the live bench cannot be requested through IPC",
     )
     .await;
-    let before = server.scene.lock().unwrap().writes.len();
-    click(aux, &format!(r#".bench [data-champion-id="{bench}"]"#)).await;
-    tokio::time::timeout(Duration::from_secs(4), async {
-        while server.scene.lock().unwrap().writes.len() == before {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{label}: clicking the bench never reached the TLS client"));
-    {
-        let scene = server.scene.lock().unwrap();
-        assert_eq!(
-            &scene.writes[before..],
-            &[("POST".to_owned(), format!("{BENCH_SWAP}{bench}"))],
-            "{label}: the bench click must reach the exact endpoint once"
-        );
-        let draft = scene.partial_kiwi.as_ref().unwrap();
-        assert_eq!(draft.gameflow.as_ref(), Some(&gameflow), "{label}");
-        assert_eq!(draft.current_champion, Some(bench), "{label}");
-    }
-    runtime.sample_fixture(app, client).await;
+    click_and_read_swap(app, client, aux, &gameflow, bench, label).await;
     second_draft_portraits(
         aux,
         bench,
@@ -432,6 +411,211 @@ async fn swap_in_second_draft(
     .await;
     *current = (bench, champion);
     true
+}
+
+async fn click_and_read_swap(
+    app: &AppHandle,
+    client: &Arc<LocalClient>,
+    aux: &WebviewWindow,
+    gameflow: &Value,
+    bench: u32,
+    label: &str,
+) {
+    let server = app.state::<MiniClient>();
+    let before = server.scene.lock().unwrap().writes.len();
+    click(aux, &format!(r#".bench [data-champion-id="{bench}"]"#)).await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while server.scene.lock().unwrap().writes.len() == before {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label}: clicking the bench never reached the TLS client"));
+    {
+        let scene = server.scene.lock().unwrap();
+        assert_eq!(
+            &scene.writes[before..],
+            &[("POST".to_owned(), format!("{BENCH_SWAP}{bench}"))],
+            "{label}: the bench click must reach the exact endpoint once"
+        );
+        let draft = scene.partial_kiwi.as_ref().unwrap();
+        assert_eq!(draft.gameflow.as_ref(), Some(gameflow), "{label}");
+        assert_eq!(draft.current_champion, Some(bench), "{label}");
+    }
+    app.state::<ClientRuntime>()
+        .sample_fixture(app, client)
+        .await;
+}
+
+async fn six_bench_portraits(
+    aux: &WebviewWindow,
+    champion: u32,
+    bench: [u32; 6],
+    actionable: bool,
+    label: &str,
+) {
+    let started = Instant::now();
+    check_renderer(
+        aux,
+        &format!(
+            r#"(() => {{
+                const decoded = (portrait, id) => {{
+                    const img = portrait?.querySelector('img');
+                    return Number(portrait?.dataset.championId) === id && img?.complete &&
+                        img.naturalWidth > 1 && img.currentSrc.includes('/champion-icons/' + id + '.png');
+                }};
+                const own = document.querySelector('.aux-activity[data-phase=ChampSelect] .current-champion');
+                const slots = [...document.querySelectorAll('.bench [data-champion-id]')];
+                return decoded(own, {champion}) && slots.length === 6 &&
+                    {bench}.every(id => slots.some(slot => decoded(slot, id))) &&
+                    !document.querySelector('.aux-draft-confirming') &&
+                    ({actionable}
+                        ? slots.find(slot => Number(slot.dataset.championId) === {first})?.getAttribute('aria-disabled') === 'false'
+                        : slots.every(slot => slot.getAttribute('aria-disabled') === 'true')) &&
+                    /^18\s*(秒|s)$/.test(document.querySelector('.aux-draft-timer')?.textContent.trim());
+            }})()"#,
+            bench = json!(bench),
+            first = bench[0],
+        ),
+        label,
+        || {},
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= Duration::from_secs(1),
+        "{label}: WebView2 took {elapsed:?}"
+    );
+    println!("HKSLGT_KIWI_SEVEN_PORTRAITS: {label}, rendered in {elapsed:?}");
+}
+
+async fn mislabeled_queue_draft(
+    app: &AppHandle,
+    client: &Arc<LocalClient>,
+    aux: &WebviewWindow,
+    champion: u32,
+    target: u32,
+) {
+    let gameflow = flow("ChampSelect", SECOND_GAME, KIWI_QUEUE, "CLASSIC");
+    let mut bench = [target, 1, 2, 4, 12, 17];
+    let mut view = selection(SECOND_GAME, champion, target, 18_000);
+    view["benchChampions"] = json!(bench.map(|id| json!({"championId": id})));
+    sample(
+        app,
+        client,
+        "ChampSelect",
+        DraftFixture {
+            gameflow: Some(gameflow.clone()),
+            selection: Some(view.clone()),
+            current_champion: Some(champion),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (_, state) = app
+        .state::<ClientRuntime>()
+        .fields(crate::lcu::aux_activity::NAMESPACE, "state")
+        .unwrap()
+        .unwrap();
+    println!(
+        "HKSLGT_KIWI_MISLABELED_QUEUE: phase={} mode={} champion={} bench={} actionable={} confirming={}",
+        state["view"]["phase"], state["view"]["gameMode"], state["view"]["championId"],
+        state["view"]["bench"], state["view"]["selectionActionable"], state["verifyingDraft"]
+    );
+    if state["view"].is_null() && state["verifyingDraft"] == true {
+        check_renderer(
+            aux,
+            "!!document.querySelector('.aux-draft-confirming') && !document.querySelector('.current-champion, .bench')",
+            "old bundled Mini reproduces the confirmation banner and missing selection UI",
+            || {},
+        )
+        .await;
+        panic!("queue 2400 with CLASSIC metadata reproduced the missing selection UI in Windows WebView2");
+    }
+    assert_eq!(state["view"]["gameMode"], "KIWI");
+    assert_eq!(state["view"]["selectionActionable"], true);
+    six_bench_portraits(
+        aux,
+        champion,
+        bench,
+        true,
+        "own champion and six decoded KIWI bench portraits",
+    )
+    .await;
+    sample(
+        app,
+        client,
+        "ChampSelect",
+        DraftFixture {
+            gameflow: Some(flow("ReadyCheck", SECOND_GAME, KIWI_QUEUE, "CLASSIC")),
+            selection: Some(view.clone()),
+            current_champion: Some(champion),
+            ..Default::default()
+        },
+    )
+    .await;
+    six_bench_portraits(
+        aux,
+        champion,
+        bench,
+        false,
+        "a lagging ReadyCheck with the right queue number cannot hide the live KIWI portraits",
+    )
+    .await;
+    let mut unnumbered = view.clone();
+    unnumbered["gameId"] = json!(0);
+    unnumbered["queueId"] = json!(0);
+    sample(
+        app,
+        client,
+        "ChampSelect",
+        DraftFixture {
+            selection: Some(unnumbered),
+            current_champion: Some(champion),
+            ..Default::default()
+        },
+    )
+    .await;
+    six_bench_portraits(
+        aux,
+        champion,
+        bench,
+        false,
+        "authoritative bench and current hero render before gameflow or queue metadata arrive",
+    )
+    .await;
+    let server = app.state::<MiniClient>();
+    assert_forged_swap_blocked(aux, &server, target, "missing draft metadata").await;
+    sample(
+        app,
+        client,
+        "ChampSelect",
+        DraftFixture {
+            gameflow: Some(gameflow.clone()),
+            selection: Some(view),
+            current_champion: Some(champion),
+            ..Default::default()
+        },
+    )
+    .await;
+    click_and_read_swap(
+        app,
+        client,
+        aux,
+        &gameflow,
+        target,
+        "mislabeled KIWI bench swap",
+    )
+    .await;
+    bench[0] = champion;
+    six_bench_portraits(
+        aux,
+        target,
+        bench,
+        true,
+        "all seven portraits after the verified KIWI swap",
+    )
+    .await;
 }
 
 async fn reject_second_draft_write(
@@ -770,6 +954,10 @@ pub(super) async fn check(app: &AppHandle) {
     )
     .await;
 
+    mislabeled_queue_draft(app, &client, &aux, champion, bench).await;
+    assert_eq!(aux.hwnd().unwrap(), hwnd);
+    assert!(aux.is_visible().unwrap());
+
     next["queueId"] = json!(420);
     sample(
         app,
@@ -803,6 +991,7 @@ pub(super) async fn check(app: &AppHandle) {
             accept,
             ("POST".to_owned(), format!("{BENCH_SWAP}136")),
             ("POST".to_owned(), format!("{BENCH_SWAP}55")),
+            ("POST".to_owned(), format!("{BENCH_SWAP}136")),
         ]
     );
 
@@ -851,5 +1040,5 @@ pub(super) async fn check(app: &AppHandle) {
         "the actual queue caption did not skip a displayed second: {whole_seconds:?}"
     );
     assert_eq!(aux.hwnd().unwrap(), hwnd);
-    println!("HKSLGT_CONSECUTIVE_KIWI_PASS: same Mini, two verified bench swaps with decoded client readback, no stale or forged writes; displayed seconds {whole_seconds:?} over {span:.0}ms");
+    println!("HKSLGT_CONSECUTIVE_KIWI_PASS: same Mini, three verified bench swaps with decoded client readback, no stale or forged writes; displayed seconds {whole_seconds:?} over {span:.0}ms");
 }

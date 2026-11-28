@@ -33,7 +33,7 @@ interface LocalAction {
 
 interface AuxView {
   phase: 'Lobby' | 'Matchmaking' | 'ReadyCheck' | 'ChampSelect'
-  gameMode: 'ARAM' | 'KIWI'
+  gameMode: 'ARAM' | 'KIWI' | ''
   queueName?: string | null
   mapName?: string | null
   modeIconPath?: string | null

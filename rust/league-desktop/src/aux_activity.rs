@@ -23,6 +23,7 @@ pub(crate) struct AuxSelectionObservation<'a> {
     pub(crate) player: Option<&'a str>,
     pub(crate) previous_game_mode: Option<&'static str>,
     pub(crate) retired_game_id: Option<u64>,
+    pub(crate) presentation_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -137,8 +138,9 @@ impl ConfirmedDraftMode {
             && [selection_queue, flow_queue_id].into_iter().flatten().all(|queue| {
                 matches!((queue, self.mode), (0, _) | (450, "ARAM") | (2400, "KIWI"))
             })
-            && flow_queue.and_then(|queue| queue.game_mode.as_deref())
-                .is_none_or(|mode| matches!(mode, "" | "ARAM" | "KIWI"))
+            && (flow_queue_id.is_some_and(|id| id > 0)
+                || flow_queue.and_then(|queue| queue.game_mode.as_deref())
+                    .is_none_or(|mode| matches!(mode, "" | "ARAM" | "KIWI")))
     }
 
     pub(crate) fn mode_for_same_game(
@@ -194,6 +196,7 @@ impl AuxActivity {
         observed: AuxSelectionObservation<'_>,
     ) -> Self {
         let direct_selection = phase == "ChampSelect";
+        let flow_missing = flow.is_none();
         let signed_in = signed_in_player(observed.player);
         let select = observed.session.filter(|value| value.is_object());
         let select_game = select.and_then(|select| positive_id(&select["gameId"]));
@@ -202,6 +205,14 @@ impl AuxActivity {
         let same_pick = || observed.current_champion.and_then(normalize_champion).is_some_and(|id| {
             select.and_then(|select| draft_player(select, signed_in))
                 .and_then(|row| champion_id(&row["championId"])) == Some(id)
+        });
+        let owns_live_bench = direct_selection && signed_in.is_some() && select.is_some_and(|draft| {
+            draft["benchEnabled"] == true
+                && draft["isSpectating"] != true
+                && draft["isCustomGame"] != true
+                && live_draft(draft)
+                && draft_player(draft, signed_in).and_then(|row| row["puuid"].as_str()) == signed_in
+                && (observed.current_champion.is_none() || same_pick())
         });
         let flow_refers_to_retired = observed.retired_game_id.is_some_and(|retired| {
             flow.is_some_and(|flow| flow_refers_to_retired_game(flow, retired))
@@ -266,9 +277,16 @@ impl AuxActivity {
                 {
                     return Self::Inactive;
                 }
-                if same_game && old.aux_game_mode().is_some_and(|mode| !matches!(mode, "ARAM" | "KIWI"))
-                {
-                    return Self::Unconfirmed;
+                if same_game {
+                    let old_queue = flow_queue_id(old);
+                    if old_queue.is_some_and(|id| aram_queue_mode(id).is_none()) {
+                        return Self::Inactive;
+                    }
+                    if old_queue.is_none() && draft_queue.and_then(aram_queue_mode).is_none()
+                        && old.aux_game_mode().is_some_and(|mode| !matches!(mode, "ARAM" | "KIWI"))
+                    {
+                        return Self::Unconfirmed;
+                    }
                 }
                 // An older phase may fill in a missing queue for the same game.
                 // If ChampSelect already reports its queue, use that observation.
@@ -301,10 +319,7 @@ impl AuxActivity {
         } else {
             lobby_queue.or(search_queue)
         };
-        let flow_queue = flow.and_then(GameflowSession::queue);
-        let flow_queue_id = flow_queue
-            .and_then(|queue| u64::try_from(queue.id?).ok())
-            .filter(|&id| id > 0);
+        let flow_queue_id = flow.and_then(flow_queue_id);
         if in_selection && !compatible_ids(selected_queue, flow_queue_id) {
             return Self::Unconfirmed;
         }
@@ -312,6 +327,9 @@ impl AuxActivity {
             return Self::Unconfirmed;
         }
         let queue = selected_queue.or(flow_queue_id);
+        if in_selection && queue.is_some_and(|queue| aram_queue_mode(queue).is_none()) {
+            return Self::Inactive;
+        }
         let config = config.filter(|_| compatible_ids(lobby_queue, queue));
         let matching_flow = flow.filter(|_| compatible_ids(flow_queue_id, queue));
         if config.is_some_and(|config| config["isCustom"] == true)
@@ -323,11 +341,7 @@ impl AuxActivity {
         }
         let lobby_mode = config
             .and_then(|config| config["gameMode"].as_str().filter(|mode| !mode.is_empty()));
-        let queue_mode = match queue {
-            Some(450) => Some("ARAM"),
-            Some(2400) => Some("KIWI"),
-            _ => None,
-        };
+        let queue_mode = queue.and_then(aram_queue_mode);
         let declared_mode = lobby_mode.or_else(|| matching_flow.and_then(GameflowSession::queue)
             .and_then(|q| q.game_mode.as_deref()).filter(|mode| !mode.is_empty()));
         // A map can be reused by several queues. It is weaker than the actual queue.
@@ -336,8 +350,8 @@ impl AuxActivity {
         } else {
             declared_mode.or_else(|| matching_flow.and_then(GameflowSession::aux_game_mode))
         };
-        let related_queue_label = in_selection && queue == Some(2400) && mode == Some("ARAM");
-        if !related_queue_label && mode
+        let queue_label_disagrees = mode.zip(queue_mode).is_some_and(|(mode, queue_mode)| mode != queue_mode);
+        if !in_selection && mode
             .zip(queue_mode)
             .is_some_and(|(mode, queue_mode)| mode != queue_mode)
         {
@@ -350,6 +364,7 @@ impl AuxActivity {
         let game_mode = match queue_mode.or(mode).or(same_game_mode) {
             Some("ARAM") => "ARAM",
             Some("KIWI") => "KIWI",
+            _ if owns_live_bench && queue.is_none() => "",
             Some(_) => return Self::Inactive,
             None if queue.is_some() => return Self::Inactive,
             None => return Self::Unconfirmed,
@@ -420,15 +435,17 @@ impl AuxActivity {
                 .as_str()
                 .filter(|phase| matches!(*phase, "PLANNING" | "BAN_PICK" | "FINALIZATION" | "GAME_STARTING"))
                 .map(str::to_owned);
-            let queue_alias_confirmed = !related_queue_label
+            let queue_alias_confirmed = !queue_label_disagrees
                 || (select_game.is_some() && select_game == flow_game && row_player == signed_in);
             let synchronized = queue_alias_confirmed && matching_flow.is_some_and(|flow| {
                 flow.phase == "ChampSelect"
                     && (queue.is_some() || flow.aux_game_mode().is_some())
             });
-            // The two live draft endpoints can corroborate the new game while
-            // gameflow is still reporting a retired game with a known ID.
-            let confirmed_after_retirement = replaced_identified_game
+            // A numbered live draft and the local champion can identify each other
+            // while gameflow is unavailable or still reports a known retired game.
+            let self_identified_draft = (flow_missing || replaced_identified_game)
+                && select_game.is_some()
+                && draft_queue.and_then(aram_queue_mode).is_some()
                 && row_player == signed_in
                 && current_pick.is_some()
                 && current_pick == roster_pick
@@ -436,8 +453,9 @@ impl AuxActivity {
                 && select["timer"]["isInfinite"] != true
                 && select["timer"]["adjustedTimeLeftInPhase"].as_u64().is_some_and(|ms| ms > 0);
             view.selection_actionable = direct_selection
-                && queue.is_none_or(|id| matches!(id, 450 | 2400))
-                && (synchronized || confirmed_after_retirement)
+                && !observed.presentation_only
+                && !game_mode.is_empty()
+                && (synchronized || self_identified_draft)
                 && signed_in.is_some()
                 && cell.is_some()
                 && cell == roster_cell
@@ -544,7 +562,9 @@ impl AuxActivity {
 
 impl AuxView {
     pub(crate) fn confirmed_mode(&self) -> Option<ConfirmedDraftMode> {
-        if !matches!(self.phase, AuxPhase::ReadyCheck | AuxPhase::ChampSelect) {
+        if !matches!(self.phase, AuxPhase::ReadyCheck | AuxPhase::ChampSelect)
+            || self.game_mode.is_empty()
+        {
             return None;
         }
         Some(ConfirmedDraftMode {
@@ -674,7 +694,10 @@ fn retired_flow_can_be_ignored(
                 queue == queue_id
             }
         })
-        && old_mode.is_none_or(|mode| matches!(mode, "ARAM" | "KIWI"))
+        && old_queue.map_or_else(
+            || old_mode.is_none_or(|mode| matches!(mode, "ARAM" | "KIWI")),
+            |queue| aram_queue_mode(queue).is_some(),
+        )
 }
 
 fn flow_refers_to_retired_game(flow: &GameflowSession, retired_game_id: u64) -> bool {
@@ -718,6 +741,18 @@ fn draft_player<'a>(select: &'a Value, signed_in: Option<&str>) -> Option<&'a Va
 
 fn game_id(flow: &GameflowSession) -> Option<u64> {
     flow.game_data.as_ref()?.game_id.filter(|&id| id > 0)
+}
+
+fn flow_queue_id(flow: &GameflowSession) -> Option<u64> {
+    u64::try_from(flow.queue()?.id?).ok().filter(|&id| id > 0)
+}
+
+fn aram_queue_mode(queue: u64) -> Option<&'static str> {
+    match queue {
+        450 => Some("ARAM"),
+        2400 => Some("KIWI"),
+        _ => None,
+    }
 }
 
 fn positive_id(value: &Value) -> Option<u64> {

@@ -56,7 +56,7 @@ const { selectionBlocked, chinese } = useNativeAuxActivity()`]
     }))
   ],
   'components/BenchChampionsMini.vue': [
-    ['v-if="combinedChampions && gameMode"', 'v-if="gameMode && (combinedChampions || lcs.champSelect.currentChampion)"'],
+    ['v-if="combinedChampions && gameMode"', 'v-if="combinedChampions || lcs.champSelect.currentChampion"'],
     ['<NDivider vertical />', '<NDivider v-if="combinedChampions" vertical />'],
     ['        <!-- 新版大乱斗', `        <span v-if="view?.remainingSeconds != null" class="aux-draft-timer text-xs tabular-nums text-gray-500">
           {{ view.remainingSeconds }}{{ chinese ? ' 秒' : 's' }}
